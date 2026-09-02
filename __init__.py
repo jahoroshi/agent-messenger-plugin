@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 __version__ = "0.1.0"
@@ -26,6 +27,7 @@ from . import mirror
 
 
 logger = logging.getLogger("amessenger")
+HOME_CHANNEL_SENTINEL = "__amessenger_home_channel_disabled__"
 
 
 def _platform_name(value) -> str:
@@ -103,6 +105,15 @@ def on_stream_end(
 
 
 def register(ctx) -> None:
+    # Hermes treats a non-empty AMESSENGER_HOME_CHANNEL as proof that a home
+    # channel exists, which suppresses its one-time /sethome notice in Channel
+    # sessions. This sentinel is deliberately neither a Channel id nor the
+    # Owner Chat id. It is inert because this entry leaves cron_deliver_env_var
+    # unset, so Hermes cron does not recognize amessenger as a deliver= target
+    # and never reads this variable for delivery. It would become unsafe only
+    # if Hermes later registered amessenger as a cron delivery platform or
+    # otherwise used this fallback variable as a real delivery destination.
+    os.environ.setdefault("AMESSENGER_HOME_CHANNEL", HOME_CHANNEL_SENTINEL)
     ctx.register_platform(
         name=PLATFORM_NAME, label="AMessenger",
         adapter_factory=lambda cfg: AMessengerAdapter(cfg, help_text=HELP_TEXT),

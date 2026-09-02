@@ -67,6 +67,7 @@ GATEWAY_NOTICE_PREFIXES = (
     "⏳ Queued for the next turn",
     "⚡ Interrupting current task",
     "💡 First-time tip",
+    "📬 No home channel",
 )
 INTERIM_SEND_KEY = "_interim_send"
 _LIVE_ADAPTER = None
@@ -1195,11 +1196,9 @@ class AMessengerAdapter(BasePlatformAdapter):
         only by the Owner-side tool; the relay resolves it to a Channel as part
         of the same POST.
         """
-        if text.startswith(DELIVERY_FAILURE_NOTICE_PREFIX):
-            logger.warning(
-                "[amessenger] dropping Hermes delivery-failure notice; it is not mail"
-            )
-            return SendResult(success=True, message_id=None)
+        guarded = self._send_guard(channel_id, text, None)
+        if guarded is not None:
+            return guarded
 
         moment = state.now() if count_reply else None
         if count_reply and state.cap_reached(self.state(), channel_id, moment):
