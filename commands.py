@@ -7,7 +7,7 @@ import re
 from gateway.config import Platform
 
 from . import adapter as adapter_module
-from . import mirror, relay, state
+from . import mirror, relay, security, state
 from .adapter import PLATFORM_NAME, read_settings
 
 
@@ -309,15 +309,63 @@ def _pending_label(adapter, channel_id) -> str:
     return mirror.label(adapter.known_channel(channel_id))
 
 
-async def _approval(adapter, choice: str) -> str:
-    updated, popped = state.pop_pending_approval(adapter.state())
-    if popped is None:
+def _pending_entries(adapter) -> list[tuple[str, dict]]:
+    pending = adapter.state()["pending_approvals"]
+    return sorted(
+        pending.items(),
+        key=lambda item: (item[1]["created_at"], item[0]),
+    )
+
+
+def _waiting_approvals_message(
+    adapter, choice: str, entries: list[tuple[str, dict]]
+) -> str:
+    descriptions = []
+    for _session_key, entry in entries:
+        channel_id = entry["chat_id"]
+        channel = adapter.known_channel(channel_id)
+        channel_name = security.safe_field(channel.get("name"), fallback="unnamed")
+        descriptions.append(
+            f"`{mirror.handle(channel_id)}` `{channel_name}`"
+        )
+    example_handle = mirror.handle(entries[0][1]["chat_id"])
+    return (
+        f"There are {len(entries)} waiting: {', '.join(descriptions)}. "
+        f"Say which, for example `/amsg {choice} {example_handle}`."
+    )
+
+
+async def _approval(adapter, choice: str, approval_handle: str | None = None) -> str:
+    entries = _pending_entries(adapter)
+    if not entries:
         return "Nothing is waiting for your approval."
+
+    if approval_handle is None:
+        if len(entries) != 1:
+            return _waiting_approvals_message(adapter, choice, entries)
+        session_key = entries[0][0]
+    else:
+        matches = [
+            item
+            for item in entries
+            if str(item[1].get("chat_id", "")).startswith(approval_handle)
+        ]
+        if not matches:
+            return f"No pending approval matches `{approval_handle}`."
+        if len(matches) != 1:
+            return _waiting_approvals_message(adapter, choice, matches)
+        session_key = matches[0][0]
+
     try:
         from tools.approval import resolve_gateway_approval
     except ImportError:
         return "Approvals are unavailable in this Hermes build."
 
+    updated, popped = state.pop_pending_approval(
+        adapter.state(), session_key=session_key
+    )
+    if popped is None:
+        return "Nothing is waiting for your approval."
     resolved = resolve_gateway_approval(popped["session_key"], choice)
     adapter.set_state(updated)
     label = _pending_label(adapter, popped["chat_id"])
@@ -353,10 +401,10 @@ def make_handler(ctx_unused=None):
             return await _leave(adapter, tokens, HELP_TEXT)
         if command == "status" and len(tokens) == 1:
             return await _status(adapter)
-        if command == "approve" and len(tokens) == 1:
-            return await _approval(adapter, "once")
-        if command == "deny" and len(tokens) == 1:
-            return await _approval(adapter, "deny")
+        if command in {"approve", "deny"} and len(tokens) in {1, 2}:
+            approval_handle = tokens[1] if len(tokens) == 2 else None
+            choice = "once" if command == "approve" else "deny"
+            return await _approval(adapter, choice, approval_handle)
         return HELP_TEXT
 
     return handle

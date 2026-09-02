@@ -496,12 +496,28 @@ class AMessengerAdapter(BasePlatformAdapter):
         owner = await self.wait_for_owner_adapter()
         if owner is None:
             return False
-        posted = await mirror.mirror(
-            owner,
-            self._owner_platform,
-            self._owner_chat_id,
-            text,
-        )
+        framed_text = None
+        if delivery.get("message", {}).get("kind") == "text":
+            framed_text = mirror.incoming_transcript(
+                delivery.get("sender_card"),
+                delivery["channel"],
+                delivery["message"].get("text", ""),
+            )
+        if framed_text is None:
+            posted = await mirror.mirror(
+                owner,
+                self._owner_platform,
+                self._owner_chat_id,
+                text,
+            )
+        else:
+            posted = await mirror.mirror(
+                owner,
+                self._owner_platform,
+                self._owner_chat_id,
+                text,
+                framed_text=framed_text,
+            )
         if not posted:
             logger.warning(
                 "[amessenger] Mirror post failed for Delivery %s", delivery["id"]
@@ -655,6 +671,15 @@ class AMessengerAdapter(BasePlatformAdapter):
                 self._card = None
                 index += 1
                 await sleep(wait)
+            except Exception:
+                wait = RECONNECT_BACKOFF[min(index, len(RECONNECT_BACKOFF) - 1)]
+                logger.exception(
+                    "[amessenger] poll pass failed; continuing in %ss",
+                    wait,
+                )
+                self._card = None
+                index += 1
+                await sleep(wait)
 
     async def after_publish(self) -> None:
         if self.state()["welcomed"]:
@@ -689,11 +714,37 @@ class AMessengerAdapter(BasePlatformAdapter):
         await self.flush_pending_mirrors()
         moment = state.now()
         updated, ended = state.expire_grants(self.state(), moment)
+        timeout_seconds = 300
+        try:
+            from tools.approval import _get_approval_config
+
+            timeout_seconds = int(_get_approval_config().get("timeout", 300))
+            if timeout_seconds < 0:
+                timeout_seconds = 300
+        except (
+            ImportError,
+            AttributeError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            timeout_seconds = 300
+        updated, expired_approvals = state.expire_pending_approvals(
+            updated, moment, timeout_seconds
+        )
+        if ended or expired_approvals:
+            self.set_state(updated)
+        if expired_approvals:
+            logger.info(
+                "[amessenger] expired %d pending approval(s); Hermes already denied them",
+                len(expired_approvals),
+            )
         if not ended:
             return
         # Write before notices: a Grant must never survive its own expiry because
         # a chat post failed; this is the opposite of the receive path.
-        self.set_state(updated)
         for channel_id in ended:
             posted = await self.mirror_or_queue(
                 mirror.grant_ended(self.known_channel(channel_id)),
@@ -783,7 +834,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 return result
 
         card = mirror.approval_request(
-            self.known_channel(chat_id), command, description
+            self.known_channel(chat_id), command, description, mirror.handle(chat_id)
         )
         # Approval cards stay direct: a stale card must never resurface after timeout.
         if await mirror.post(owner, self._owner_chat_id, card):

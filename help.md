@@ -44,8 +44,8 @@ The Mirror shows who sent the Message, its Channel, and its full text.
   Example: `/amsg leave k3Jx`
 
 - `/amsg status` — list your Channels and Grant details.
-- `/amsg approve` — approve the forwarded action.
-- `/amsg deny` — deny the forwarded action.
+- `/amsg approve [handle]` — approve the forwarded action.
+- `/amsg deny [handle]` — deny the forwarded action.
 - `/amsg help` — print this text again.
 
 These commands work only when you type them here, in the Owner Chat, never through the Agent.
@@ -66,7 +66,7 @@ At `base`, the Agent may read and reply only.
 `full` allows everything the Agent can do for its Owner.
 `full` needs `approvals.mode: manual` in `config.yaml`; with any other mode the Agent grants `base` and says so, because otherwise a model, not the Owner, would approve a peer's dangerous command.
 Every approval prompt at `full` is forwarded here to the Owner Chat.
-Answer that prompt with `/amsg approve` or `/amsg deny`.
+Answer that prompt with `/amsg approve <handle>` or `/amsg deny <handle>`.
 
 ## When a Grant ends
 

@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 
 # Copied from a2a's security.py; copy instead of importing because a plugin must not depend on another plugin.
@@ -24,6 +25,28 @@ def filter_inbound(text: str) -> str:
     for pat in _INJECTION_PATTERNS:
         cleaned = pat.sub(_INJECTION_REPLACEMENT, cleaned)
     return cleaned
+
+
+def safe_field(value, fallback: str = "unknown", limit: int = 100) -> str:
+    """Make a relay-supplied string safe to interpolate into a frame or Mirror line."""
+    if not isinstance(value, str):
+        return fallback
+
+    cleaned = filter_inbound(value)
+    cleaned = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in cleaned
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return fallback
+    if limit <= 0:
+        return fallback
+    if len(cleaned) > limit:
+        if limit == 1:
+            return "…"
+        cleaned = cleaned[: limit - 1].rstrip() + "…"
+    return cleaned.strip()
 
 
 # Copied from a2a's security.py; copy instead of importing because a plugin must not depend on another plugin.
@@ -63,11 +86,11 @@ def wrap_inbound(sender_card: dict | None, channel: dict | None, text: str) -> s
     card = sender_card if isinstance(sender_card, dict) else {}
     owner = card.get("owner") if isinstance(card.get("owner"), dict) else {}
     channel_data = channel if isinstance(channel, dict) else {}
-    agent_name = card.get("name") or "unknown"
-    owner_name = owner.get("name") or owner.get("login") or "unknown"
-    kind = card.get("kind") or "unknown"
-    channel_id = channel_data.get("id") or "unknown"
-    channel_name = channel_data.get("name") or channel_id
+    agent_name = safe_field(card.get("name"))
+    owner_name = safe_field(owner.get("name") or owner.get("login"))
+    kind = safe_field(card.get("kind"))
+    channel_id = safe_field(channel_data.get("id"))
+    channel_name = safe_field(channel_data.get("name"), fallback=channel_id)
     body = text.strip() if isinstance(text, str) else ""
     prefix = (
         f"[AMessenger inbound — message from agent '{agent_name}' (owner {owner_name}, "

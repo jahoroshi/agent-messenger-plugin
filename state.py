@@ -152,15 +152,36 @@ def add_pending_approval(state: dict, session_key, chat_id, moment) -> dict:
     return _copy_state(state, pending=pending)
 
 
-def pop_pending_approval(state: dict) -> tuple[dict, dict | None]:
+def pop_pending_approval(state: dict, session_key=None) -> tuple[dict, dict | None]:
     pending = state["pending_approvals"]
     if not pending:
         return _copy_state(state), None
-    session_key = min(pending, key=lambda key: (pending[key]["created_at"], key))
+    if session_key is None:
+        session_key = min(pending, key=lambda key: (pending[key]["created_at"], key))
+    if session_key not in pending:
+        return _copy_state(state), None
     entry = pending[session_key]
     remaining = {key: value for key, value in pending.items() if key != session_key}
     popped = {"session_key": session_key, "chat_id": entry["chat_id"], "created_at": entry["created_at"]}
     return _copy_state(state, pending=remaining), popped
+
+
+def expire_pending_approvals(
+    state: dict, moment: datetime, timeout_seconds: int
+) -> tuple[dict, list[str]]:
+    """Drop pending approval records that have outlived Hermes's wait window."""
+    cutoff = moment - timedelta(seconds=timeout_seconds)
+    pending = state["pending_approvals"]
+    expired = []
+    for key, entry in pending.items():
+        created_at = parse_ts(entry.get("created_at"))
+        if created_at is None or created_at < cutoff:
+            expired.append(key)
+    expired.sort()
+    if not expired:
+        return _copy_state(state), []
+    remaining = {key: value for key, value in pending.items() if key not in expired}
+    return _copy_state(state, pending=remaining), expired
 
 
 def load(path) -> dict:
