@@ -6,6 +6,7 @@ import re
 
 from gateway.config import Platform
 
+from . import adapter as adapter_module
 from . import mirror, relay, state
 from .adapter import PLATFORM_NAME, read_settings
 
@@ -197,6 +198,17 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
     if parsed is None:
         return help_text
     kind, duration_seconds, level = parsed
+    approval_mode = None
+    if level == "full":
+        approval_mode = adapter_module.approval_mode()
+        if approval_mode != "manual":
+            logger.warning(
+                "[amessenger] refused full Tool Level for Channel %s: "
+                "approvals.mode=%r is not manual",
+                channel["id"],
+                approval_mode,
+            )
+            level = "base"
     moment = state.now()
     updated = state.grant(
         adapter.state(),
@@ -211,6 +223,15 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
     grant_period = (
         "standing" if record["expires_at"] is None else f"until {record['expires_at']}"
     )
+    if approval_mode is not None and approval_mode != "manual":
+        return (
+            f"{mirror.label(channel)} is now interact, Tool Level base, {grant_period}.\n"
+            f"I refused the full Tool Level: this gateway has approvals.mode "
+            f"'{approval_mode}', so a dangerous command from a peer would be approved "
+            "by a model instead of by you. To use full, set approvals.mode: manual "
+            "in config.yaml and restart the gateway, then grant it again.\n"
+            f"End it any time with /amsg notify {mirror.handle(channel['id'])}."
+        )
     return (
         f"{mirror.label(channel)} is now interact, Tool Level {level}, {grant_period}. "
         f"End it any time with `/amsg notify {mirror.handle(channel['id'])}`."

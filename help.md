@@ -64,6 +64,7 @@ Choose `notify` with `/amsg notify` to end a Grant and return to the default.
 `base` is the default Tool Level for every Grant.
 At `base`, the Agent may read and reply only.
 `full` allows everything the Agent can do for its Owner.
+`full` needs `approvals.mode: manual` in `config.yaml`; with any other mode the Agent grants `base` and says so, because otherwise a model, not the Owner, would approve a peer's dangerous command.
 Every approval prompt at `full` is forwarded here to the Owner Chat.
 Answer that prompt with `/amsg approve` or `/amsg deny`.
 

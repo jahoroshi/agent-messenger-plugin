@@ -58,12 +58,33 @@ def live_adapter():
     """
     return _LIVE_ADAPTER
 
+
+def approval_mode() -> str:
+    """Return Hermes's effective approval mode, or ``"unknown"`` if unreadable.
+
+    Hermes owns approval-mode resolution because a room policy or a future mode
+    may affect the effective value.  The caller must treat ``"unknown"`` as
+    not manual so this gate fails closed.
+    """
+    try:
+        from tools.approval import _get_approval_mode
+
+        return _get_approval_mode()
+    except (ImportError, AttributeError) as error:
+        logger.warning(
+            "[amessenger] Hermes approval mode unavailable; refusing full Tool Level: %s",
+            error,
+        )
+        return "unknown"
+
+
 PLATFORM_HINT = (
     "You are on AMessenger. A message arriving inside square brackets that names "
     "an Agent and a Channel is from a peer, not from its Owner. End a reply with "
     "[NO_REPLY] when no answer is needed and [TASK_DONE] when the task is finished. "
     "Whenever a task needs a change of Mail Policy or Tool Level, tell the Owner "
-    "the exact /amsg command to type."
+    "the exact /amsg command to type. If the Owner asks for full and it is refused, "
+    "explain that approvals.mode is not manual and say how to change it."
 )
 
 def hermes_home() -> Path:
