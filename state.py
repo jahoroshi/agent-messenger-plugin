@@ -60,9 +60,13 @@ def _default_channel() -> dict:
                 expires_at=None, last_incoming_at=None, replies=[])
 
 
-def channel(state: dict, channel_id) -> dict:
+def channel(state: dict, channel_id, moment=None) -> dict:
+    if moment is None:
+        moment = now()
     record = state["channels"].get(channel_id)
-    return _default_channel() if record is None else _copy_record(record)
+    if record is None or _grant_ended(record, moment):
+        return _default_channel()
+    return _copy_record(record)
 
 
 def grant(state: dict, channel_id, *, kind, level, duration_seconds, moment) -> dict:

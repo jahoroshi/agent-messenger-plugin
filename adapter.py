@@ -45,6 +45,7 @@ DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
 PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 OWNER_POST_TIMEOUT_SECONDS = 15
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
+NO_TOOLS_SENTINEL = "amessenger_none"
 _LIVE_ADAPTER = None
 
 
@@ -76,6 +77,29 @@ def approval_mode() -> str:
             error,
         )
         return "unknown"
+
+
+def approval_bypass_active(session_key: str) -> bool:
+    """Return whether Hermes will bypass approvals for this session."""
+    try:
+        from tools.approval import is_approval_bypass_active_for_session
+
+        return is_approval_bypass_active_for_session(session_key)
+    except (ImportError, AttributeError) as error:
+        logger.warning(
+            "[amessenger] Hermes approval bypass state unavailable for session %s; "
+            "treating bypass as active: %s",
+            session_key,
+            error,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "[amessenger] Hermes approval bypass check failed for session %s; "
+            "treating bypass as active",
+            session_key,
+        )
+        return True
 
 
 PLATFORM_HINT = (
@@ -468,7 +492,9 @@ class AMessengerAdapter(BasePlatformAdapter):
     async def _handle_text_delivery(
         self, delivery: dict, channel: dict, sender_card, message_text: str
     ) -> bool:
-        policy = state.channel(self.state(), channel["id"])["policy"]
+        policy = state.channel(
+            self.state(), channel["id"], state.now()
+        )["policy"]
         text = mirror.incoming(sender_card, channel, message_text, policy)
         if not await self._mirror_delivery(delivery, text):
             return False
@@ -498,22 +524,79 @@ class AMessengerAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     def toolsets_for_source(self, source) -> list[str]:
-        level = state.channel(self.state(), source.chat_id)["level"]
-        settings = read_settings()
-        configured = (
-            settings["full_toolsets"]
-            if level == "full"
-            else settings["base_toolsets"]
-        )
-        # Filter here instead of trusting Owner-controlled configuration: management
-        # tools are reserved for Owner Chat sessions, never Channel sessions.
-        toolsets = [toolset for toolset in configured if toolset != MANAGE_TOOLSET]
-        if len(toolsets) != len(configured):
-            logger.warning(
-                "[amessenger] filtering %s from Channel toolsets; Owner Chat only",
-                MANAGE_TOOLSET,
+        channel_id = "<unknown>"
+        base = []
+        configured = base
+
+        try:
+            channel_id = source.chat_id
+            settings = read_settings()
+            base = list(settings["base_toolsets"])
+            configured = base
+
+            try:
+                record = state.channel(self.state(), channel_id, state.now())
+            except (state.StateFileCorrupt, OSError):
+                logger.exception(
+                    "[amessenger] state read failed for Channel %s; "
+                    "using base Tool Level",
+                    channel_id,
+                )
+            else:
+                if record["level"] == "full":
+                    from gateway.session import build_session_key
+
+                    session_key = build_session_key(source)
+                    mode = approval_mode()
+                    bypass_active = approval_bypass_active(session_key)
+                    if mode == "manual" and bypass_active is False:
+                        configured = list(settings["full_toolsets"])
+                    else:
+                        failed_conditions = []
+                        if mode != "manual":
+                            failed_conditions.append(f"approvals.mode={mode!r}")
+                        if bypass_active is not False:
+                            failed_conditions.append("approval bypass is active")
+                        logger.warning(
+                            "[amessenger] refusing full Tool Level for Channel %s: %s",
+                            channel_id,
+                            ", ".join(failed_conditions),
+                        )
+
+            # Filter here instead of trusting Owner-controlled configuration:
+            # management tools are reserved for Owner Chat sessions.
+            toolsets = [
+                toolset for toolset in configured if toolset != MANAGE_TOOLSET
+            ]
+            if len(toolsets) != len(configured):
+                logger.warning(
+                    "[amessenger] filtering %s from Channel toolsets; Owner Chat only",
+                    MANAGE_TOOLSET,
+                )
+        except Exception:
+            # This gate deliberately catches every other error and fails closed:
+            # a Channel must never inherit Hermes's platform-default toolsets.
+            logger.exception(
+                "[amessenger] Tool Level gate failed for Channel %s while reading "
+                "configuration or approval bypass state; using base Tool Level",
+                channel_id,
             )
-        return toolsets
+            toolsets = [
+                toolset for toolset in base if toolset != MANAGE_TOOLSET
+            ]
+
+        if toolsets:
+            return toolsets
+
+        # gateway/run.py discards an empty override and replaces it with the
+        # platform default, so use a toolset name that does not exist instead.
+        logger.warning(
+            "[amessenger] Tool Level resolved to an empty list for Channel %s; "
+            "using %s sentinel",
+            channel_id,
+            NO_TOOLS_SENTINEL,
+        )
+        return [NO_TOOLS_SENTINEL]
 
     async def run_poll_loop(self) -> None:
         index = 0
