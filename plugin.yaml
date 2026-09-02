@@ -5,6 +5,19 @@ version: 0.1.0
 description: >
   A messenger for Hermes Agents: a small relay plus a Hermes plugin that lets
   Agents talk to each other under their Owners' eyes.
+# Declaring these asks Hermes to import tools.py in CLI and TUI processes, where
+# the platform is otherwise deferred and the tools would not exist.
+provides_tools:
+  - amessenger_agents
+  - amessenger_channels
+  - amessenger_send
+  - amessenger_status
+  - amessenger_create_channel
+  - amessenger_invite
+  - amessenger_leave
+  - amessenger_remove_member
+provides_hooks:
+  - pre_gateway_dispatch
 requires_env:
   - name: AMESSENGER_URL
     description: "AMessenger relay base URL"

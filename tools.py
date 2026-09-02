@@ -2,13 +2,14 @@
 
 from contextlib import asynccontextmanager
 import logging
+import os
 
-from . import relay, security, state
-from .adapter import check_requirements, live_adapter, read_settings
+from . import adapter as adapter_module
+from . import mirror, relay, security, state
+from .adapter import active_adapter, check_requirements
 
 
 logger = logging.getLogger("amessenger")
-NOT_CONNECTED = "Error: AMessenger is not connected."
 RELAY_OUTAGE = "Error: the AMessenger relay did not answer. Try again."
 
 
@@ -20,11 +21,18 @@ def relay_error(error) -> str:
     return RELAY_OUTAGE
 
 
-def _adapter_or_error():
-    adapter = live_adapter()
-    if adapter is None or getattr(adapter, "_running", False) is not True:
-        return None, NOT_CONNECTED
-    return adapter, None
+def _configuration_error() -> str | None:
+    if check_requirements():
+        return None
+    missing = [
+        name
+        for name in adapter_module.REQUIRED_ENV
+        if not os.getenv(name, "").strip()
+    ]
+    if not missing:
+        # This also keeps a monkeypatched check_requirements failure actionable.
+        missing = list(adapter_module.REQUIRED_ENV)
+    return f"Error: AMessenger is not configured: set {', '.join(missing)}."
 
 
 @asynccontextmanager
@@ -36,13 +44,10 @@ async def relay_client(adapter):
     bound to the loop that built it. Building one per call is cheap next to the
     request itself.
     """
-    settings = read_settings()
-    client = relay.build_client(
-        settings["url"],
-        settings["key"],
-        settings["agent"],
-        transport=adapter._transport,
-    )
+    if adapter is None:
+        client = adapter_module.build_relay_client()
+    else:
+        client = adapter_module.build_relay_client(transport=adapter._transport)
     try:
         yield client
     finally:
@@ -86,18 +91,23 @@ def _pending_recipients(channel: dict, to: str | None) -> list[str]:
     ]
 
 
-def _send_result(result: dict, text: str, to: str | None) -> str:
+def _send_result(
+    result: dict, text: str, to: str | None, owner_copy_queued: bool = False
+) -> str:
     channel = result["channel"]
     message_id = security.safe_field(result["message"].get("id"))
     channel_id = security.safe_field(channel.get("id"))
+    answer = f"Sent to channel {channel_id}. Message id {message_id}."
     pending = _pending_recipients(channel, to)
     if pending:
         recipient = ", ".join(security.safe_field(agent) for agent in pending)
-        return (
-            f"Sent to channel {channel_id}. {recipient} has not joined yet, so their "
+        answer += (
+            f" {recipient} has not joined yet, so their "
             "Owner must accept the Invite before it is delivered. Tell your Owner that."
         )
-    return f"Sent to channel {channel_id}. Message id {message_id}."
+    if owner_copy_queued:
+        answer += " Your Owner Chat copy is queued for the gateway to post."
+    return answer
 
 
 def _manage_description(action: str) -> str:
@@ -108,7 +118,8 @@ def _manage_description(action: str) -> str:
 
 
 async def amessenger_agents(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     query = args.get("query")
@@ -127,7 +138,8 @@ async def amessenger_agents(args: dict, **_) -> str:
 
 
 async def amessenger_channels(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     try:
@@ -141,7 +153,8 @@ async def amessenger_channels(args: dict, **_) -> str:
 
 
 async def amessenger_send(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     to = args.get("to")
@@ -150,28 +163,60 @@ async def amessenger_send(args: dict, **_) -> str:
         return "Error: provide exactly one of 'to' and 'channel_id'."
     text = args.get("text", "")
     count_reply = False
-    if channel_id is not None:
+    reply_moment = None
+    if adapter is not None and channel_id is not None:
         # A tool send into an active Grant uses the same bounded reply window as
         # an autonomous Channel reply. No Grant means there is no window to count.
         record = state.channel(adapter.state(), channel_id, state.now())
         count_reply = record["grant"] is not None
+    elif channel_id is not None:
+        reply_moment = state.now()
+        record = state.channel(
+            adapter_module.read_state_file(), channel_id, reply_moment
+        )
+        count_reply = record["grant"] is not None
 
-    delivery = await adapter.deliver_to_channel(
-        channel_id,
-        text,
-        count_reply=count_reply,
-        to=to,
-    )
-    if not delivery.success:
-        error = delivery.raw_response
-        if isinstance(error, (relay.RelayRejected, relay.RelayUnavailable)):
+    if adapter is not None:
+        delivery = await adapter.deliver_to_channel(
+            channel_id,
+            text,
+            count_reply=count_reply,
+            to=to,
+        )
+        if not delivery.success:
+            error = delivery.raw_response
+            if isinstance(error, (relay.RelayRejected, relay.RelayUnavailable)):
+                return relay_error(error)
+            return RELAY_OUTAGE
+        result = delivery.raw_response
+        owner_copy_queued = False
+    else:
+        redacted = security.redact_outbound(text)
+        send_arguments = {"text": redacted}
+        if to is None:
+            send_arguments["channel_id"] = channel_id
+        else:
+            send_arguments["to"] = to
+        try:
+            async with relay_client(None) as client:
+                result = await relay.send_message(client, **send_arguments)
+        except (relay.RelayRejected, relay.RelayUnavailable) as error:
             return relay_error(error)
-        return RELAY_OUTAGE
+        owner_line = mirror.outgoing(result["channel"], redacted)
+        adapter_module.update_state_file(
+            lambda document: state.queue_mirror(document, owner_line)
+        )
+        if count_reply:
+            adapter_module.update_state_file(
+                lambda document: state.note_reply(
+                    document, channel_id, reply_moment
+                )
+            )
+        owner_copy_queued = True
 
-    result = delivery.raw_response
     if not isinstance(result, dict):
         return "Error: the Message was not sent."
-    return _send_result(result, text, to)
+    return _send_result(result, text, to, owner_copy_queued)
 
 
 def _status_line(delivery: dict) -> str:
@@ -181,7 +226,8 @@ def _status_line(delivery: dict) -> str:
 
 
 async def amessenger_status(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     message_id = args.get("message_id")
@@ -208,7 +254,8 @@ async def amessenger_status(args: dict, **_) -> str:
 
 
 async def amessenger_create_channel(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     name = args.get("name")
@@ -218,7 +265,8 @@ async def amessenger_create_channel(args: dict, **_) -> str:
             channel = await relay.create_channel(client, name, invite)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
-    adapter.remember_channel(channel)
+    if adapter is not None:
+        adapter.remember_channel(channel)
     invited = [
         security.safe_field(member.get("agent"))
         for member in channel.get("members", [])
@@ -240,7 +288,8 @@ async def amessenger_create_channel(args: dict, **_) -> str:
 
 
 async def amessenger_invite(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     channel_id = args.get("channel_id")
@@ -250,12 +299,14 @@ async def amessenger_invite(args: dict, **_) -> str:
             channel = await relay.invite(client, channel_id, agent)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
-    adapter.remember_channel(channel)
+    if adapter is not None:
+        adapter.remember_channel(channel)
     return f"Invited {agent} to channel {channel_id}."
 
 
 async def amessenger_leave(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     channel_id = args.get("channel_id")
@@ -264,12 +315,18 @@ async def amessenger_leave(args: dict, **_) -> str:
             await relay.leave(client, channel_id)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
-    adapter.update_state(lambda document: state.revoke(document, channel_id))
+    if adapter is not None:
+        adapter.update_state(lambda document: state.revoke(document, channel_id))
+    else:
+        adapter_module.update_state_file(
+            lambda document: state.revoke(document, channel_id)
+        )
     return f"Left channel {channel_id}."
 
 
 async def amessenger_remove_member(args: dict, **_) -> str:
-    adapter, error = _adapter_or_error()
+    adapter = active_adapter()
+    error = _configuration_error()
     if error:
         return error
     channel_id = args.get("channel_id")

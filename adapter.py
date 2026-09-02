@@ -66,6 +66,14 @@ def live_adapter():
     return _LIVE_ADAPTER
 
 
+def active_adapter():
+    """Return the running adapter in this process, or ``None`` otherwise."""
+    adapter = live_adapter()
+    if adapter is None or getattr(adapter, "_running", False) is not True:
+        return None
+    return adapter
+
+
 def approval_mode() -> str:
     """Return Hermes's effective approval mode, or ``"unknown"`` if unreadable.
 
@@ -141,6 +149,34 @@ def hermes_home() -> Path:
         if not home:
             raise RuntimeError("cannot resolve Hermes home via hermes_constants.get_hermes_home or HERMES_HOME")
         return Path(home)
+
+
+def state_path_for_process() -> Path:
+    """Return this process's shared AMessenger state path."""
+    return hermes_home() / STATE_DIRNAME / STATE_FILENAME
+
+
+def read_state_file() -> dict:
+    """Read the shared state without requiring a constructed platform adapter."""
+    return state.load(state_path_for_process())
+
+
+def update_state_file(change) -> dict:
+    """Apply one locked read-modify-write to the shared state file."""
+    return state.update_file(state_path_for_process(), change)
+
+
+def build_relay_client(transport=None):
+    """Build a relay client from the current environment settings."""
+    settings = read_settings()
+    return relay.build_client(
+        settings["url"],
+        settings["key"],
+        settings["agent"],
+        transport=transport,
+    )
+
+
 async def sleep(seconds: float) -> None:
     """Sleep behind a module seam so tests never wait real seconds."""
     await asyncio.sleep(seconds)
@@ -369,7 +405,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         return None
 
     def state_path(self) -> Path:
-        return hermes_home() / STATE_DIRNAME / STATE_FILENAME
+        return state_path_for_process()
 
     def state(self) -> dict:
         with self._state_lock:
@@ -393,11 +429,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         lose an expiry or revive a Grant. Every mutation goes through this.
         """
         with self._state_lock:
-            if self._state is None:
-                self._state = state.load(self.state_path())
-            updated = change(self._state)
-            state.save(self.state_path(), updated)
-            self._state = updated
+            # fcntl.flock protects this process from the TUI/CLI; the threading
+            # lock above remains necessary for concurrent work within this adapter.
+            self._state = state.update_file(self.state_path(), change)
+            updated = self._state
             self._pending_mirrors = [*updated.get("pending_mirrors", [])]
             return updated
 
@@ -435,12 +470,32 @@ class AMessengerAdapter(BasePlatformAdapter):
             future = asyncio.run_coroutine_threadsafe(
                 self.mirror_or_queue(text), self._loop
             )
+            completed = threading.Event()
+            outcome = {}
+
+            def record_result(done):
+                try:
+                    outcome["value"] = done.result()
+                except Exception as error:
+                    outcome["error"] = error
+                finally:
+                    completed.set()
+
+            future.add_done_callback(record_result)
+
+            async def wait_for_result():
+                while not completed.is_set():
+                    await asyncio.sleep(0)
+
             # mirror_or_queue queues the text when posting fails, so nothing the
             # Owner should see is lost if this hand-off times out or fails.
-            return await asyncio.get_running_loop().run_in_executor(
-                None, future.result, OWNER_POST_TIMEOUT_SECONDS
+            await asyncio.wait_for(
+                wait_for_result(), OWNER_POST_TIMEOUT_SECONDS
             )
-        except (concurrent.futures.TimeoutError, RuntimeError) as error:
+            if "error" in outcome:
+                raise outcome["error"]
+            return outcome["value"]
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError, RuntimeError) as error:
             logger.warning(
                 "[amessenger] Owner-facing line hand-off failed; line was queued "
                 "for retry: %s",
@@ -643,7 +698,12 @@ class AMessengerAdapter(BasePlatformAdapter):
             configured = base
 
             try:
-                record = state.channel(self.state(), channel_id, state.now())
+                # Preserve the fail-closed adapter seam for unreadable state,
+                # then reload so a TUI Grant is visible to every dispatch.
+                self.state()
+                record = state.channel(
+                    state.load(self.state_path()), channel_id, state.now()
+                )
             except (state.StateFileCorrupt, OSError):
                 logger.exception(
                     "[amessenger] state read failed for Channel %s; "

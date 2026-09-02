@@ -1,27 +1,28 @@
 """Owner-only ``/amsg`` commands."""
 
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 import logging
 import re
 
-from gateway.config import Platform
-
 from . import adapter as adapter_module
 from . import mirror, relay, security, state
-from .adapter import PLATFORM_NAME, read_settings
+from .adapter import active_adapter, read_settings
 
 
 logger = logging.getLogger("amessenger")
 REFUSAL = "AMessenger commands are accepted only from the Owner in the Owner Chat."
-NOT_CONNECTED = "AMessenger is not connected."
 _DURATION = re.compile(r"^(\d+)([hm])$")
 
 _SOURCE: ContextVar = ContextVar("amessenger_source", default=None)
 _GATEWAY: ContextVar = ContextVar("amessenger_gateway", default=None)
+_IN_GATEWAY_PROCESS = False
 
 
 def remember_source(**kwargs) -> None:
     """Stash the gateway event source for the command dispatched just after it."""
+    global _IN_GATEWAY_PROCESS
+    _IN_GATEWAY_PROCESS = True
     event = kwargs.get("event")
     gateway = kwargs.get("gateway")
     source = getattr(event, "source", None)
@@ -34,8 +35,18 @@ def remember_source(**kwargs) -> None:
     return None
 
 
+def in_gateway_process() -> bool:
+    """Return whether Hermes has delivered a gateway dispatch hook here."""
+    return _IN_GATEWAY_PROCESS
+
+
 def owner_check(adapter, source) -> bool:
     """Return whether *source* is the configured Owner in the Owner Chat."""
+    # A TUI/CLI process has no platform adapters or peer path into it. Its
+    # console user is therefore the Owner; the hook flag is positive evidence
+    # of a gateway, because the hook fires before every gateway command.
+    if not in_gateway_process():
+        return True
     if source is None:
         return False
     try:
@@ -71,13 +82,30 @@ def _log_refusal(source) -> None:
     )
 
 
-def _live_adapter(gateway):
-    if gateway is None:
-        return None
+@asynccontextmanager
+async def relay_client(adapter):
+    """Use the adapter client in a gateway and a process-local client in TUI/CLI."""
+    if adapter is None:
+        client = adapter_module.build_relay_client()
+        close_client = True
+    else:
+        client = adapter.client()
+        close_client = False
     try:
-        return gateway.adapters[Platform(PLATFORM_NAME)]
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return None
+        yield client
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+def _read_state(adapter) -> dict:
+    return adapter.state() if adapter is not None else adapter_module.read_state_file()
+
+
+def _update_state(adapter, change) -> dict:
+    if adapter is not None:
+        return adapter.update_state(change)
+    return adapter_module.update_state_file(change)
 
 
 def parse_interact(tokens) -> tuple[str, float | None, str] | None:
@@ -136,7 +164,8 @@ def _ambiguous_message(channels: list[dict]) -> str:
 async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     """Resolve an Owner-facing Channel id, prefix, or exact name."""
     try:
-        channels = await relay.list_channels(adapter.client())
+        async with relay_client(adapter) as client:
+            channels = await relay.list_channels(client)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return None, _relay_failure("list Channels", error)
 
@@ -182,7 +211,8 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
     if error is not None:
         return error
     try:
-        await relay.join(adapter.client(), channel["id"])
+        async with relay_client(adapter) as client:
+            await relay.join(client, channel["id"])
     except (relay.RelayRejected, relay.RelayUnavailable) as caught:
         return _relay_failure("join the Channel", caught)
     return f"Joined {mirror.label(channel)}. Messages in it will be mirrored here."
@@ -210,7 +240,8 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
             )
             level = "base"
     moment = state.now()
-    updated = adapter.update_state(
+    updated = _update_state(
+        adapter,
         lambda document: state.grant(
             document,
             channel["id"],
@@ -246,7 +277,7 @@ async def _notify(adapter, tokens: list[str], help_text: str) -> str:
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
-    adapter.update_state(lambda document: state.revoke(document, channel["id"]))
+    _update_state(adapter, lambda document: state.revoke(document, channel["id"]))
     return (
         f"{mirror.label(channel)} is back to notify. I will show you its Messages "
         "and do nothing else."
@@ -261,10 +292,11 @@ async def _leave(adapter, tokens: list[str], help_text: str) -> str:
     if error is not None:
         return error
     try:
-        await relay.leave(adapter.client(), channel["id"])
+        async with relay_client(adapter) as client:
+            await relay.leave(client, channel["id"])
     except (relay.RelayRejected, relay.RelayUnavailable) as caught:
         return _relay_failure("leave the Channel", caught)
-    adapter.update_state(lambda document: state.revoke(document, channel["id"]))
+    _update_state(adapter, lambda document: state.revoke(document, channel["id"]))
     return f"Left {mirror.label(channel)}."
 
 
@@ -278,7 +310,8 @@ def _is_invited(channel: dict, agent_name: str) -> bool:
 
 async def _status(adapter) -> str:
     try:
-        channels = await relay.list_channels(adapter.client())
+        async with relay_client(adapter) as client:
+            channels = await relay.list_channels(client)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return _relay_failure("list Channels", error)
     if not channels:
@@ -293,7 +326,7 @@ async def _status(adapter) -> str:
                 f"{label} — invited. Join with /amsg join {mirror.handle(channel['id'])}"
             )
             continue
-        record = state.channel(adapter.state(), channel["id"])
+        record = state.channel(_read_state(adapter), channel["id"])
         if record.get("grant") in {"single", "standing"}:
             period = (
                 "standing"
@@ -311,7 +344,7 @@ def _pending_label(adapter, channel_id) -> str:
 
 
 def _pending_entries(adapter) -> list[tuple[str, dict]]:
-    pending = adapter.state()["pending_approvals"]
+    pending = _read_state(adapter)["pending_approvals"]
     return sorted(
         pending.items(),
         key=lambda item: (item[1]["created_at"], item[0]),
@@ -337,6 +370,11 @@ def _waiting_approvals_message(
 
 
 async def _approval(adapter, choice: str, approval_handle: str | None = None) -> str:
+    if adapter is None:
+        return (
+            "Approvals are resolved by the gateway and there is none in this process. "
+            "Run /amsg approve in your Owner Chat."
+        )
     entries = _pending_entries(adapter)
     if not entries:
         return "Nothing is waiting for your approval."
@@ -382,12 +420,8 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
 def make_handler():
     """Return the async callable registered by Hermes as ``/amsg``."""
     async def handle(raw_args: str) -> str:
-        gateway = _GATEWAY.get()
         source = _SOURCE.get()
-        adapter = _live_adapter(gateway)
-        if adapter is None:
-            _log_refusal(source)
-            return NOT_CONNECTED
+        adapter = active_adapter()
         if not owner_check(adapter, source):
             _log_refusal(source)
             return REFUSAL

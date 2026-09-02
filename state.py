@@ -1,9 +1,16 @@
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
+import threading
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
+    fcntl = None
 
 DEFAULT_SINGLE_GRANT_HOURS = 5.0  # A Grant with no duration (§6.6).
 SINGLE_GRANT_IDLE_HOURS = 1.0  # A single Grant's idle limit (§6.6).
@@ -13,6 +20,9 @@ PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 DEDUPE_MAX = 200  # Processed Delivery ids retained for restart-safe dedupe.
 DEDUPE_SECONDS = 3600  # Processed Delivery retention window.
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # Fixed-width UTC timestamps.
+logger = logging.getLogger("amessenger")
+_file_lock_warning_logged = False
+_file_lock_warning_lock = threading.Lock()
 
 
 class StateFileCorrupt(Exception):
@@ -322,3 +332,37 @@ def save(path, state) -> None:
             with suppress(OSError):
                 os.unlink(temporary_name)
         raise
+
+
+@contextmanager
+def file_lock(path):
+    """Hold an exclusive advisory lock on the sibling ``<path>.lock`` file."""
+    global _file_lock_warning_logged
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(f"{target}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        if fcntl is None:
+            with _file_lock_warning_lock:
+                if not _file_lock_warning_logged:
+                    logger.warning(
+                        "[amessenger] fcntl is unavailable; state file locking is disabled"
+                    )
+                    _file_lock_warning_logged = True
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def update_file(path, change) -> dict:
+    """Load, change, and save a state file while holding its process lock."""
+    with file_lock(path):
+        document = load(path)
+        updated = change(document)
+        save(path, updated)
+        return updated
