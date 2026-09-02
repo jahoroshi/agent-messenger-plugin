@@ -97,12 +97,14 @@ def format_card(card: dict | None) -> str:
         return "Your Card is published."
 
     owner = card.get("owner") or {}
+    owner_name = owner.get("name") or owner.get("login") or "unknown"
+    owner_line = f"  Owner: {owner_name}"
+    if owner.get("email"):
+        owner_line += f" <{owner['email']}>"
     lines = [
         "Your Card is published:",
         f"  Agent: {card.get('name') or 'unknown'} ({card.get('kind') or 'unknown'})",
-        "  Owner: "
-        f"{owner.get('name') or owner.get('login') or 'unknown'} "
-        f"<{owner.get('email') or 'unknown'}>",
+        owner_line,
     ]
     if card.get("description"):
         lines.append(f"  About: {card['description']}")
