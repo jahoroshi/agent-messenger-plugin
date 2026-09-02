@@ -442,8 +442,25 @@ class AMessengerAdapter(BasePlatformAdapter):
                 logger.exception("[amessenger] housekeeping pass failed; continuing")
 
     async def housekeeping_once(self) -> None:
-        # Task T7.3 expires Grants and posts the notices.
-        return None
+        """Expire single Grants and tell the Owner about each one (§6.6)."""
+        moment = state.now()
+        updated, ended = state.expire_grants(self.state(), moment)
+        if not ended:
+            return
+        # Write before notices: a Grant must never survive its own expiry because
+        # a chat post failed; this is the opposite of the receive path.
+        self.set_state(updated)
+        for channel_id in ended:
+            posted = await mirror.mirror(
+                self.owner_adapter,
+                self._owner_platform,
+                self._owner_chat_id,
+                mirror.grant_ended(self.known_channel(channel_id)),
+            )
+            if not posted:
+                logger.warning(
+                    "[amessenger] Grant-ended notice failed for Channel %s", channel_id
+                )
 
     async def end_single_grant(self, chat_id: str) -> None:
         """End a single Grant that the Agent reported finished (§6.6)."""

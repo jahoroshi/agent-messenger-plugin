@@ -21,17 +21,15 @@ _GATEWAY: ContextVar = ContextVar("amessenger_gateway", default=None)
 
 def remember_source(**kwargs) -> None:
     """Stash the gateway event source for the command dispatched just after it."""
-    try:
-        event = kwargs.get("event")
-        gateway = kwargs.get("gateway")
-        source = event.source if event is not None else None
-        if source is None or gateway is None:
-            raise ValueError("incomplete pre-dispatch payload")
-        _SOURCE.set(source)
-        _GATEWAY.set(gateway)
-    except Exception:
+    event = kwargs.get("event")
+    gateway = kwargs.get("gateway")
+    source = getattr(event, "source", None)
+    if source is None or gateway is None:
         _SOURCE.set(None)
         _GATEWAY.set(None)
+        return None
+    _SOURCE.set(source)
+    _GATEWAY.set(gateway)
     return None
 
 
@@ -48,7 +46,7 @@ def owner_check(adapter, source) -> bool:
         return same_platform and same_chat and (
             source.chat_type == "dm" or named_owner
         )
-    except (AttributeError, KeyError, TypeError, ValueError):
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
         return False
 
 
@@ -138,8 +136,8 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     """Resolve an Owner-facing Channel id, prefix, or exact name."""
     try:
         channels = await relay.list_channels(adapter.client())
-    except Exception as error:
-        return None, f"Could not list Channels: {error}"
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return None, _relay_failure("list Channels", error)
 
     exact_ids = [channel for channel in channels if channel.get("id") == token]
     if exact_ids:
@@ -184,7 +182,7 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
         return error
     try:
         await relay.join(adapter.client(), channel["id"])
-    except Exception as caught:
+    except (relay.RelayRejected, relay.RelayUnavailable) as caught:
         return _relay_failure("join the Channel", caught)
     return f"Joined {mirror.label(channel)}. Messages in it will be mirrored here."
 
@@ -242,7 +240,7 @@ async def _leave(adapter, tokens: list[str], help_text: str) -> str:
         return error
     try:
         await relay.leave(adapter.client(), channel["id"])
-    except Exception as caught:
+    except (relay.RelayRejected, relay.RelayUnavailable) as caught:
         return _relay_failure("leave the Channel", caught)
     adapter.set_state(state.revoke(adapter.state(), channel["id"]))
     return f"Left {mirror.label(channel)}."
@@ -259,8 +257,8 @@ def _is_invited(channel: dict, agent_name: str) -> bool:
 async def _status(adapter) -> str:
     try:
         channels = await relay.list_channels(adapter.client())
-    except Exception as error:
-        return f"Could not list Channels: {error}"
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return _relay_failure("list Channels", error)
     if not channels:
         return "No Channels yet."
 
@@ -287,9 +285,7 @@ async def _status(adapter) -> str:
 
 
 def _pending_label(adapter, channel_id) -> str:
-    known = getattr(adapter, "known_channel", None)
-    channel = known(channel_id) if callable(known) else {"id": channel_id, "name": None}
-    return mirror.label(channel)
+    return mirror.label(adapter.known_channel(channel_id))
 
 
 async def _approval(adapter, choice: str) -> str:
