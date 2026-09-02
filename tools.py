@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 import logging
 
-from . import mirror, relay, state
+from . import relay, state
 from .adapter import check_requirements, live_adapter, read_settings
 
 
@@ -21,7 +21,7 @@ def relay_error(error) -> str:
 
 def _adapter_or_error():
     adapter = live_adapter()
-    if adapter is None:
+    if adapter is None or getattr(adapter, "_running", False) is not True:
         return None, NOT_CONNECTED
     return adapter, None
 
@@ -145,22 +145,28 @@ async def amessenger_send(args: dict, **_) -> str:
     if (to is None) == (channel_id is None):
         return "Error: provide exactly one of 'to' and 'channel_id'."
     text = args.get("text", "")
-    try:
-        async with relay_client(adapter) as client:
-            result = await relay.send_message(
-                client, to=to, channel_id=channel_id, text=text
-            )
-    except (relay.RelayRejected, relay.RelayUnavailable) as error:
-        return relay_error(error)
+    count_reply = False
+    if channel_id is not None:
+        # A tool send into an active Grant uses the same bounded reply window as
+        # an autonomous Channel reply. No Grant means there is no window to count.
+        record = state.channel(adapter.state(), channel_id, state.now())
+        count_reply = record["grant"] is not None
 
-    adapter.remember_channel(result["channel"])
-    # The reply cap does not apply: it counts autonomous replies inside a
-    # Channel session, not a Message the Owner asked the Agent to send.
-    posted = await adapter.post_owner_line(mirror.outgoing(result["channel"], text))
-    if not posted:
-        logger.warning(
-            "[amessenger] outgoing Mirror failed for tool send; Message was accepted"
-        )
+    delivery = await adapter.deliver_to_channel(
+        channel_id,
+        text,
+        count_reply=count_reply,
+        to=to,
+    )
+    if not delivery.success:
+        error = delivery.raw_response
+        if isinstance(error, (relay.RelayRejected, relay.RelayUnavailable)):
+            return relay_error(error)
+        return RELAY_OUTAGE
+
+    result = delivery.raw_response
+    if not isinstance(result, dict):
+        return "Error: the Message was not sent."
     return _send_result(result, text, to)
 
 

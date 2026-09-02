@@ -45,7 +45,9 @@ DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
 PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 OWNER_POST_TIMEOUT_SECONDS = 15
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
+TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail tools
 NO_TOOLS_SENTINEL = "amessenger_none"
+DELIVERY_FAILURE_NOTICE_PREFIX = "⚠️ Message delivery failed"
 _LIVE_ADAPTER = None
 
 
@@ -100,6 +102,21 @@ def approval_bypass_active(session_key: str) -> bool:
             session_key,
         )
         return True
+
+
+def relay_failure_is_retryable(error: RelayUnavailable) -> bool:
+    """Return whether a relay failure proves that no request reached the relay."""
+    cause = error.__cause__
+    return isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+def relay_failure_detail(error: RelayUnavailable) -> str:
+    """Make uncertain timeout failures visible to Hermes's no-fallback guard."""
+    detail = str(error)
+    is_timeout = isinstance(error.__cause__, httpx.TimeoutException)
+    if is_timeout and not relay_failure_is_retryable(error):
+        return f"{detail}; request timed out" if detail else "request timed out"
+    return detail
 
 
 PLATFORM_HINT = (
@@ -208,8 +225,6 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._seen: "OrderedDict[str, float]" = OrderedDict()
         self._channels: dict[str, dict] = {}
         self._pending_mirrors: list[str] = []
-        global _LIVE_ADAPTER
-        _LIVE_ADAPTER = self
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -370,6 +385,9 @@ class AMessengerAdapter(BasePlatformAdapter):
             return False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        global _LIVE_ADAPTER
+        _LIVE_ADAPTER = None
+        self._running = False
         problem = self.configuration_problem()
         if problem:
             logger.error("[amessenger] not connecting: %s", problem)
@@ -379,6 +397,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._poll_task = asyncio.create_task(self.run_poll_loop())
         self._housekeeping_task = asyncio.create_task(self.run_housekeeping_loop())
         self._mark_connected()
+        _LIVE_ADAPTER = self
         logger.info(
             "[amessenger] connected Agent %s with Owner Chat %s:%s",
             self._settings["agent"],
@@ -543,7 +562,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                     channel_id,
                 )
             else:
-                if record["level"] == "full":
+                if record["policy"] == "interact" and record["level"] == "full":
                     from gateway.session import build_session_key
 
                     session_key = build_session_key(source)
@@ -563,16 +582,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                             ", ".join(failed_conditions),
                         )
 
-            # Filter here instead of trusting Owner-controlled configuration:
-            # management tools are reserved for Owner Chat sessions.
-            toolsets = [
-                toolset for toolset in configured if toolset != MANAGE_TOOLSET
-            ]
-            if len(toolsets) != len(configured):
-                logger.warning(
-                    "[amessenger] filtering %s from Channel toolsets; Owner Chat only",
-                    MANAGE_TOOLSET,
-                )
+            toolsets = self._filter_channel_toolsets(configured, channel_id)
         except Exception:
             # This gate deliberately catches every other error and fails closed:
             # a Channel must never inherit Hermes's platform-default toolsets.
@@ -581,9 +591,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 "configuration or approval bypass state; using base Tool Level",
                 channel_id,
             )
-            toolsets = [
-                toolset for toolset in base if toolset != MANAGE_TOOLSET
-            ]
+            toolsets = self._filter_channel_toolsets(base, channel_id)
 
         if toolsets:
             return toolsets
@@ -597,6 +605,26 @@ class AMessengerAdapter(BasePlatformAdapter):
             NO_TOOLS_SENTINEL,
         )
         return [NO_TOOLS_SENTINEL]
+
+    @staticmethod
+    def _filter_channel_toolsets(toolsets: list[str], channel_id: str) -> list[str]:
+        """Remove every AMessenger toolset from a peer-driven Channel session."""
+        filtered = [
+            toolset
+            for toolset in toolsets
+            if toolset in {TOOLSET, MANAGE_TOOLSET}
+        ]
+        if filtered:
+            logger.warning(
+                "[amessenger] filtering %s from Channel %s toolsets; Owner Chat only",
+                ", ".join(dict.fromkeys(filtered)),
+                channel_id,
+            )
+        return [
+            toolset
+            for toolset in toolsets
+            if toolset not in {TOOLSET, MANAGE_TOOLSET}
+        ]
 
     async def run_poll_loop(self) -> None:
         index = 0
@@ -690,6 +718,8 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
 
     async def disconnect(self) -> None:
+        global _LIVE_ADAPTER
+        _LIVE_ADAPTER = None
         self._running = False
         for attribute in ("_poll_task", "_housekeeping_task"):
             task = getattr(self, attribute)
@@ -708,8 +738,6 @@ class AMessengerAdapter(BasePlatformAdapter):
             await client.aclose()
         self._loop = None
         self._mark_disconnected()
-        global _LIVE_ADAPTER
-        _LIVE_ADAPTER = None
 
     async def send_exec_approval(
         self,
@@ -769,6 +797,118 @@ class AMessengerAdapter(BasePlatformAdapter):
         logger.error("[amessenger] %s", error)
         return SendResult(success=False, error=error)
 
+    def _keep_cap_record(self, channel_id: str) -> None:
+        """Switch a capped Channel to notify without discarding its window."""
+        document = self.state()
+        record = document["channels"].get(channel_id)
+        if record is None:
+            return
+        channels = {
+            **document["channels"],
+            channel_id: {**record, "policy": "notify"},
+        }
+        self.set_state({**document, "channels": channels})
+
+    async def deliver_to_channel(
+        self,
+        channel_id: str | None,
+        text: str,
+        *,
+        count_reply: bool,
+        to: str | None = None,
+    ) -> SendResult:
+        """Redact, send to the relay, Mirror to the Owner, and count a reply.
+
+        This is the only path by which a Message reaches a peer. ``to`` is used
+        only by the Owner-side tool; the relay resolves it to a Channel as part
+        of the same POST.
+        """
+        if text.startswith(DELIVERY_FAILURE_NOTICE_PREFIX):
+            logger.warning(
+                "[amessenger] dropping Hermes delivery-failure notice; it is not mail"
+            )
+            return SendResult(success=True, message_id=None)
+
+        moment = state.now() if count_reply else None
+        if count_reply and state.cap_reached(self.state(), channel_id, moment):
+            self._keep_cap_record(channel_id)
+            posted = await self.mirror_or_queue(
+                mirror.cap_reached(self.known_channel(channel_id)),
+            )
+            # The reply was deliberately not sent; that is not a delivery failure.
+            suffix = "" if posted else "; cap notice failed"
+            logger.warning(
+                "[amessenger] reply cap reached for Channel %s%s",
+                channel_id,
+                suffix,
+            )
+            return SendResult(success=True, message_id=None)
+
+        redacted = security.redact_outbound(text)
+        if self.on_gateway_loop():
+            client = self.client()
+            close_client = False
+        else:
+            settings = self._settings or read_settings()
+            client = relay.build_client(
+                settings["url"],
+                settings["key"],
+                settings["agent"],
+                transport=self._transport,
+            )
+            close_client = True
+        try:
+            try:
+                # This is the only path by which a Message reaches a peer.
+                send_arguments = {"text": redacted}
+                if to is None:
+                    send_arguments["channel_id"] = channel_id
+                else:
+                    send_arguments["to"] = to
+                result = await relay.send_message(client, **send_arguments)
+            except RelayRejected as error:
+                logger.warning("[amessenger] outbound relay send failed: %s", error)
+                return SendResult(
+                    success=False,
+                    error=str(error),
+                    raw_response=error,
+                    retryable=False,
+                )
+            except RelayUnavailable as error:
+                logger.warning("[amessenger] outbound relay send failed: %s", error)
+                return SendResult(
+                    success=False,
+                    error=relay_failure_detail(error),
+                    raw_response=error,
+                    retryable=relay_failure_is_retryable(error),
+                )
+        finally:
+            if close_client:
+                await client.aclose()
+
+        self.remember_channel(result["channel"])
+        outgoing_line = mirror.outgoing(result["channel"], redacted)
+        if self._loop is None or self.on_gateway_loop():
+            posted = await self.mirror_or_queue(outgoing_line)
+        else:
+            # Tool calls may run on a worker loop; post_owner_line hands the
+            # Mirror to the gateway loop, where it goes through mirror_or_queue.
+            posted = await self.post_owner_line(outgoing_line)
+        if not posted:
+            logger.warning(
+                "[amessenger] outgoing Mirror failed for Channel %s; send succeeded",
+                channel_id or result["channel"]["id"],
+            )
+
+        if count_reply:
+            self.set_state(state.note_reply(self.state(), channel_id, moment))
+
+        return SendResult(
+            success=True,
+            message_id=result["message"]["id"],
+            raw_response=result,
+        )
+
     async def send(
         self,
         chat_id,
@@ -777,6 +917,14 @@ class AMessengerAdapter(BasePlatformAdapter):
         metadata=None,
     ) -> SendResult:
         INTERIM_SEND_KEY = "_interim_send"   # Hermes marks streaming/commentary sends with this
+
+        if isinstance(content, str) and content.startswith(
+            DELIVERY_FAILURE_NOTICE_PREFIX
+        ):
+            logger.warning(
+                "[amessenger] dropping Hermes delivery-failure notice; it is not mail"
+            )
+            return SendResult(success=True, message_id=None)
 
         # A Channel is not a chat window. Hermes may stream interim commentary through
         # send() when display.streaming or display.interim_assistant_messages is on, and
@@ -796,56 +944,14 @@ class AMessengerAdapter(BasePlatformAdapter):
                 await self.end_single_grant(chat_id)
             return SendResult(success=True, message_id=None)
 
-        moment = state.now()
-        if state.cap_reached(self.state(), chat_id, moment):
-            self.set_state(state.revoke(self.state(), chat_id))
-            posted = await self.mirror_or_queue(
-                mirror.cap_reached(self.known_channel(chat_id)),
-            )
-            # Check before counting: replies one through twenty go out; the
-            # twenty-first reply inside the ten-minute window is stopped.
-            suffix = "" if posted else "; cap notice failed"
-            logger.warning(
-                "[amessenger] reply cap reached for Channel %s%s",
-                chat_id,
-                suffix,
-            )
-            return SendResult(success=False, error="reply cap reached")
-
-        redacted = security.redact_outbound(text)
-        # An answer produced under a Grant still goes out if that Grant just
-        # ended; send does not check Mail Policy, so only the cap and Grant
-        # rules below can gate this outbound path.
-        try:
-            result = await relay.send_message(
-                self.client(), channel_id=chat_id, text=redacted
-            )
-        except (RelayRejected, RelayUnavailable) as error:
-            logger.warning("[amessenger] outbound relay send failed: %s", error)
-            return SendResult(
-                success=False,
-                error=str(error),
-                retryable=True,
-            )
-
-        self.remember_channel(result["channel"])
-        # The relay has accepted the Message and it cannot be unsent, so a
-        # failed Owner Chat Mirror is queued but does not make this send fail.
-        posted = await self.mirror_or_queue(
-            mirror.outgoing(result["channel"], redacted),
+        result = await self.deliver_to_channel(
+            chat_id,
+            text,
+            count_reply=True,
         )
-        if not posted:
-            logger.warning(
-                "[amessenger] outgoing Mirror failed for Channel %s; send succeeded",
-                chat_id,
-            )
-
-        self.set_state(state.note_reply(self.state(), chat_id, moment))
-
-        if task_done:
+        if result.success and task_done and result.message_id is not None:
             await self.end_single_grant(chat_id)
-
-        return SendResult(success=True, message_id=result["message"]["id"])
+        return result
 
     async def mirror_or_queue(self, text: str) -> bool:
         """Post an Owner-facing line, and remember it for a retry when the post fails.
