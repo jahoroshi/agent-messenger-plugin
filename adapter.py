@@ -143,6 +143,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._housekeeping_task = None
         self._card = self._state = None
         self._seen: "OrderedDict[str, float]" = OrderedDict()
+        self._channels: dict[str, dict] = {}
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -272,6 +273,15 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._prune_seen(monotonic())
         return delivery_id in self._seen
 
+    def remember_channel(self, channel: dict) -> None:
+        """Remember the latest relay Channel record for Owner-facing notices."""
+        self._channels[channel["id"]] = dict(channel)
+
+    def known_channel(self, channel_id: str) -> dict:
+        """Return a remembered Channel, or a renderable unnamed fallback."""
+        channel = self._channels.get(channel_id)
+        return dict(channel) if channel is not None else {"id": channel_id, "name": None}
+
     async def poll_once(self) -> list[dict]:
         deliveries = await self.fetch_deliveries()
         done = []
@@ -289,6 +299,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         delivery_id = delivery["id"]
         message = delivery["message"]
         channel = delivery["channel"]
+        self.remember_channel(channel)
         sender_card = delivery.get("sender_card")
         kind = message["kind"]
         logger.info("[amessenger] Delivery %s kind=%s", delivery_id, kind)
@@ -434,6 +445,23 @@ class AMessengerAdapter(BasePlatformAdapter):
         # Task T7.3 expires Grants and posts the notices.
         return None
 
+    async def end_single_grant(self, chat_id: str) -> None:
+        """End a single Grant that the Agent reported finished (§6.6)."""
+        if state.channel(self.state(), chat_id)["grant"] != "single":
+            return
+        self.set_state(state.revoke(self.state(), chat_id))
+        posted = await mirror.mirror(
+            self.owner_adapter,
+            self._owner_platform,
+            self._owner_chat_id,
+            mirror.grant_ended(self.known_channel(chat_id)),
+        )
+        if not posted:
+            logger.warning(
+                "[amessenger] Grant-ended notice failed for Channel %s",
+                chat_id,
+            )
+
     async def disconnect(self) -> None:
         self._running = False
         for attribute in ("_poll_task", "_housekeeping_task"):
@@ -460,9 +488,72 @@ class AMessengerAdapter(BasePlatformAdapter):
         reply_to=None,
         metadata=None,
     ) -> SendResult:
-        # Task T6.3 replaces this whole placeholder body with outbound mail.
-        logger.error("[amessenger] send arrives in task T6.3")
-        return SendResult(success=False, error="AMessenger send arrives in task T6.3")
+        task_done = security.has_task_done(content)
+        no_reply = security.has_no_reply(content)
+        text = security.strip_markers(content)
+
+        if no_reply or not text:
+            logger.debug("[amessenger] no outbound reply for Channel %s", chat_id)
+            if task_done:
+                await self.end_single_grant(chat_id)
+            return SendResult(success=True, message_id=None)
+
+        moment = state.now()
+        if state.cap_reached(self.state(), chat_id, moment):
+            self.set_state(state.revoke(self.state(), chat_id))
+            posted = await mirror.mirror(
+                self.owner_adapter,
+                self._owner_platform,
+                self._owner_chat_id,
+                mirror.cap_reached(self.known_channel(chat_id)),
+            )
+            # Check before counting: replies one through twenty go out; the
+            # twenty-first reply inside the ten-minute window is stopped.
+            suffix = "" if posted else "; cap notice failed"
+            logger.warning(
+                "[amessenger] reply cap reached for Channel %s%s",
+                chat_id,
+                suffix,
+            )
+            return SendResult(success=False, error="reply cap reached")
+
+        redacted = security.redact_outbound(text)
+        # An answer produced under a Grant still goes out if that Grant just
+        # ended; send does not check Mail Policy, so only the cap and Grant
+        # rules below can gate this outbound path.
+        try:
+            result = await relay.send_message(
+                self.client(), channel_id=chat_id, text=redacted
+            )
+        except (RelayRejected, RelayUnavailable) as error:
+            logger.warning("[amessenger] outbound relay send failed: %s", error)
+            return SendResult(
+                success=False,
+                error=str(error),
+                retryable=True,
+            )
+
+        self.remember_channel(result["channel"])
+        # The relay has accepted the Message and it cannot be unsent, so a
+        # failed Owner Chat Mirror is logged but does not make this send fail.
+        posted = await mirror.mirror(
+            self.owner_adapter,
+            self._owner_platform,
+            self._owner_chat_id,
+            mirror.outgoing(result["channel"], redacted),
+        )
+        if not posted:
+            logger.warning(
+                "[amessenger] outgoing Mirror failed for Channel %s; send succeeded",
+                chat_id,
+            )
+
+        self.set_state(state.note_reply(self.state(), chat_id, moment))
+
+        if task_done:
+            await self.end_single_grant(chat_id)
+
+        return SendResult(success=True, message_id=result["message"]["id"])
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": chat_id, "type": "dm"}

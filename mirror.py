@@ -51,6 +51,16 @@ def outgoing(channel, text) -> str:
     return f"📤 AMessenger · to channel {label(channel)}\n{text}"
 
 
+def grant_ended(channel: dict) -> str:
+    """Format the notice for a single Grant ended by the Agent."""
+    return f"🔕 AMessenger · Grant for {label(channel)} ended, back to notify."
+
+
+def cap_reached(channel: dict) -> str:
+    """Format the notice for a Channel that reached its reply cap."""
+    return f"🔕 AMessenger · Cap reached, channel {label(channel)} back to notify."
+
+
 def invite(channel, text) -> str:
     """Format an Invite, including its first Message, for the Owner Chat."""
     return (
