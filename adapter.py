@@ -10,7 +10,7 @@ import time
 
 import httpx
 
-from . import state
+from . import security, state
 from . import mirror, relay
 from .mirror import format_card
 from .relay import (
@@ -21,7 +21,7 @@ from .relay import (
     WAIT_TIMEOUT_SECONDS,
 )
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 
 
 logger = logging.getLogger("amessenger")
@@ -39,6 +39,7 @@ AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
 DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
 DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
+MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 
 PLATFORM_HINT = (
     "You are on AMessenger. A message arriving inside square brackets that names "
@@ -342,8 +343,42 @@ class AMessengerAdapter(BasePlatformAdapter):
         return True
 
     async def dispatch(self, delivery: dict) -> None:
-        # Task T6.2 builds the source, frames the text and calls handle_message.
-        return None
+        message = delivery["message"]
+        channel = delivery["channel"]
+        sender = message["sender"] or "unknown"
+        framed = security.wrap_inbound(delivery.get("sender_card"), channel, message["text"])
+        source = self.build_source(
+            chat_id=channel["id"],
+            chat_name=channel.get("name") or channel["id"],
+            chat_type="dm",
+            user_id=sender,
+            user_name=sender,
+        )
+        event = MessageEvent(
+            text=framed,
+            source=source,
+            message_id=message["id"],
+            allow_gateway_control=False,  # Peer '/' input is never a gateway command.
+        )
+        await self.handle_message(event)
+
+    def toolsets_for_source(self, source) -> list[str]:
+        level = state.channel(self.state(), source.chat_id)["level"]
+        settings = read_settings()
+        configured = (
+            settings["full_toolsets"]
+            if level == "full"
+            else settings["base_toolsets"]
+        )
+        # Filter here instead of trusting Owner-controlled configuration: management
+        # tools are reserved for Owner Chat sessions, never Channel sessions.
+        toolsets = [toolset for toolset in configured if toolset != MANAGE_TOOLSET]
+        if len(toolsets) != len(configured):
+            logger.warning(
+                "[amessenger] filtering %s from Channel toolsets; Owner Chat only",
+                MANAGE_TOOLSET,
+            )
+        return toolsets
 
     async def run_poll_loop(self) -> None:
         index = 0
