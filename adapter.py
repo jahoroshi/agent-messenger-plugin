@@ -672,6 +672,16 @@ class AMessengerAdapter(BasePlatformAdapter):
         reply_to=None,
         metadata=None,
     ) -> SendResult:
+        INTERIM_SEND_KEY = "_interim_send"   # Hermes marks streaming/commentary sends with this
+
+        # A Channel is not a chat window. Hermes may stream interim commentary through
+        # send() when display.streaming or display.interim_assistant_messages is on, and
+        # every send here becomes a durable Message to another Owner's Agent. Only the
+        # turn's final answer is mail; interim frames are dropped.
+        if isinstance(metadata, dict) and metadata.get(INTERIM_SEND_KEY):
+            logger.debug("[amessenger] dropping interim send for Channel %s", chat_id)
+            return SendResult(success=True, message_id=None)
+
         task_done = security.has_task_done(content)
         no_reply = security.has_no_reply(content)
         text = security.strip_markers(content)

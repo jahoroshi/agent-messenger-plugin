@@ -139,7 +139,9 @@ def note(platform: str, chat_id: str, text: str) -> bool:
         logger.warning("[amessenger] Owner Chat transcript unavailable: %s", error)
         return False
     if not result:
-        logger.warning("[amessenger] Owner Chat transcript note failed")
+        logger.info(
+            "[amessenger] Owner saw the post; only the session transcript note did not land"
+        )
     return bool(result)
 
 
