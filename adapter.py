@@ -877,11 +877,22 @@ class AMessengerAdapter(BasePlatformAdapter):
                 return
             except (RelayRejected, RelayUnavailable) as error:
                 wait = RECONNECT_BACKOFF[min(index, len(RECONNECT_BACKOFF) - 1)]
-                logger.warning(
-                    "[amessenger] relay unavailable (%s); retrying in %ss",
-                    error,
-                    wait,
-                )
+                if (
+                    isinstance(error, RelayRejected)
+                    and error.code == "agent_connected_elsewhere"
+                ):
+                    settings = self._settings or read_settings()
+                    logger.error(
+                        "[amessenger] another gateway is publishing Agent %s; "
+                        "this one will retry",
+                        settings["agent"],
+                    )
+                else:
+                    logger.warning(
+                        "[amessenger] relay unavailable (%s); retrying in %ss",
+                        error,
+                        wait,
+                    )
                 self._card = None
                 index += 1
                 await sleep(wait)
