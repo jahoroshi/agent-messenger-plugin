@@ -29,6 +29,8 @@ logger = logging.getLogger("amessenger")
 
 PLATFORM_NAME = "amessenger"
 RECONNECT_BACKOFF = (1, 2, 5, 10, 30)   # seconds, §6.2: reconnect backoff 1–30 s
+OWNER_WAIT_BACKOFF = (1, 2, 5, 10, 30)     # seconds between attempts to find the Owner Chat adapter
+OWNER_WAIT_MAX_SECONDS = 300               # §6.2: give a slow-starting Owner Chat five minutes
 MIN_POLL_CYCLE_SECONDS = 1.0            # a poll that returns nothing instantly must not spin
 HOUSEKEEPING_SECONDS = 60               # §6.2: expire Grants every minute
 MAX_MESSAGE_LENGTH = 65536              # SYSTEM_DESIGN §5: text ≤ 64 KB
@@ -191,13 +193,12 @@ class AMessengerAdapter(BasePlatformAdapter):
             return "AMESSENGER_OWNER_CHAT must name an Owner Chat platform"
 
         runner = getattr(self, "gateway_runner", None)
-        adapters = getattr(runner, "adapters", None) if runner is not None else None
         try:
             platform = Platform(owner_platform)
         except ValueError:
-            platform = None
-        if runner is None or not adapters or platform is None or platform not in adapters:
-            return f"the Owner Chat platform '{owner_platform}' is not connected"
+            return f"the Owner Chat platform '{owner_platform}' is not a known Hermes platform"
+        if runner is None:
+            return "the gateway runner is unavailable"
 
         if not owner_chat_id:
             runner_config = getattr(runner, "config", None)
@@ -220,7 +221,49 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     @property
     def owner_adapter(self):
-        return self.gateway_runner.adapters[Platform(self._owner_platform)]
+        runner = getattr(self, "gateway_runner", None)
+        adapters = getattr(runner, "adapters", None) if runner is not None else None
+        if adapters is None:
+            return None
+        try:
+            platform = Platform(self._owner_platform)
+        except ValueError:
+            return None
+        return adapters.get(platform)
+
+    async def wait_for_owner_adapter(self):
+        """Return the Owner Chat adapter, waiting for Hermes to start it (§6.2)."""
+        owner = self.owner_adapter
+        if owner is not None:
+            return owner
+
+        waited = 0
+        attempt = 0
+        logger.info(
+            "[amessenger] waiting for Owner Chat platform '%s' adapter to start",
+            self._owner_platform,
+        )
+        while waited < OWNER_WAIT_MAX_SECONDS:
+            delay = OWNER_WAIT_BACKOFF[min(attempt, len(OWNER_WAIT_BACKOFF) - 1)]
+            await sleep(delay)
+            waited += delay
+            attempt += 1
+
+            owner = self.owner_adapter
+            if owner is not None:
+                logger.info(
+                    "[amessenger] Owner Chat platform '%s' adapter appeared after %ss",
+                    self._owner_platform,
+                    waited,
+                )
+                return owner
+
+        logger.error(
+            "[amessenger] Owner Chat platform '%s' adapter did not appear after %ss",
+            self._owner_platform,
+            waited,
+        )
+        return None
 
     def state_path(self) -> Path:
         return hermes_home() / STATE_DIRNAME / STATE_FILENAME
@@ -386,8 +429,11 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def _mirror_delivery(self, delivery: dict, text: str) -> bool:
         # Receive mirrors stay direct: failure prevents Ack, so the relay re-offers the Delivery.
+        owner = await self.wait_for_owner_adapter()
+        if owner is None:
+            return False
         posted = await mirror.mirror(
-            self.owner_adapter,
+            owner,
             self._owner_platform,
             self._owner_chat_id,
             text,
@@ -483,7 +529,14 @@ class AMessengerAdapter(BasePlatformAdapter):
             return
         text = self._help_text + "\n\n" + format_card(self._card)
         # Welcome stays direct: it is retried on restart and recorded only after delivery.
-        if not await mirror.post(self.owner_adapter, self._owner_chat_id, text):
+        owner = await self.wait_for_owner_adapter()
+        if owner is None:
+            logger.warning(
+                "[amessenger] welcome not delivered to Owner Chat %s",
+                self._owner_chat_id,
+            )
+            return
+        if not await mirror.post(owner, self._owner_chat_id, text):
             logger.warning("[amessenger] welcome not delivered to Owner Chat %s", self._owner_chat_id)
             return
         self.set_state(state.set_welcomed(self.state(), True))
@@ -565,7 +618,12 @@ class AMessengerAdapter(BasePlatformAdapter):
         allow_session=True,
         smart_denied=False,
     ) -> SendResult:
-        owner = self.owner_adapter
+        owner = await self.wait_for_owner_adapter()
+        if owner is None:
+            return SendResult(
+                success=False,
+                error="approval request was not delivered to the Owner Chat",
+            )
         # Nothing in this method may post into the Channel: the peer must never
         # learn that an approval was asked for, let alone answer it.
         if getattr(type(owner), "send_exec_approval", None) is not None:
@@ -681,12 +739,16 @@ class AMessengerAdapter(BasePlatformAdapter):
         The queue is in memory and is lost on a gateway restart. A restart
         re-publishes the Card and the Owner sees the Agent come back.
         """
-        posted = await mirror.mirror(
-            self.owner_adapter,
-            self._owner_platform,
-            self._owner_chat_id,
-            text,
-        )
+        owner = await self.wait_for_owner_adapter()
+        if owner is None:
+            posted = False
+        else:
+            posted = await mirror.mirror(
+                owner,
+                self._owner_platform,
+                self._owner_chat_id,
+                text,
+            )
         if posted:
             return True
 
@@ -702,11 +764,15 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def flush_pending_mirrors(self) -> None:
         """Retry the Owner-facing lines the Owner Chat refused earlier."""
+        owner = await self.wait_for_owner_adapter()
+        if owner is None:
+            return
+
         delivered = 0
         while self._pending_mirrors:
             text = self._pending_mirrors[0]
             if not await mirror.mirror(
-                self.owner_adapter,
+                owner,
                 self._owner_platform,
                 self._owner_chat_id,
                 text,
