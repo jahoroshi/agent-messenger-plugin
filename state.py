@@ -10,6 +10,8 @@ SINGLE_GRANT_IDLE_HOURS = 1.0  # A single Grant's idle limit (§6.6).
 REPLY_CAP = 20  # Autonomous replies allowed per Channel (§6.4).
 REPLY_WINDOW_SECONDS = 600  # Rolling reply-cap window (§6.4).
 PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
+DEDUPE_MAX = 200  # Processed Delivery ids retained for restart-safe dedupe.
+DEDUPE_SECONDS = 3600  # Processed Delivery retention window.
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # Fixed-width UTC timestamps.
 
 
@@ -42,6 +44,7 @@ def empty_state() -> dict:
         "channels": {},
         "pending_approvals": {},
         "pending_mirrors": [],
+        "seen_deliveries": {},
     }
 
 
@@ -57,11 +60,22 @@ def _copy_pending(pending: dict) -> dict:
     return {key: {**entry} for key, entry in pending.items()}
 
 
-def _copy_state(state: dict, channels=None, pending=None, pending_mirrors=None) -> dict:
+def _copy_state(
+    state: dict,
+    channels=None,
+    pending=None,
+    pending_mirrors=None,
+    seen_deliveries=None,
+) -> dict:
     mirrors = (
         state.get("pending_mirrors", [])
         if pending_mirrors is None
         else pending_mirrors
+    )
+    seen = (
+        state.get("seen_deliveries", {})
+        if seen_deliveries is None
+        else seen_deliveries
     )
     return {
         **state,
@@ -70,6 +84,7 @@ def _copy_state(state: dict, channels=None, pending=None, pending_mirrors=None) 
             state["pending_approvals"] if pending is None else pending
         ),
         "pending_mirrors": [*mirrors],
+        "seen_deliveries": {**seen},
     }
 
 
@@ -131,6 +146,39 @@ def note_reply(state: dict, channel_id, moment) -> dict:
 def cap_reached(state: dict, channel_id, moment) -> bool:
     record = state["channels"].get(channel_id)
     return record is not None and len(_replies_in_window(record, moment)) >= REPLY_CAP
+
+
+def forget_old_deliveries(state: dict, moment: datetime) -> dict:
+    """Drop expired Delivery ids and retain only the newest bounded set."""
+    cutoff = moment - timedelta(seconds=DEDUPE_SECONDS)
+    current = {}
+    for delivery_id, seen_at in state.get("seen_deliveries", {}).items():
+        parsed = parse_ts(seen_at)
+        if parsed is not None and parsed >= cutoff:
+            current[delivery_id] = seen_at
+    if len(current) > DEDUPE_MAX:
+        current = dict(list(current.items())[-DEDUPE_MAX:])
+    return _copy_state(state, seen_deliveries=current)
+
+
+def remember_delivery(state: dict, delivery_id: str, moment: datetime) -> dict:
+    """Remember a Delivery id with a timestamp, without mutating *state*."""
+    updated = forget_old_deliveries(state, moment)
+    seen = {**updated["seen_deliveries"]}
+    seen.pop(delivery_id, None)
+    seen[delivery_id] = ts(moment)
+    if len(seen) > DEDUPE_MAX:
+        seen = dict(list(seen.items())[-DEDUPE_MAX:])
+    return _copy_state(updated, seen_deliveries=seen)
+
+
+def was_delivery_seen(state: dict, delivery_id: str, moment: datetime) -> bool:
+    """Return whether *delivery_id* is still inside the dedupe window."""
+    seen_at = state.get("seen_deliveries", {}).get(delivery_id)
+    parsed = parse_ts(seen_at)
+    if parsed is None:
+        return False
+    return parsed >= moment - timedelta(seconds=DEDUPE_SECONDS)
 
 
 def _timestamps_are_valid(record: dict) -> bool:
@@ -230,6 +278,9 @@ def load(path) -> dict:
     pending_mirrors = (
         document.get("pending_mirrors", []) if isinstance(document, dict) else None
     )
+    seen_deliveries = (
+        document.get("seen_deliveries", {}) if isinstance(document, dict) else None
+    )
     valid = (
         isinstance(document, dict)
         and isinstance(document.get("welcomed"), bool)
@@ -237,10 +288,19 @@ def load(path) -> dict:
         and isinstance(document.get("pending_approvals"), dict)
         and isinstance(pending_mirrors, list)
         and all(isinstance(value, str) for value in pending_mirrors)
+        and isinstance(seen_deliveries, dict)
+        and all(
+            isinstance(delivery_id, str) and isinstance(seen_at, str)
+            for delivery_id, seen_at in seen_deliveries.items()
+        )
     )
     if not valid:
         raise StateFileCorrupt(f"invalid state file: {target}")
-    return {**document, "pending_mirrors": [*pending_mirrors]}
+    return {
+        **document,
+        "pending_mirrors": [*pending_mirrors],
+        "seen_deliveries": {**seen_deliveries},
+    }
 
 
 def save(path, state) -> None:

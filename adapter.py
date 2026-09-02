@@ -41,14 +41,16 @@ REQUIRED_ENV = ("AMESSENGER_URL", "AMESSENGER_KEY", "AMESSENGER_AGENT",
                 "AMESSENGER_KIND", "AMESSENGER_OWNER_CHAT")
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
-DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
-DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
+DEDUPE_MAX = state.DEDUPE_MAX
+DEDUPE_SECONDS = state.DEDUPE_SECONDS
+CHANNELS_MAX = 200  # Remembered Channel records used for Owner-facing labels.
 PENDING_MIRRORS_MAX = state.PENDING_MIRRORS_MAX
 OWNER_POST_TIMEOUT_SECONDS = 15
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail tools
 NO_TOOLS_SENTINEL = "amessenger_none"
 DELIVERY_FAILURE_NOTICE_PREFIX = "⚠️ Message delivery failed"
+INTERIM_SEND_KEY = "_interim_send"
 _LIVE_ADAPTER = None
 
 
@@ -224,8 +226,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._housekeeping_task = None
         self._card = self._state = None
         self._state_lock = threading.Lock()
-        self._seen: "OrderedDict[str, float]" = OrderedDict()
-        self._channels: dict[str, dict] = {}
+        self._channels: "OrderedDict[str, dict]" = OrderedDict()
         self._pending_mirrors: list[str] = []
 
     @property
@@ -479,28 +480,32 @@ class AMessengerAdapter(BasePlatformAdapter):
     async def fetch_deliveries(self) -> list[dict]:
         return await relay.wait(self.client(), WAIT_TIMEOUT_SECONDS)
 
-    def _prune_seen(self, moment: float) -> None:
-        cutoff = moment - DEDUPE_SECONDS
-        expired = [delivery_id for delivery_id, seen_at in self._seen.items()
-                   if seen_at < cutoff]
-        for delivery_id in expired:
-            del self._seen[delivery_id]
-
     def remember(self, delivery_id: str) -> None:
-        moment = monotonic()
-        self._prune_seen(moment)
-        self._seen[delivery_id] = moment
-        self._seen.move_to_end(delivery_id)
-        while len(self._seen) > DEDUPE_MAX:
-            self._seen.popitem(last=False)
+        moment = state.now()
+        self.update_state(
+            lambda document: state.remember_delivery(document, delivery_id, moment)
+        )
 
     def already_processed(self, delivery_id: str) -> bool:
-        self._prune_seen(monotonic())
-        return delivery_id in self._seen
+        moment = state.now()
+        seen = False
+
+        def inspect(document):
+            nonlocal seen
+            updated = state.forget_old_deliveries(document, moment)
+            seen = state.was_delivery_seen(updated, delivery_id, moment)
+            return updated
+
+        self.update_state(inspect)
+        return seen
 
     def remember_channel(self, channel: dict) -> None:
         """Remember the latest relay Channel record for Owner-facing notices."""
-        self._channels[channel["id"]] = dict(channel)
+        channel_id = channel["id"]
+        self._channels.pop(channel_id, None)
+        self._channels[channel_id] = dict(channel)
+        while len(self._channels) > CHANNELS_MAX:
+            self._channels.popitem(last=False)
 
     def known_channel(self, channel_id: str) -> dict:
         """Return a remembered Channel, or a renderable unnamed fallback."""
@@ -549,7 +554,8 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
         else:
             logger.warning("[amessenger] unknown Delivery kind=%s", kind)
-            processed = True
+            text = mirror.unknown_notice(channel, kind, message.get("text", ""))
+            processed = await self._mirror_delivery(delivery, text)
 
         if processed:
             self.remember(delivery_id)
@@ -875,6 +881,69 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._loop = None
         self._mark_disconnected()
 
+    async def _forward_exec_approval(
+        self,
+        owner,
+        command,
+        session_key,
+        description,
+        allow_permanent,
+        allow_session,
+        smart_denied,
+    ) -> SendResult | None:
+        """Try Hermes's interactive approval API, returning None for fallback."""
+        if getattr(type(owner), "send_exec_approval", None) is None:
+            return None
+        try:
+            result = await owner.send_exec_approval(
+                self._owner_chat_id,
+                command,
+                session_key,
+                description=description,
+                # The metadata describes a Channel thread, not the Owner Chat.
+                metadata=None,
+                allow_permanent=allow_permanent,
+                allow_session=allow_session,
+                smart_denied=smart_denied,
+            )
+        except (RuntimeError, TypeError, AttributeError) as error:
+            logger.warning(
+                "[amessenger] Owner Chat approval buttons unavailable; "
+                "using a text card: %s",
+                error,
+            )
+        else:
+            if result and getattr(result, "success", False):
+                # Preserve the mail session key so the Owner's button resolves
+                # this Channel session, not the Owner Chat session.
+                return result
+            logger.warning(
+                "[amessenger] Owner Chat approval forwarding failed: %s; "
+                "using a text card",
+                getattr(result, "error", result),
+            )
+        return None
+
+    async def _post_exec_approval_card(
+        self, owner, chat_id, command, session_key, description
+    ) -> SendResult:
+        """Post and record the text-card approval fallback."""
+        card = mirror.approval_request(
+            self.known_channel(chat_id), command, description, mirror.handle(chat_id)
+        )
+        # Approval cards stay direct: a stale card must never resurface after timeout.
+        if await mirror.post(owner, self._owner_chat_id, card):
+            self.update_state(
+                lambda document: state.add_pending_approval(
+                    document, session_key, chat_id, state.now()
+                )
+            )
+            return SendResult(success=True)
+
+        error = "approval request was not delivered to the Owner Chat"
+        logger.error("[amessenger] %s", error)
+        return SendResult(success=False, error=error)
+
     async def send_exec_approval(
         self,
         chat_id,
@@ -894,51 +963,20 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
         # Nothing in this method may post into the Channel: the peer must never
         # learn that an approval was asked for, let alone answer it.
-        if getattr(type(owner), "send_exec_approval", None) is not None:
-            try:
-                result = await owner.send_exec_approval(
-                    self._owner_chat_id,
-                    command,
-                    session_key,
-                    description=description,
-                    # The metadata describes a Channel thread, not the Owner Chat.
-                    metadata=None,
-                    allow_permanent=allow_permanent,
-                    allow_session=allow_session,
-                    smart_denied=smart_denied,
-                )
-            except (RuntimeError, TypeError, AttributeError) as error:
-                logger.warning(
-                    "[amessenger] Owner Chat approval buttons unavailable; "
-                    "using a text card: %s",
-                    error,
-                )
-            else:
-                if result and getattr(result, "success", False):
-                    # Preserve the mail session key so the Owner's button resolves
-                    # this Channel session, not the Owner Chat session.
-                    return result
-                logger.warning(
-                    "[amessenger] Owner Chat approval forwarding failed: %s; "
-                    "using a text card",
-                    getattr(result, "error", result),
-                )
-
-        card = mirror.approval_request(
-            self.known_channel(chat_id), command, description, mirror.handle(chat_id)
+        forwarded = await self._forward_exec_approval(
+            owner,
+            command,
+            session_key,
+            description,
+            allow_permanent,
+            allow_session,
+            smart_denied,
         )
-        # Approval cards stay direct: a stale card must never resurface after timeout.
-        if await mirror.post(owner, self._owner_chat_id, card):
-            self.update_state(
-                lambda document: state.add_pending_approval(
-                    document, session_key, chat_id, state.now()
-                )
-            )
-            return SendResult(success=True)
-
-        error = "approval request was not delivered to the Owner Chat"
-        logger.error("[amessenger] %s", error)
-        return SendResult(success=False, error=error)
+        if forwarded is not None:
+            return forwarded
+        return await self._post_exec_approval_card(
+            owner, chat_id, command, session_key, description
+        )
 
     def _keep_cap_record(self, channel_id: str) -> None:
         """Switch a capped Channel to notify without discarding its window."""
@@ -953,6 +991,20 @@ class AMessengerAdapter(BasePlatformAdapter):
             return {**document, "channels": channels}
 
         self.update_state(keep_record)
+
+    async def _cap_result(self, channel_id: str | None) -> SendResult:
+        """Switch a capped Channel to notify and report the deliberate drop."""
+        self._keep_cap_record(channel_id)
+        posted = await self.mirror_or_queue(
+            mirror.cap_reached(self.known_channel(channel_id)),
+        )
+        suffix = "" if posted else "; cap notice failed"
+        logger.warning(
+            "[amessenger] reply cap reached for Channel %s%s",
+            channel_id,
+            suffix,
+        )
+        return SendResult(success=True, message_id=None)
 
     async def deliver_to_channel(
         self,
@@ -976,18 +1028,7 @@ class AMessengerAdapter(BasePlatformAdapter):
 
         moment = state.now() if count_reply else None
         if count_reply and state.cap_reached(self.state(), channel_id, moment):
-            self._keep_cap_record(channel_id)
-            posted = await self.mirror_or_queue(
-                mirror.cap_reached(self.known_channel(channel_id)),
-            )
-            # The reply was deliberately not sent; that is not a delivery failure.
-            suffix = "" if posted else "; cap notice failed"
-            logger.warning(
-                "[amessenger] reply cap reached for Channel %s%s",
-                channel_id,
-                suffix,
-            )
-            return SendResult(success=True, message_id=None)
+            return await self._cap_result(channel_id)
 
         redacted = security.redact_outbound(text)
         if self.on_gateway_loop():
@@ -1056,15 +1097,8 @@ class AMessengerAdapter(BasePlatformAdapter):
             raw_response=result,
         )
 
-    async def send(
-        self,
-        chat_id,
-        content,
-        reply_to=None,
-        metadata=None,
-    ) -> SendResult:
-        INTERIM_SEND_KEY = "_interim_send"   # Hermes marks streaming/commentary sends with this
-
+    def _send_guard(self, chat_id, content, metadata) -> SendResult | None:
+        """Handle gateway-generated sends that must never become peer mail."""
         if isinstance(content, str) and content.startswith(
             DELIVERY_FAILURE_NOTICE_PREFIX
         ):
@@ -1073,20 +1107,36 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=None)
 
-        # A Channel is not a chat window. Hermes may stream interim commentary through
-        # send() when display.streaming or display.interim_assistant_messages is on, and
-        # every send here becomes a durable Message to another Owner's Agent. Only the
-        # turn's final answer is mail; interim frames are dropped.
         if isinstance(metadata, dict) and metadata.get(INTERIM_SEND_KEY):
             logger.debug("[amessenger] dropping interim send for Channel %s", chat_id)
             return SendResult(success=True, message_id=None)
+        return None
+
+    async def send(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+    ) -> SendResult:
+        guarded = self._send_guard(chat_id, content, metadata)
+        if guarded is not None:
+            return guarded
 
         task_done = security.has_task_done(content)
         no_reply = security.has_no_reply(content)
         text = security.strip_markers(content)
+        moment = state.now()
+
+        if state.cap_reached(self.state(), chat_id, moment):
+            return await self._cap_result(chat_id)
 
         if no_reply or not text:
             logger.debug("[amessenger] no outbound reply for Channel %s", chat_id)
+            if no_reply:
+                self.update_state(
+                    lambda document: state.note_reply(document, chat_id, moment)
+                )
             if task_done:
                 await self.end_single_grant(chat_id)
             return SendResult(success=True, message_id=None)

@@ -3,7 +3,7 @@
 from contextlib import asynccontextmanager
 import logging
 
-from . import relay, state
+from . import relay, security, state
 from .adapter import check_requirements, live_adapter, read_settings
 
 
@@ -15,7 +15,8 @@ RELAY_OUTAGE = "Error: the AMessenger relay did not answer. Try again."
 def relay_error(error) -> str:
     """The sentence the model reads when the relay refused or did not answer."""
     if isinstance(error, relay.RelayRejected):
-        return f"Error: {error.detail}"
+        detail = security.safe_field(error.detail, fallback=RELAY_OUTAGE)
+        return f"Error: {detail}"
     return RELAY_OUTAGE
 
 
@@ -50,23 +51,26 @@ async def relay_client(adapter):
 
 def _agent_line(card: dict) -> str:
     owner = card.get("owner") if isinstance(card.get("owner"), dict) else {}
-    name = card.get("name") or "unknown"
-    kind = card.get("kind") or "unknown"
-    owner_name = owner.get("name") or owner.get("login") or "unknown"
-    owner_email = owner.get("email") or "unknown"
+    name = security.safe_field(card.get("name"))
+    kind = security.safe_field(card.get("kind"))
+    owner_name = security.safe_field(owner.get("name") or owner.get("login"))
+    owner_email = security.safe_field(owner.get("email"))
     line = f"{name} ({kind}) — {owner_name} <{owner_email}>"
-    if card.get("description"):
-        line += f" — {card['description']}"
+    description = security.safe_field(card.get("description"), fallback="")
+    if description:
+        line += f" — {description}"
     return line
 
 
 def _channel_line(channel: dict) -> str:
-    channel_id = channel.get("id") or "unknown"
-    name = channel.get("name") or "unnamed"
+    channel_id = security.safe_field(channel.get("id"))
+    name = security.safe_field(channel.get("name"), fallback="unnamed")
     members = channel.get("members") or []
     rendered_members = ", ".join(
-        f"{member.get('agent', 'unknown')} ({member.get('state', 'unknown')})"
+        f"{security.safe_field(member.get('agent'))} "
+        f"({security.safe_field(member.get('state'))})"
         for member in members
+        if isinstance(member, dict)
     )
     return f"{channel_id} — {name}, members: {rendered_members}"
 
@@ -84,11 +88,11 @@ def _pending_recipients(channel: dict, to: str | None) -> list[str]:
 
 def _send_result(result: dict, text: str, to: str | None) -> str:
     channel = result["channel"]
-    message_id = result["message"]["id"]
-    channel_id = channel["id"]
+    message_id = security.safe_field(result["message"].get("id"))
+    channel_id = security.safe_field(channel.get("id"))
     pending = _pending_recipients(channel, to)
     if pending:
-        recipient = ", ".join(pending)
+        recipient = ", ".join(security.safe_field(agent) for agent in pending)
         return (
             f"Sent to channel {channel_id}. {recipient} has not joined yet, so their "
             "Owner must accept the Invite before it is delivered. Tell your Owner that."
@@ -171,8 +175,8 @@ async def amessenger_send(args: dict, **_) -> str:
 
 
 def _status_line(delivery: dict) -> str:
-    agent = delivery.get("agent", "unknown")
-    attempts = delivery.get("attempts", 0)
+    agent = security.safe_field(delivery.get("agent"))
+    attempts = security.safe_field(str(delivery.get("attempts", 0)))
     return f"{agent} ({attempts} attempts)"
 
 
@@ -216,19 +220,20 @@ async def amessenger_create_channel(args: dict, **_) -> str:
         return relay_error(error)
     adapter.remember_channel(channel)
     invited = [
-        member.get("agent", "unknown")
+        security.safe_field(member.get("agent"))
         for member in channel.get("members", [])
-        if member.get("state") == "invited"
+        if isinstance(member, dict) and member.get("state") == "invited"
     ]
     invited_names = set(invite)
     joined = [
-        member.get("agent", "unknown")
+        security.safe_field(member.get("agent"))
         for member in channel.get("members", [])
-        if member.get("state") == "member"
+        if isinstance(member, dict) and member.get("state") == "member"
         and member.get("agent") in invited_names
     ]
+    channel_id = security.safe_field(channel.get("id"))
     return (
-        f"Created channel {channel['id']}.\n"
+        f"Created channel {channel_id}.\n"
         f"Invited: {', '.join(invited) if invited else 'none'}.\n"
         f"Joined immediately: {', '.join(joined) if joined else 'none'}."
     )

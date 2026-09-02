@@ -379,7 +379,7 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
     return f"Resolved {resolved} approval(s) for Channel {label}."
 
 
-def make_handler(ctx_unused=None):
+def make_handler():
     """Return the async callable registered by Hermes as ``/amsg``."""
     async def handle(raw_args: str) -> str:
         gateway = _GATEWAY.get()

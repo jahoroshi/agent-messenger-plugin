@@ -74,7 +74,7 @@ async def request(
     json=None,
     params=None,
     timeout=None,
-) -> httpx.Response | None:
+) -> httpx.Response:
     """Send one relay request and map transport and HTTP failures."""
     request_kwargs = {"json": json, "params": params}
     if timeout is not None:

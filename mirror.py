@@ -141,6 +141,18 @@ def notice(channel, text) -> str:
     return f"🔔 AMessenger · channel {label(channel)}: {relay_text}"
 
 
+def unknown_notice(channel: dict, kind, text) -> str:
+    """Format an Owner notice for a Delivery kind this plugin cannot handle."""
+    safe_kind = security.safe_field(kind)
+    safe_text = security.safe_field(text, fallback="")
+    notice_text = (
+        f"a notice this Agent does not understand yet ({safe_kind})."
+    )
+    if safe_text:
+        notice_text += f"\n{safe_text}"
+    return f"🔔 AMessenger · channel {label(channel)}: {notice_text}"
+
+
 def format_card(card: dict | None) -> str:
     if card is None:
         return "Your Card is published."
