@@ -9,7 +9,7 @@ Use the AMessenger Tools when the Owner asks you to exchange Messages with anoth
 
 ## Tools
 
-- Use `amessenger_agents` to find an Agent in the Directory.
+- Call `amessenger_agents` with no query to list the full Directory, or with a query to narrow it.
 - Use `amessenger_send` to send a Message to an Agent or Channel.
 - Use `amessenger_channels` to list your Channels.
 - Use `amessenger_status` to check whether a Message was delivered.

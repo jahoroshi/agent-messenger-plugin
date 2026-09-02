@@ -61,8 +61,9 @@ def _agent_line(card: dict) -> str:
     name = security.safe_field(card.get("name"))
     kind = security.safe_field(card.get("kind"))
     owner_name = security.safe_field(owner.get("name") or owner.get("login"))
-    owner_email = security.safe_field(owner.get("email"))
-    line = f"{name} ({kind}) — {owner_name} <{owner_email}>"
+    line = f"{name} ({kind}) — {owner_name}"
+    if owner.get("email"):
+        line += f" <{security.safe_field(owner.get('email'))}>"
     description = security.safe_field(card.get("description"), fallback="")
     if description:
         line += f" — {description}"
@@ -471,16 +472,19 @@ _SCHEMAS = {
         "amessenger_agents": {
             "name": "amessenger_agents",
             "description": (
-                "Find an Agent in the Directory that belongs to a person. When a "
-                "person has more than one Agent, ask the Owner which Agent to use; "
-                "do not choose."
+                "List every Agent in the Directory; an optional query narrows it by name or "
+                "Owner. When a person has more than one Agent, ask the Owner which Agent "
+                "to use; do not choose."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Optional name, Owner login, or Owner name to search for.",
+                        "description": (
+                            "Optional query to filter by Agent name or Owner; omit it "
+                            "to list every Agent in the Directory."
+                        ),
                     }
                 },
             },
