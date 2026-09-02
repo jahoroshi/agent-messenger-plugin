@@ -37,6 +37,7 @@ HOUSEKEEPING_SECONDS = 60               # §6.2: expire Grants every minute
 MAX_MESSAGE_LENGTH = 65536              # SYSTEM_DESIGN §5: text ≤ 64 KB
 STATE_DIRNAME = "amessenger"           # $HERMES_HOME/amessenger/state.json, §6.6
 STATE_FILENAME = "state.json"
+OWNER_LOG_FILENAME = "owner_log.jsonl"
 REQUIRED_ENV = ("AMESSENGER_URL", "AMESSENGER_KEY", "AMESSENGER_AGENT",
                 "AMESSENGER_KIND", "AMESSENGER_OWNER_CHAT")
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
@@ -170,6 +171,11 @@ def hermes_home() -> Path:
 def state_path_for_process() -> Path:
     """Return this process's shared AMessenger state path."""
     return hermes_home() / STATE_DIRNAME / STATE_FILENAME
+
+
+def owner_log_path_for_process() -> Path:
+    """Return the shared Owner-Chat log path used by gateways and TUI/CLI."""
+    return hermes_home() / STATE_DIRNAME / OWNER_LOG_FILENAME
 
 
 def read_state_file() -> dict:
@@ -426,17 +432,22 @@ class AMessengerAdapter(BasePlatformAdapter):
     def state(self) -> dict:
         with self._state_lock:
             if self._state is None:
-                self._state = state.load(self.state_path())
+                self._state = state.ensure_file(self.state_path())
                 self._pending_mirrors = [
-                    *self._state.get("pending_mirrors", [])
+                    state.mirror_entry_text(entry)
+                    for entry in self._state.get("pending_mirrors", [])
                 ]
             return self._state
 
     def set_state(self, new_state: dict) -> None:
         with self._state_lock:
+            new_state = state.ensure_authenticity_secret(new_state)
             state.save(self.state_path(), new_state)
             self._state = new_state
-            self._pending_mirrors = [*new_state.get("pending_mirrors", [])]
+            self._pending_mirrors = [
+                state.mirror_entry_text(entry)
+                for entry in new_state.get("pending_mirrors", [])
+            ]
 
     def update_state(self, change):
         """Apply ``change(state) -> state`` under a lock, then write the file.
@@ -449,7 +460,10 @@ class AMessengerAdapter(BasePlatformAdapter):
             # lock above remains necessary for concurrent work within this adapter.
             self._state = state.update_file(self.state_path(), change)
             updated = self._state
-            self._pending_mirrors = [*updated.get("pending_mirrors", [])]
+            self._pending_mirrors = [
+                state.mirror_entry_text(entry)
+                for entry in updated.get("pending_mirrors", [])
+            ]
             return updated
 
     def client(self) -> httpx.AsyncClient:
@@ -472,10 +486,22 @@ class AMessengerAdapter(BasePlatformAdapter):
         except RuntimeError:
             return False
 
-    async def post_owner_line(self, text: str) -> bool:
+    async def post_owner_line(
+        self,
+        text: str,
+        *,
+        framed_text: str | None = None,
+        queue_on_failure: bool = True,
+        note_transcript: bool = True,
+    ) -> bool:
         """Post an Owner-facing line from wherever the caller is running."""
         if self.on_gateway_loop():
-            return await self.mirror_or_queue(text)
+            return await self.mirror_or_queue(
+                text,
+                framed_text=framed_text,
+                queue_on_failure=queue_on_failure,
+                note_transcript=note_transcript,
+            )
         if self._loop is None:
             logger.warning(
                 "[amessenger] cannot post Owner-facing line: gateway loop is unavailable"
@@ -484,7 +510,13 @@ class AMessengerAdapter(BasePlatformAdapter):
 
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self.mirror_or_queue(text), self._loop
+                self.mirror_or_queue(
+                    text,
+                    framed_text=framed_text,
+                    queue_on_failure=queue_on_failure,
+                    note_transcript=note_transcript,
+                ),
+                self._loop,
             )
             completed = threading.Event()
             outcome = {}
@@ -634,10 +666,6 @@ class AMessengerAdapter(BasePlatformAdapter):
         return processed
 
     async def _mirror_delivery(self, delivery: dict, text: str) -> bool:
-        # Receive mirrors stay direct: failure prevents Ack, so the relay re-offers the Delivery.
-        owner = await self.wait_for_owner_adapter()
-        if owner is None:
-            return False
         framed_text = None
         if delivery.get("message", {}).get("kind") == "text":
             framed_text = mirror.incoming_transcript(
@@ -645,21 +673,13 @@ class AMessengerAdapter(BasePlatformAdapter):
                 delivery["channel"],
                 delivery["message"].get("text", ""),
             )
-        if framed_text is None:
-            posted = await mirror.mirror(
-                owner,
-                self._owner_platform,
-                self._owner_chat_id,
-                text,
-            )
-        else:
-            posted = await mirror.mirror(
-                owner,
-                self._owner_platform,
-                self._owner_chat_id,
-                text,
-                framed_text=framed_text,
-            )
+        # Receive failures are deliberately not queued: the relay must offer
+        # the Delivery again, and a queued copy would race that retry.
+        posted = await self.mirror_or_queue(
+            text,
+            framed_text=framed_text,
+            queue_on_failure=False,
+        )
         if not posted:
             logger.warning(
                 "[amessenger] Mirror post failed for Delivery %s", delivery["id"]
@@ -878,17 +898,26 @@ class AMessengerAdapter(BasePlatformAdapter):
     async def after_publish(self) -> None:
         if self.state()["welcomed"]:
             return
-        text = self._help_text + "\n\n" + format_card(self._card)
-        # Welcome stays direct: it is retried on restart and recorded only after delivery.
-        owner = await self.wait_for_owner_adapter()
-        if owner is None:
+        # Leave the mark itself to the single Owner-post seam. Ending the
+        # explanatory sentence here makes that seam turn it into the one
+        # concrete mark the Owner should remember, without putting the mark in
+        # the log or any model-visible transcript.
+        text = (
+            self._help_text
+            + "\n\n"
+            + format_card(self._card)
+            + "\n\nReal AMessenger lines end with"
+        )
+        # A welcome is retried by the startup loop, not persisted as a second
+        # pending copy; otherwise the failed attempt and the retry can both
+        # appear when the Owner adapter comes back.
+        if not await self.mirror_or_queue(
+            text, queue_on_failure=False, note_transcript=False
+        ):
             logger.warning(
                 "[amessenger] welcome not delivered to Owner Chat %s",
                 self._owner_chat_id,
             )
-            return
-        if not await mirror.post(owner, self._owner_chat_id, text):
-            logger.warning("[amessenger] welcome not delivered to Owner Chat %s", self._owner_chat_id)
             return
         self.update_state(lambda document: state.set_welcomed(document, True))
         logger.info("[amessenger] welcome delivered to Owner Chat %s", self._owner_chat_id)
@@ -1049,8 +1078,12 @@ class AMessengerAdapter(BasePlatformAdapter):
         card = mirror.approval_request(
             self.known_channel(chat_id), command, description, mirror.handle(chat_id)
         )
-        # Approval cards stay direct: a stale card must never resurface after timeout.
-        if await mirror.post(owner, self._owner_chat_id, card):
+        # Approval cards use the same marked/logged Owner-Chat path as Mirrors.
+        # Approval cards are also retried by the approval request itself; do
+        # not leave a stale queued card that could outlive its request.
+        if await self.mirror_or_queue(
+            card, queue_on_failure=False, note_transcript=False
+        ):
             self.update_state(
                 lambda document: state.add_pending_approval(
                     document, session_key, chat_id, state.now()
@@ -1278,27 +1311,74 @@ class AMessengerAdapter(BasePlatformAdapter):
             await self.end_single_grant(chat_id)
         return result
 
-    async def mirror_or_queue(self, text: str) -> bool:
-        """Post an Owner-facing line, and persist it for a retry when posting fails."""
+    def owner_log_path(self) -> Path:
+        return owner_log_path_for_process()
+
+    def _record_owner_log(self, text: str) -> None:
+        """Best-effort append of the unmarked copy received by the Owner."""
+        try:
+            state.append_owner_log(self.owner_log_path(), text)
+        except Exception as error:
+            # The Owner-Chat post is the product; a log filesystem failure is
+            # observable but must never turn a successful post into a failure.
+            logger.warning("[amessenger] Owner log append failed: %s", error)
+
+    async def _post_owner_line_now(
+        self,
+        text: str,
+        *,
+        framed_text: str | None = None,
+        note_transcript: bool = True,
+    ) -> bool:
+        """Post one line, marking only the chat copy and logging it unmarked."""
         owner = await self.wait_for_owner_adapter()
         if owner is None:
-            posted = False
-        else:
-            posted = await mirror.mirror(
-                owner,
-                self._owner_platform,
-                self._owner_chat_id,
-                text,
-            )
+            return False
+        marked_text = f"{text} {mirror.authenticity_mark(self.state()[state.AUTHENTICITY_SECRET_KEY])}"
+        posted = await mirror.mirror(
+            owner,
+            self._owner_platform,
+            self._owner_chat_id,
+            marked_text,
+            framed_text=framed_text,
+            transcript_text=text if note_transcript else None,
+            note_transcript=note_transcript,
+        )
+        if posted:
+            self._record_owner_log(text)
+        return posted
+
+    async def mirror_or_queue(
+        self,
+        text: str,
+        *,
+        framed_text: str | None = None,
+        queue_on_failure: bool = True,
+        note_transcript: bool = True,
+    ) -> bool:
+        """Post an Owner line, optionally persisting it for a later retry."""
+        posted = await self._post_owner_line_now(
+            text,
+            framed_text=framed_text,
+            note_transcript=note_transcript,
+        )
         if posted:
             return True
+
+        if not queue_on_failure:
+            return False
 
         dropped = False
 
         def queue(document):
             nonlocal dropped
             dropped = len(document.get("pending_mirrors", [])) >= PENDING_MIRRORS_MAX
-            return state.queue_mirror(document, text)
+            return state.queue_mirror(
+                document,
+                text,
+                framed_text=framed_text,
+                note_transcript=note_transcript,
+            )
 
         self.update_state(queue)
         logger.warning("[amessenger] Owner-facing line queued for retry")
@@ -1312,17 +1392,18 @@ class AMessengerAdapter(BasePlatformAdapter):
     async def flush_pending_mirrors(self) -> None:
         """Retry the Owner-facing lines the Owner Chat refused earlier."""
         pending = self.state().get("pending_mirrors", [])
-        if self._pending_mirrors != pending:
+        pending_texts = [state.mirror_entry_text(entry) for entry in pending]
+        if self._pending_mirrors != pending_texts:
             if (
-                len(self._pending_mirrors) >= len(pending)
-                and self._pending_mirrors[: len(pending)] == pending
+                len(self._pending_mirrors) >= len(pending_texts)
+                and self._pending_mirrors[: len(pending_texts)] == pending_texts
             ):
-                for text in self._pending_mirrors[len(pending) :]:
+                for text in self._pending_mirrors[len(pending_texts) :]:
                     self.update_state(
                         lambda document, text=text: state.queue_mirror(document, text)
                     )
             else:
-                self._pending_mirrors = [*pending]
+                self._pending_mirrors = [*pending_texts]
 
         pending = self.state().get("pending_mirrors", [])
         if not pending:
@@ -1334,18 +1415,19 @@ class AMessengerAdapter(BasePlatformAdapter):
 
         delivered = 0
         while self.state().get("pending_mirrors", []):
-            text = self.state()["pending_mirrors"][0]
-            if not await mirror.mirror(
-                owner,
-                self._owner_platform,
-                self._owner_chat_id,
+            entry = self.state()["pending_mirrors"][0]
+            text = state.mirror_entry_text(entry)
+            framed_text = state.mirror_entry_transcript(entry)
+            if not await self._post_owner_line_now(
                 text,
+                framed_text=framed_text,
+                note_transcript=state.mirror_entry_should_note(entry),
             ):
                 break
 
             def remove_delivered(document):
                 pending_lines = document.get("pending_mirrors", [])
-                if pending_lines and pending_lines[0] == text:
+                if pending_lines and pending_lines[0] == entry:
                     updated, _popped = state.pop_mirror(document)
                     return updated
                 return document

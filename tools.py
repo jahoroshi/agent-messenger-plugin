@@ -97,7 +97,7 @@ def _recipient_members(result: dict, to: str | None) -> list[dict]:
             continue
         if to is None and member.get("agent") == sender:
             continue
-        if member.get("state") in {"joined", "member", "invited"}:
+        if member.get("state") in {"member", "invited"}:
             recipients.append(member)
     return recipients
 
@@ -164,7 +164,7 @@ def _send_result(
     delivered = [
         security.safe_field(member.get("agent"))
         for member in recipients
-        if member.get("state") in {"joined", "member"}
+        if member.get("state") == "member"
     ]
     pending = [
         member.get("agent", "unknown")

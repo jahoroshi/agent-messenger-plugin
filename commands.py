@@ -172,6 +172,54 @@ def _channel_token(tokens: list[str]) -> str | None:
     return tokens[1]
 
 
+def _log_argument_error() -> str:
+    return (
+        "Expected `/amsg log [n]`, where n is a positive number from 1 to "
+        f"{state.OWNER_LOG_MAX_LINES}."
+    )
+
+
+def _log_limit(tokens: list[str]) -> int | None:
+    if len(tokens) == 1:
+        return 20
+    if len(tokens) != 2 or re.fullmatch(r"[0-9]+", tokens[1]) is None:
+        return None
+    if len(tokens[1]) > len(str(state.OWNER_LOG_MAX_LINES)):
+        return None
+    value = int(tokens[1])
+    if value <= 0 or value > state.OWNER_LOG_MAX_LINES:
+        return None
+    return value
+
+
+async def _log(tokens: list[str]) -> str:
+    limit = _log_limit(tokens)
+    if limit is None:
+        return _log_argument_error()
+
+    try:
+        entries = state.read_owner_log(adapter_module.owner_log_path_for_process(), limit)
+    except OSError as error:
+        logger.warning("[amessenger] could not read Owner log: %s", error)
+        return "The Owner log is unavailable."
+    if not entries:
+        return "The Owner log is empty."
+
+    try:
+        document = adapter_module.read_state_file()
+        if document.get(state.AUTHENTICITY_SECRET_KEY) is None:
+            document = adapter_module.update_state_file(
+                state.ensure_authenticity_secret
+            )
+        mark = mirror.authenticity_mark(
+            document[state.AUTHENTICITY_SECRET_KEY]
+        )
+    except (OSError, state.StateFileCorrupt, KeyError) as error:
+        logger.warning("[amessenger] could not load Owner log mark: %s", error)
+        return "The Owner log is unavailable."
+    return "\n".join(f"{entry['text']} {mark}" for entry in entries)
+
+
 async def _join(adapter, tokens: list[str], help_text: str) -> str:
     token = _channel_token(tokens)
     if token is None:
@@ -409,6 +457,8 @@ def make_handler():
             return await _notify(adapter, tokens, HELP_TEXT)
         if command == "leave":
             return await _leave(adapter, tokens, HELP_TEXT)
+        if command == "log":
+            return await _log(tokens)
         if command == "status" and len(tokens) == 1:
             return await _status(adapter)
         if command in {"approve", "deny"} and len(tokens) in {1, 2}:

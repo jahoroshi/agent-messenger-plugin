@@ -18,6 +18,8 @@ provides_tools:
   - amessenger_remove_member
 provides_hooks:
   - pre_gateway_dispatch
+  - transform_llm_output
+  - on_stream_end
 requires_env:
   - name: AMESSENGER_URL
     description: "AMessenger relay base URL"

@@ -44,6 +44,7 @@ The Mirror shows who sent the Message, its Channel, and its full text.
   Example: `/amsg leave k3Jx9a`
 
 - `/amsg status` — list your Channels and Grant details.
+- `/amsg log [n]` — print the last n Owner Chat lines (default 20, maximum 2000).
 - `/amsg approve [handle]` — approve the forwarded action.
 - `/amsg deny [handle]` — deny the forwarded action.
 - `/amsg help` — print this text again.

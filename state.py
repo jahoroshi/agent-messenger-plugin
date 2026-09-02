@@ -5,6 +5,8 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
+import secrets
 import tempfile
 import threading
 
@@ -22,6 +24,10 @@ DEDUPE_MAX = 200  # Processed Delivery ids retained for restart-safe dedupe.
 DEDUPE_SECONDS = 3600  # Processed Delivery retention window.
 SEND_IDEMPOTENCY_SECONDS = 60  # Exact tool sends are coalesced for one minute.
 SEND_IDEMPOTENCY_MAX = DEDUPE_MAX
+OWNER_LOG_MAX_LINES = 2000
+AUTHENTICITY_SECRET_KEY = "authenticity_secret"
+AUTHENTICITY_SECRET_LENGTH = 4
+_AUTHENTICITY_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{4}$")
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # Fixed-width UTC timestamps.
 logger = logging.getLogger("amessenger")
 _file_lock_warning_logged = False
@@ -58,7 +64,32 @@ def empty_state() -> dict:
         "pending_approvals": {},
         "pending_mirrors": [],
         "seen_deliveries": {},
+        # None is the uninitialised value used by old/in-memory state. The
+        # adapter replaces it with a generated value before its first post.
+        AUTHENTICITY_SECRET_KEY: None,
     }
+
+
+def _valid_authenticity_secret(value) -> bool:
+    return isinstance(value, str) and bool(_AUTHENTICITY_SECRET_RE.fullmatch(value))
+
+
+def ensure_authenticity_secret(document: dict) -> dict:
+    """Return state with its stable per-gateway authenticity secret.
+
+    A missing value is a legacy/uninitialised state and gets one new secret.
+    Any present value has to retain the short, URL-safe shape so a damaged
+    state file cannot silently change the mark used to identify real posts.
+    """
+    value = document.get(AUTHENTICITY_SECRET_KEY)
+    if value is None:
+        return {
+            **document,
+            AUTHENTICITY_SECRET_KEY: secrets.token_urlsafe(3),
+        }
+    if not _valid_authenticity_secret(value):
+        raise StateFileCorrupt("invalid authenticity secret")
+    return {**document}
 
 
 def _copy_record(record: dict) -> dict:
@@ -315,9 +346,51 @@ def add_pending_approval(state: dict, session_key, chat_id, moment) -> dict:
     return _copy_state(state, pending=pending)
 
 
-def queue_mirror(state: dict, text: str) -> dict:
+def _pending_mirror_entry(
+    text: str, framed_text: str | None = None, note_transcript: bool = True
+):
+    if framed_text is None and note_transcript:
+        return text
+    entry = {"text": text, "note_transcript": note_transcript}
+    if framed_text is not None:
+        entry["framed_text"] = framed_text
+    return entry
+
+
+def mirror_entry_text(entry) -> str:
+    """Return the human-facing text from a queued Mirror entry."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+        return entry["text"]
+    return ""
+
+
+def mirror_entry_transcript(entry) -> str | None:
+    """Return an optional model-safe transcript copy from a queue entry."""
+    if isinstance(entry, dict) and isinstance(entry.get("framed_text"), str):
+        return entry["framed_text"]
+    return None
+
+
+def mirror_entry_should_note(entry) -> bool:
+    if isinstance(entry, dict):
+        return entry.get("note_transcript", True) is True
+    return True
+
+
+def queue_mirror(
+    state: dict,
+    text: str,
+    *,
+    framed_text: str | None = None,
+    note_transcript: bool = True,
+) -> dict:
     """Append an Owner-facing line, retaining only the newest queued lines."""
-    pending = [*state.get("pending_mirrors", []), text]
+    pending = [
+        *state.get("pending_mirrors", []),
+        _pending_mirror_entry(text, framed_text, note_transcript),
+    ]
     if len(pending) > PENDING_MIRRORS_MAX:
         pending = pending[-PENDING_MIRRORS_MAX:]
     return _copy_state(state, pending_mirrors=pending)
@@ -387,7 +460,21 @@ def load(path) -> dict:
         and isinstance(document.get("channels"), dict)
         and isinstance(document.get("pending_approvals"), dict)
         and isinstance(pending_mirrors, list)
-        and all(isinstance(value, str) for value in pending_mirrors)
+        and all(
+            (
+                isinstance(value, str)
+                or (
+                    isinstance(value, dict)
+                    and isinstance(value.get("text"), str)
+                    and (
+                        "framed_text" not in value
+                        or isinstance(value.get("framed_text"), str)
+                    )
+                    and isinstance(value.get("note_transcript", True), bool)
+                )
+            )
+            for value in pending_mirrors
+        )
         and isinstance(seen_deliveries, dict)
         and all(
             isinstance(delivery_id, str) and isinstance(seen_at, str)
@@ -404,10 +491,16 @@ def load(path) -> dict:
     )
     if not valid:
         raise StateFileCorrupt(f"invalid state file: {target}")
+    authenticity_secret = document.get(AUTHENTICITY_SECRET_KEY)
+    if authenticity_secret is not None and not _valid_authenticity_secret(
+        authenticity_secret
+    ):
+        raise StateFileCorrupt(f"invalid state file: {target}")
     loaded = {
         **document,
         "pending_mirrors": [*pending_mirrors],
         "seen_deliveries": {**seen_deliveries},
+        AUTHENTICITY_SECRET_KEY: authenticity_secret,
     }
     if "send_idempotency" in document:
         loaded["send_idempotency"] = _copy_send_idempotency(send_idempotency)
@@ -461,12 +554,78 @@ def file_lock(path):
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def ensure_file(path) -> dict:
+    """Initialise a state file's authenticity secret under the file lock."""
+    target = Path(path)
+    with file_lock(target):
+        document = load(target)
+        updated = ensure_authenticity_secret(document)
+        if updated != document:
+            save(target, updated)
+        return updated
+
+
 def update_file(path, change) -> dict:
     """Load, change, and save a state file while holding its process lock."""
     with file_lock(path):
-        document = load(path)
+        document = ensure_authenticity_secret(load(path))
         updated = change(document)
+        updated = ensure_authenticity_secret(updated)
         if "send_idempotency" in updated:
             updated = forget_old_sends(updated, now())
         save(path, updated)
         return updated
+
+
+def append_owner_log(path, text: str, moment: datetime | None = None) -> None:
+    """Append one unmarked Owner-Chat line and retain at most 2000 records."""
+    if not isinstance(text, str):
+        raise TypeError("Owner log text must be a string")
+    target = Path(path)
+    if moment is None:
+        moment = now()
+    record = json.dumps(
+        {"timestamp": ts(moment), "text": text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+    # The sibling lock is the same fcntl discipline used for state.json. Keep
+    # malformed old lines during rotation; readers skip them after a crash.
+    with file_lock(target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a+", encoding="utf-8") as log_file:
+            log_file.seek(0)
+            lines = log_file.readlines()
+            if len(lines) >= OWNER_LOG_MAX_LINES:
+                log_file.seek(0)
+                log_file.truncate()
+                log_file.writelines(lines[-(OWNER_LOG_MAX_LINES - 1) :])
+            log_file.seek(0, os.SEEK_END)
+            log_file.write(record)
+            log_file.flush()
+
+
+def read_owner_log(path, limit: int) -> list[dict]:
+    """Read the newest valid Owner log records, skipping malformed lines."""
+    target = Path(path)
+    try:
+        with target.open("r", encoding="utf-8") as log_file:
+            lines = log_file.readlines()
+    except FileNotFoundError:
+        return []
+
+    records = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not (
+            isinstance(value, dict)
+            and isinstance(value.get("timestamp"), str)
+            and isinstance(value.get("text"), str)
+        ):
+            continue
+        records.append(value)
+    return records[-limit:]
