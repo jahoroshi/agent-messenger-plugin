@@ -39,6 +39,7 @@ AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
 DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
 DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
+PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 _LIVE_ADAPTER = None
 
@@ -156,6 +157,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._card = self._state = None
         self._seen: "OrderedDict[str, float]" = OrderedDict()
         self._channels: dict[str, dict] = {}
+        self._pending_mirrors: list[str] = []
         global _LIVE_ADAPTER
         _LIVE_ADAPTER = self
 
@@ -343,6 +345,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         return processed
 
     async def _mirror_delivery(self, delivery: dict, text: str) -> bool:
+        # Receive mirrors stay direct: failure prevents Ack, so the relay re-offers the Delivery.
         posted = await mirror.mirror(
             self.owner_adapter,
             self._owner_platform,
@@ -439,6 +442,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         if self.state()["welcomed"]:
             return
         text = self._help_text + "\n\n" + format_card(self._card)
+        # Welcome stays direct: it is retried on restart and recorded only after delivery.
         if not await mirror.post(self.owner_adapter, self._owner_chat_id, text):
             logger.warning("[amessenger] welcome not delivered to Owner Chat %s", self._owner_chat_id)
             return
@@ -457,6 +461,7 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def housekeeping_once(self) -> None:
         """Expire single Grants and tell the Owner about each one (§6.6)."""
+        await self.flush_pending_mirrors()
         moment = state.now()
         updated, ended = state.expire_grants(self.state(), moment)
         if not ended:
@@ -465,10 +470,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         # a chat post failed; this is the opposite of the receive path.
         self.set_state(updated)
         for channel_id in ended:
-            posted = await mirror.mirror(
-                self.owner_adapter,
-                self._owner_platform,
-                self._owner_chat_id,
+            posted = await self.mirror_or_queue(
                 mirror.grant_ended(self.known_channel(channel_id)),
             )
             if not posted:
@@ -481,10 +483,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         if state.channel(self.state(), chat_id)["grant"] != "single":
             return
         self.set_state(state.revoke(self.state(), chat_id))
-        posted = await mirror.mirror(
-            self.owner_adapter,
-            self._owner_platform,
-            self._owner_chat_id,
+        posted = await self.mirror_or_queue(
             mirror.grant_ended(self.known_channel(chat_id)),
         )
         if not posted:
@@ -555,6 +554,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         card = mirror.approval_request(
             self.known_channel(chat_id), command, description
         )
+        # Approval cards stay direct: a stale card must never resurface after timeout.
         if await mirror.post(owner, self._owner_chat_id, card):
             updated = state.add_pending_approval(
                 self.state(), session_key, chat_id, state.now()
@@ -586,10 +586,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         moment = state.now()
         if state.cap_reached(self.state(), chat_id, moment):
             self.set_state(state.revoke(self.state(), chat_id))
-            posted = await mirror.mirror(
-                self.owner_adapter,
-                self._owner_platform,
-                self._owner_chat_id,
+            posted = await self.mirror_or_queue(
                 mirror.cap_reached(self.known_channel(chat_id)),
             )
             # Check before counting: replies one through twenty go out; the
@@ -620,11 +617,8 @@ class AMessengerAdapter(BasePlatformAdapter):
 
         self.remember_channel(result["channel"])
         # The relay has accepted the Message and it cannot be unsent, so a
-        # failed Owner Chat Mirror is logged but does not make this send fail.
-        posted = await mirror.mirror(
-            self.owner_adapter,
-            self._owner_platform,
-            self._owner_chat_id,
+        # failed Owner Chat Mirror is queued but does not make this send fail.
+        posted = await self.mirror_or_queue(
             mirror.outgoing(result["channel"], redacted),
         )
         if not posted:
@@ -639,6 +633,49 @@ class AMessengerAdapter(BasePlatformAdapter):
             await self.end_single_grant(chat_id)
 
         return SendResult(success=True, message_id=result["message"]["id"])
+
+    async def mirror_or_queue(self, text: str) -> bool:
+        """Post an Owner-facing line, and remember it for a retry when the post fails.
+
+        The queue is in memory and is lost on a gateway restart. A restart
+        re-publishes the Card and the Owner sees the Agent come back.
+        """
+        posted = await mirror.mirror(
+            self.owner_adapter,
+            self._owner_platform,
+            self._owner_chat_id,
+            text,
+        )
+        if posted:
+            return True
+
+        self._pending_mirrors.append(text)
+        logger.warning("[amessenger] Owner-facing line queued for retry")
+        if len(self._pending_mirrors) > PENDING_MIRRORS_MAX:
+            self._pending_mirrors.pop(0)
+            logger.warning(
+                "[amessenger] dropped 1 oldest queued Owner-facing line; "
+                "1 line lost"
+            )
+        return False
+
+    async def flush_pending_mirrors(self) -> None:
+        """Retry the Owner-facing lines the Owner Chat refused earlier."""
+        delivered = 0
+        while self._pending_mirrors:
+            text = self._pending_mirrors[0]
+            if not await mirror.mirror(
+                self.owner_adapter,
+                self._owner_platform,
+                self._owner_chat_id,
+                text,
+            ):
+                break
+            self._pending_mirrors.pop(0)
+            delivered += 1
+
+        if delivered:
+            logger.info("[amessenger] delivered %d queued Owner-facing lines", delivered)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": chat_id, "type": "dm"}
