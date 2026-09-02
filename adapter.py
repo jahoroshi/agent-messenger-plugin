@@ -514,6 +514,58 @@ class AMessengerAdapter(BasePlatformAdapter):
         global _LIVE_ADAPTER
         _LIVE_ADAPTER = None
 
+    async def send_exec_approval(
+        self,
+        chat_id,
+        command,
+        session_key,
+        description="dangerous command",
+        metadata=None,
+        allow_permanent=True,
+        allow_session=True,
+        smart_denied=False,
+    ) -> SendResult:
+        owner = self.owner_adapter
+        # Nothing in this method may post into the Channel: the peer must never
+        # learn that an approval was asked for, let alone answer it.
+        if getattr(type(owner), "send_exec_approval", None) is not None:
+            try:
+                result = await owner.send_exec_approval(
+                    self._owner_chat_id,
+                    command,
+                    session_key,
+                    description=description,
+                    # The metadata describes a Channel thread, not the Owner Chat.
+                    metadata=None,
+                    allow_permanent=allow_permanent,
+                    allow_session=allow_session,
+                    smart_denied=smart_denied,
+                )
+            except (RuntimeError, TypeError, AttributeError) as error:
+                logger.warning(
+                    "[amessenger] Owner Chat approval buttons unavailable; "
+                    "using a text card: %s",
+                    error,
+                )
+            else:
+                # Preserve the mail session key so the Owner's button resolves
+                # this Channel session, not the Owner Chat session.
+                return result
+
+        card = mirror.approval_request(
+            self.known_channel(chat_id), command, description
+        )
+        if await mirror.post(owner, self._owner_chat_id, card):
+            updated = state.add_pending_approval(
+                self.state(), session_key, chat_id, state.now()
+            )
+            self.set_state(updated)
+            return SendResult(success=True)
+
+        error = "approval request was not delivered to the Owner Chat"
+        logger.error("[amessenger] %s", error)
+        return SendResult(success=False, error=error)
+
     async def send(
         self,
         chat_id,

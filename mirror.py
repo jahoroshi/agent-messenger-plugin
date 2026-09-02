@@ -46,6 +46,23 @@ def incoming(sender_card, channel, text, policy) -> str:
     return rendered
 
 
+def approval_request(channel: dict, command: str, description: str) -> str:
+    """Format a dangerous-command approval for the Owner Chat."""
+    lines = [
+        f"⚠️ AMessenger · channel {label(channel)} asked me to run a command "
+        "under the full Tool Level."
+    ]
+    if description:
+        lines.append(description)
+    lines.extend(
+        (
+            f"    {command}",
+            "— Allow once: /amsg approve     Refuse: /amsg deny     Silence refuses it.",
+        )
+    )
+    return "\n".join(lines)
+
+
 def outgoing(channel, text) -> str:
     """Format an outgoing Message for the Owner Chat."""
     return f"📤 AMessenger · to channel {label(channel)}\n{text}"

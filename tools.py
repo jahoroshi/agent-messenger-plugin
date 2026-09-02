@@ -11,6 +11,13 @@ NOT_CONNECTED = "Error: AMessenger is not connected."
 RELAY_OUTAGE = "Error: the AMessenger relay did not answer. Try again."
 
 
+def relay_error(error) -> str:
+    """The sentence the model reads when the relay refused or did not answer."""
+    if isinstance(error, relay.RelayRejected):
+        return f"Error: {error.detail}"
+    return RELAY_OUTAGE
+
+
 def _adapter_or_error():
     adapter = live_adapter()
     if adapter is None:
@@ -80,10 +87,8 @@ async def amessenger_agents(args: dict, **_) -> str:
     query = args.get("query")
     try:
         cards = await relay.list_agents(adapter.client(), query)
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
     if not cards:
         return (
             f"No Agents match '{query}'."
@@ -99,10 +104,8 @@ async def amessenger_channels(args: dict, **_) -> str:
         return error
     try:
         channels = await relay.list_channels(adapter.client())
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
     if not channels:
         return "No Channels yet."
     return "\n".join(_channel_line(channel) for channel in channels)
@@ -121,10 +124,8 @@ async def amessenger_send(args: dict, **_) -> str:
         result = await relay.send_message(
             adapter.client(), to=to, channel_id=channel_id, text=text
         )
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
 
     adapter.remember_channel(result["channel"])
     # The reply cap does not apply: it counts autonomous replies inside a
@@ -156,12 +157,10 @@ async def amessenger_status(args: dict, **_) -> str:
     message_id = args.get("message_id")
     try:
         status_result = await relay.message_status(adapter.client(), message_id)
-    except relay.RelayRejected as rejected:
-        if rejected.status == 404:
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        if isinstance(error, relay.RelayRejected) and error.status == 404:
             return "That Message is gone: every recipient acked it, or it expired."
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+        return relay_error(error)
 
     deliveries = status_result.get("deliveries") or []
     delivered = sum(delivery.get("state") == "acked" for delivery in deliveries)
@@ -182,10 +181,8 @@ async def amessenger_create_channel(args: dict, **_) -> str:
     invite = args.get("invite") or []
     try:
         channel = await relay.create_channel(adapter.client(), name, invite)
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
     adapter.remember_channel(channel)
     invited = [
         member.get("agent", "unknown")
@@ -214,10 +211,8 @@ async def amessenger_invite(args: dict, **_) -> str:
     agent = args.get("agent")
     try:
         channel = await relay.invite(adapter.client(), channel_id, agent)
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
     adapter.remember_channel(channel)
     return f"Invited {agent} to channel {channel_id}."
 
@@ -229,10 +224,8 @@ async def amessenger_leave(args: dict, **_) -> str:
     channel_id = args.get("channel_id")
     try:
         await relay.leave(adapter.client(), channel_id)
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
     adapter.set_state(state.revoke(adapter.state(), channel_id))
     return f"Left channel {channel_id}."
 
@@ -245,10 +238,8 @@ async def amessenger_remove_member(args: dict, **_) -> str:
     agent = args.get("agent")
     try:
         await relay.remove_member(adapter.client(), channel_id, agent)
-    except relay.RelayRejected as rejected:
-        return f"Error: {rejected.detail}"
-    except relay.RelayUnavailable:
-        return RELAY_OUTAGE
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return relay_error(error)
     return f"Removed {agent} from channel {channel_id}."
 
 
