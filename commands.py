@@ -227,6 +227,14 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
+    agent_name = read_settings().get("agent", "")
+    if any(
+        isinstance(member, dict)
+        and member.get("agent") == agent_name
+        and member.get("state") == "member"
+        for member in channel.get("members", [])
+    ):
+        return f"{mirror.label(channel)} is already a member."
     try:
         async with relay_client(adapter) as client:
             await relay.join(client, channel["id"])
@@ -294,6 +302,9 @@ async def _notify(adapter, tokens: list[str], help_text: str) -> str:
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
+    record = state.channel(_read_state(adapter), channel["id"], state.now())
+    if record["policy"] == "notify":
+        return f"{mirror.label(channel)} is already notify."
     _update_state(adapter, lambda document: state.revoke(document, channel["id"]))
     return (
         f"{mirror.label(channel)} is back to notify. I will show you its Messages "

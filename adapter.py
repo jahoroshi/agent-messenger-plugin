@@ -1031,6 +1031,7 @@ class AMessengerAdapter(BasePlatformAdapter):
     async def _forward_exec_approval(
         self,
         owner,
+        chat_id,
         command,
         session_key,
         description,
@@ -1063,6 +1064,17 @@ class AMessengerAdapter(BasePlatformAdapter):
             if result and getattr(result, "success", False):
                 # Preserve the mail session key so the Owner's button resolves
                 # this Channel session, not the Owner Chat session.
+                # Hermes owns the native card's rendering, but the plugin still
+                # owns the durable Owner log.  Record the same wording used by
+                # the text-card fallback without trying to post or mark it.
+                self._record_owner_log(
+                    mirror.approval_request(
+                        self.known_channel(chat_id),
+                        command,
+                        description,
+                        mirror.handle(chat_id),
+                    )
+                )
                 return result
             logger.warning(
                 "[amessenger] Owner Chat approval forwarding failed: %s; "
@@ -1116,6 +1128,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         # learn that an approval was asked for, let alone answer it.
         forwarded = await self._forward_exec_approval(
             owner,
+            chat_id,
             command,
             session_key,
             description,
