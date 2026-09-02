@@ -10,6 +10,15 @@ import time
 import httpx
 
 from . import state
+from . import mirror, relay
+from .mirror import format_card
+from .relay import (
+    CardConflict,
+    HTTP_TIMEOUT_SECONDS,
+    RelayRejected,
+    RelayUnavailable,
+    WAIT_TIMEOUT_SECONDS,
+)
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
@@ -18,10 +27,8 @@ logger = logging.getLogger("amessenger")
 
 PLATFORM_NAME = "amessenger"
 RECONNECT_BACKOFF = (1, 2, 5, 10, 30)   # seconds, §6.2: reconnect backoff 1–30 s
-WAIT_TIMEOUT_SECONDS = 25               # §6.2: GET /v1/inbox/wait?timeout=25
 MIN_POLL_CYCLE_SECONDS = 1.0            # a poll that returns nothing instantly must not spin
 HOUSEKEEPING_SECONDS = 60               # §6.2: expire Grants every minute
-HTTP_TIMEOUT_SECONDS = 10               # every relay call except the long poll
 MAX_MESSAGE_LENGTH = 65536              # SYSTEM_DESIGN §5: text ≤ 64 KB
 STATE_DIRNAME = "amessenger"           # $HERMES_HOME/amessenger/state.json, §6.6
 STATE_FILENAME = "state.json"
@@ -47,21 +54,6 @@ def hermes_home() -> Path:
         if not home:
             raise RuntimeError("cannot resolve Hermes home via hermes_constants.get_hermes_home or HERMES_HOME")
         return Path(home)
-def format_card(card: dict | None) -> str:
-    if card is None: return "Your Card is published."
-    owner = card.get("owner") or {}
-    lines = ["Your Card is published:",
-             f"  Agent: {card.get('name') or 'unknown'} ({card.get('kind') or 'unknown'})",
-             f"  Owner: {owner.get('name') or owner.get('login') or 'unknown'} <{owner.get('email') or 'unknown'}>"]
-    if card.get("description"): lines.append(f"  About: {card['description']}")
-    return "\n".join(lines)
-class CardConflict(Exception):
-    """The relay rejected this Agent's Card because its identity conflicts."""
-
-class RelayUnavailable(Exception):
-    """The relay could not complete a request."""
-
-
 async def sleep(seconds: float) -> None:
     """Sleep behind a module seam so tests never wait real seconds."""
     await asyncio.sleep(seconds)
@@ -134,23 +126,6 @@ def env_enablement() -> dict | None:
     }
 
 
-def _safe_error(message, key: str) -> str:
-    text = str(message)
-    return text.replace(key, "[redacted]") if key else text
-
-
-def _response_detail(response: httpx.Response, fallback: str, key: str) -> str:
-    try:
-        payload = response.json()
-    except (TypeError, ValueError):
-        return fallback
-    if isinstance(payload, dict):
-        detail = payload.get("detail")
-        if isinstance(detail, str) and detail.strip():
-            return _safe_error(detail, key)
-    return fallback
-
-
 class AMessengerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig, help_text: str = "") -> None:
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
@@ -221,10 +196,15 @@ class AMessengerAdapter(BasePlatformAdapter):
     @property
     def owner_adapter(self):
         return self.gateway_runner.adapters[Platform(self._owner_platform)]
-    def state_path(self) -> Path: return hermes_home() / STATE_DIRNAME / STATE_FILENAME
+
+    def state_path(self) -> Path:
+        return hermes_home() / STATE_DIRNAME / STATE_FILENAME
+
     def state(self) -> dict:
-        if self._state is None: self._state = state.load(self.state_path())
+        if self._state is None:
+            self._state = state.load(self.state_path())
         return self._state
+
     def set_state(self, new_state: dict) -> None:
         state.save(self.state_path(), new_state)
         self._state = new_state
@@ -232,15 +212,11 @@ class AMessengerAdapter(BasePlatformAdapter):
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             settings = self._settings or read_settings()
-            self._client = httpx.AsyncClient(
-                base_url=settings["url"],
+            self._client = relay.build_client(
+                settings["url"],
+                settings["key"],
+                settings["agent"],
                 transport=self._transport,
-                timeout=HTTP_TIMEOUT_SECONDS,
-                trust_env=False,
-                headers={
-                    "Authorization": "Bearer " + settings["key"],
-                    "X-Agent": settings["agent"],
-                },
             )
         return self._client
 
@@ -263,50 +239,14 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def publish_card(self) -> dict:
         settings = self._settings or read_settings()
-        body = {"kind": settings["kind"]}
-        if settings["description"]:
-            body["description"] = settings["description"]
-        try:
-            response = await self.client().put("/v1/agents/me", json=body)
-        except httpx.HTTPError as error:
-            raise RelayUnavailable(_safe_error(error, settings["key"])) from error
-        if response.status_code == 409:
-            detail = _response_detail(response, "HTTP 409", settings["key"])
-            raise CardConflict(detail)
-        if response.status_code != 200:
-            raise RelayUnavailable(f"HTTP {response.status_code}")
-        try:
-            card = response.json()
-        except (TypeError, ValueError) as error:
-            raise RelayUnavailable("malformed Card response") from error
-        if not isinstance(card, dict):
-            raise RelayUnavailable("malformed Card response")
+        card = await relay.publish_card(
+            self.client(), settings["kind"], settings["description"]
+        )
         self._card = card
         return card
 
     async def fetch_deliveries(self) -> list[dict]:
-        settings = self._settings or read_settings()
-        timeout = httpx.Timeout(
-            HTTP_TIMEOUT_SECONDS, read=WAIT_TIMEOUT_SECONDS + HTTP_TIMEOUT_SECONDS
-        )
-        try:
-            response = await self.client().get(
-                "/v1/inbox/wait",
-                params={"timeout": WAIT_TIMEOUT_SECONDS},
-                timeout=timeout,
-            )
-        except httpx.HTTPError as error:
-            raise RelayUnavailable(_safe_error(error, settings["key"])) from error
-        if response.status_code != 200:
-            raise RelayUnavailable(f"HTTP {response.status_code}")
-        try:
-            payload = response.json()
-            deliveries = payload["deliveries"]
-        except (KeyError, TypeError, ValueError) as error:
-            raise RelayUnavailable("malformed deliveries response") from error
-        if not isinstance(deliveries, list):
-            raise RelayUnavailable("malformed deliveries response")
-        return deliveries
+        return await relay.wait(self.client(), WAIT_TIMEOUT_SECONDS)
 
     async def poll_once(self) -> list[dict]:
         # Task T5.1 adds the Mirror, dispatch and Ack here.
@@ -331,7 +271,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 self._running = False
                 self._mark_disconnected()
                 return
-            except RelayUnavailable as error:
+            except (RelayRejected, RelayUnavailable) as error:
                 wait = RECONNECT_BACKOFF[min(index, len(RECONNECT_BACKOFF) - 1)]
                 logger.warning(
                     "[amessenger] relay unavailable (%s); retrying in %ss",
@@ -346,8 +286,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         if self.state()["welcomed"]:
             return
         text = self._help_text + "\n\n" + format_card(self._card)
-        result = await self.owner_adapter.send(self._owner_chat_id, text)
-        if not result or not getattr(result, "success", False):
+        if not await mirror.post(self.owner_adapter, self._owner_chat_id, text):
             logger.warning("[amessenger] welcome not delivered to Owner Chat %s", self._owner_chat_id)
             return
         self.set_state(state.set_welcomed(self.state(), True))
@@ -377,7 +316,8 @@ class AMessengerAdapter(BasePlatformAdapter):
                     await task
                 except asyncio.CancelledError:
                     # A cancelled task is the expected outcome during disconnect.
-                    pass
+                    setattr(self, attribute, None)
+                    continue
                 setattr(self, attribute, None)
         client = self._client
         self._client = None
