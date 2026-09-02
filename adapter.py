@@ -1,6 +1,7 @@
 """AMessenger platform adapter for Hermes."""
 
 import asyncio
+from collections import OrderedDict
 import logging
 import os
 from pathlib import Path
@@ -36,6 +37,8 @@ REQUIRED_ENV = ("AMESSENGER_URL", "AMESSENGER_KEY", "AMESSENGER_AGENT",
                 "AMESSENGER_KIND", "AMESSENGER_OWNER_CHAT")
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
+DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
+DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
 
 PLATFORM_HINT = (
     "You are on AMessenger. A message arriving inside square brackets that names "
@@ -138,6 +141,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._poll_task = None
         self._housekeeping_task = None
         self._card = self._state = None
+        self._seen: "OrderedDict[str, float]" = OrderedDict()
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -248,9 +252,98 @@ class AMessengerAdapter(BasePlatformAdapter):
     async def fetch_deliveries(self) -> list[dict]:
         return await relay.wait(self.client(), WAIT_TIMEOUT_SECONDS)
 
+    def _prune_seen(self, moment: float) -> None:
+        cutoff = moment - DEDUPE_SECONDS
+        expired = [delivery_id for delivery_id, seen_at in self._seen.items()
+                   if seen_at < cutoff]
+        for delivery_id in expired:
+            del self._seen[delivery_id]
+
+    def remember(self, delivery_id: str) -> None:
+        moment = monotonic()
+        self._prune_seen(moment)
+        self._seen[delivery_id] = moment
+        self._seen.move_to_end(delivery_id)
+        while len(self._seen) > DEDUPE_MAX:
+            self._seen.popitem(last=False)
+
+    def already_processed(self, delivery_id: str) -> bool:
+        self._prune_seen(monotonic())
+        return delivery_id in self._seen
+
     async def poll_once(self) -> list[dict]:
-        # Task T5.1 adds the Mirror, dispatch and Ack here.
-        return await self.fetch_deliveries()
+        deliveries = await self.fetch_deliveries()
+        done = []
+        for delivery in deliveries:
+            if await self.handle_delivery(delivery):
+                done.append(delivery["id"])
+        if done:
+            logger.info("[amessenger] acking %d Deliveries", len(done))
+            # If this Ack fails, the loop backs off and the relay re-offers;
+            # the dedupe set Acks that repeat without mirroring.
+            await relay.ack(self.client(), done)
+        return deliveries
+
+    async def handle_delivery(self, delivery: dict) -> bool:
+        delivery_id = delivery["id"]
+        message = delivery["message"]
+        channel = delivery["channel"]
+        sender_card = delivery.get("sender_card")
+        kind = message["kind"]
+        logger.info("[amessenger] Delivery %s kind=%s", delivery_id, kind)
+
+        if self.already_processed(delivery_id):
+            logger.debug("[amessenger] Delivery %s already processed", delivery_id)
+            return True
+
+        if kind == "invite":
+            text = mirror.invite(channel, message["text"])
+            processed = await self._mirror_delivery(delivery, text)
+        elif kind in {"joined", "left", "closed", "removed"}:
+            text = mirror.notice(channel, message["text"])
+            processed = await self._mirror_delivery(delivery, text)
+            if processed and kind in {"closed", "removed"}:
+                self.set_state(state.revoke(self.state(), channel["id"]))
+        elif kind == "text":
+            processed = await self._handle_text_delivery(
+                delivery, channel, sender_card, message["text"]
+            )
+        else:
+            logger.warning("[amessenger] unknown Delivery kind=%s", kind)
+            processed = True
+
+        if processed:
+            self.remember(delivery_id)
+        return processed
+
+    async def _mirror_delivery(self, delivery: dict, text: str) -> bool:
+        posted = await mirror.mirror(
+            self.owner_adapter,
+            self._owner_platform,
+            self._owner_chat_id,
+            text,
+        )
+        if not posted:
+            logger.warning(
+                "[amessenger] Mirror post failed for Delivery %s", delivery["id"]
+            )
+        return posted
+
+    async def _handle_text_delivery(
+        self, delivery: dict, channel: dict, sender_card, message_text: str
+    ) -> bool:
+        policy = state.channel(self.state(), channel["id"])["policy"]
+        text = mirror.incoming(sender_card, channel, message_text, policy)
+        if not await self._mirror_delivery(delivery, text):
+            return False
+        self.set_state(state.note_incoming(self.state(), channel["id"], state.now()))
+        if policy == "interact":
+            await self.dispatch(delivery)
+        return True
+
+    async def dispatch(self, delivery: dict) -> None:
+        # Task T6.2 builds the source, frames the text and calls handle_message.
+        return None
 
     async def run_poll_loop(self) -> None:
         index = 0
