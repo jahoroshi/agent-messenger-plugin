@@ -31,4 +31,12 @@ def register(ctx) -> None:
         env_enablement_fn=env_enablement, platform_hint=PLATFORM_HINT,
         emoji="📨", max_message_length=MAX_MESSAGE_LENGTH, pii_safe=False,
     )
-    # Tasks T7.2, T8.1 and T9.1 register the command, tools, skill and hooks.
+    from . import commands
+
+    ctx.register_command(
+        "amsg",
+        commands.make_handler(),
+        description="AMessenger: join Channels and set the Mail Policy",
+        args_hint="join|interact|notify|leave|status|approve|deny|help",
+    )
+    ctx.register_hook("pre_gateway_dispatch", commands.remember_source)
