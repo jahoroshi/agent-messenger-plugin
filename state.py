@@ -1,5 +1,6 @@
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,8 @@ REPLY_WINDOW_SECONDS = 600  # Rolling reply-cap window (§6.4).
 PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 DEDUPE_MAX = 200  # Processed Delivery ids retained for restart-safe dedupe.
 DEDUPE_SECONDS = 3600  # Processed Delivery retention window.
+SEND_IDEMPOTENCY_SECONDS = 60  # Exact tool sends are coalesced for one minute.
+SEND_IDEMPOTENCY_MAX = DEDUPE_MAX
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # Fixed-width UTC timestamps.
 logger = logging.getLogger("amessenger")
 _file_lock_warning_logged = False
@@ -76,6 +79,7 @@ def _copy_state(
     pending=None,
     pending_mirrors=None,
     seen_deliveries=None,
+    send_idempotency=None,
 ) -> dict:
     mirrors = (
         state.get("pending_mirrors", [])
@@ -87,7 +91,7 @@ def _copy_state(
         if seen_deliveries is None
         else seen_deliveries
     )
-    return {
+    updated = {
         **state,
         "channels": _copy_channels(state["channels"] if channels is None else channels),
         "pending_approvals": _copy_pending(
@@ -96,6 +100,16 @@ def _copy_state(
         "pending_mirrors": [*mirrors],
         "seen_deliveries": {**seen},
     }
+    if "send_idempotency" in state or send_idempotency is not None:
+        idempotency = (
+            state.get("send_idempotency", {})
+            if send_idempotency is None
+            else send_idempotency
+        )
+        updated["send_idempotency"] = {
+            key: {**entry} for key, entry in idempotency.items()
+        }
+    return updated
 
 
 def _default_channel() -> dict:
@@ -189,6 +203,79 @@ def was_delivery_seen(state: dict, delivery_id: str, moment: datetime) -> bool:
     if parsed is None:
         return False
     return parsed >= moment - timedelta(seconds=DEDUPE_SECONDS)
+
+
+def send_idempotency_key(channel_id: str, text: str) -> str:
+    """Hash a resolved Channel and body without storing the body in state."""
+    encoded = json.dumps(
+        [channel_id, text], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _copy_send_idempotency(entries: dict) -> dict:
+    return {
+        key: {**entry}
+        for key, entry in entries.items()
+        if isinstance(key, str) and isinstance(entry, dict)
+    }
+
+
+def _bound_send_idempotency(entries: dict) -> dict:
+    if len(entries) <= SEND_IDEMPOTENCY_MAX:
+        return entries
+    ordered = sorted(
+        entries.items(),
+        key=lambda item: (parse_ts(item[1]["sent_at"]), item[0]),
+    )
+    return dict(ordered[-SEND_IDEMPOTENCY_MAX:])
+
+
+def forget_old_sends(state: dict, moment: datetime) -> dict:
+    """Prune expired exact-send records and retain the newest bounded set."""
+    entries = state.get("send_idempotency", {})
+    cutoff = moment - timedelta(seconds=SEND_IDEMPOTENCY_SECONDS)
+    current = {}
+    for key, entry in entries.items():
+        sent_at = parse_ts(entry.get("sent_at")) if isinstance(entry, dict) else None
+        message_id = entry.get("message_id") if isinstance(entry, dict) else None
+        if (
+            isinstance(key, str)
+            and isinstance(message_id, str)
+            and sent_at is not None
+            and sent_at >= cutoff
+        ):
+            current[key] = {"message_id": message_id, "sent_at": entry["sent_at"]}
+    current = _bound_send_idempotency(current)
+    return _copy_state(state, send_idempotency=current)
+
+
+def recent_send(state: dict, key: str, moment: datetime) -> dict | None:
+    """Return a recent exact-send record, if one exists."""
+    entry = state.get("send_idempotency", {}).get(key)
+    if not isinstance(entry, dict):
+        return None
+    sent_at = parse_ts(entry.get("sent_at"))
+    message_id = entry.get("message_id")
+    if (
+        sent_at is None
+        or not isinstance(message_id, str)
+        or sent_at < moment - timedelta(seconds=SEND_IDEMPOTENCY_SECONDS)
+    ):
+        return None
+    return {"message_id": message_id, "sent_at": entry["sent_at"]}
+
+
+def remember_send(
+    state: dict, key: str, message_id: str, moment: datetime
+) -> dict:
+    """Remember a successful exact send without retaining its body."""
+    updated = forget_old_sends(state, moment)
+    entries = {**updated.get("send_idempotency", {})}
+    entries.pop(key, None)
+    entries[key] = {"message_id": message_id, "sent_at": ts(moment)}
+    entries = _bound_send_idempotency(entries)
+    return _copy_state(updated, send_idempotency=entries)
 
 
 def _timestamps_are_valid(record: dict) -> bool:
@@ -291,6 +378,9 @@ def load(path) -> dict:
     seen_deliveries = (
         document.get("seen_deliveries", {}) if isinstance(document, dict) else None
     )
+    send_idempotency = (
+        document.get("send_idempotency", {}) if isinstance(document, dict) else None
+    )
     valid = (
         isinstance(document, dict)
         and isinstance(document.get("welcomed"), bool)
@@ -303,19 +393,31 @@ def load(path) -> dict:
             isinstance(delivery_id, str) and isinstance(seen_at, str)
             for delivery_id, seen_at in seen_deliveries.items()
         )
+        and isinstance(send_idempotency, dict)
+        and all(
+            isinstance(key, str)
+            and isinstance(entry, dict)
+            and isinstance(entry.get("message_id"), str)
+            and isinstance(entry.get("sent_at"), str)
+            for key, entry in send_idempotency.items()
+        )
     )
     if not valid:
         raise StateFileCorrupt(f"invalid state file: {target}")
-    return {
+    loaded = {
         **document,
         "pending_mirrors": [*pending_mirrors],
         "seen_deliveries": {**seen_deliveries},
     }
+    if "send_idempotency" in document:
+        loaded["send_idempotency"] = _copy_send_idempotency(send_idempotency)
+    return loaded
 
 
 def save(path, state) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    state = forget_old_sends(state, now()) if "send_idempotency" in state else state
     temporary_name = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
@@ -364,5 +466,7 @@ def update_file(path, change) -> dict:
     with file_lock(path):
         document = load(path)
         updated = change(document)
+        if "send_idempotency" in updated:
+            updated = forget_old_sends(updated, now())
         save(path, updated)
         return updated

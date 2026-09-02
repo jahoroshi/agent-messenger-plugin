@@ -1,5 +1,7 @@
 """Small HTTP client for the AMessenger relay."""
 
+from . import mirror
+
 import httpx
 
 
@@ -200,12 +202,59 @@ async def list_channels(client) -> list[dict]:
     return _array(response)
 
 
-async def create_channel(client, name, invite) -> dict:
+def _ambiguous_channel_message(channels: list[dict]) -> str:
+    entries = []
+    for channel in channels:
+        short_handle = mirror.handle(channel["id"])
+        name = channel.get("name") or "unnamed"
+        entries.append(f"{short_handle}… {name}")
+    return (
+        f"That matches {len(channels)} Channels: {', '.join(entries)}. "
+        "Type more characters."
+    )
+
+
+def resolve_channel(
+    channels: list[dict], token: str
+) -> tuple[dict | None, str | None]:
+    """Resolve a Channel id, unique id prefix, or unique exact name.
+
+    The caller supplies the already-fetched Channels so this remains a pure
+    resolver shared by the Owner command path and the Owner-only tools.
+    """
+    exact_ids = [channel for channel in channels if channel.get("id") == token]
+    if exact_ids:
+        return exact_ids[0], None
+
+    prefixes = [
+        channel
+        for channel in channels
+        if isinstance(channel.get("id"), str)
+        and isinstance(token, str)
+        and channel["id"].startswith(token)
+    ]
+    if len(prefixes) == 1:
+        return prefixes[0], None
+    if len(prefixes) > 1:
+        return None, _ambiguous_channel_message(prefixes)
+
+    exact_names = [channel for channel in channels if channel.get("name") == token]
+    if len(exact_names) == 1:
+        return exact_names[0], None
+    if len(exact_names) > 1:
+        return None, _ambiguous_channel_message(exact_names)
+    return None, f"No Channel here starts with {token}."
+
+
+async def create_channel(client, name, invite, text=None) -> dict:
+    payload = {"name": name, "invite": invite}
+    if text is not None:
+        payload["text"] = text
     response = await request(
         client,
         "POST",
         "/v1/channels",
-        json={"name": name, "invite": invite},
+        json=payload,
     )
     return _object(response)
 

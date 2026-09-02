@@ -149,18 +149,6 @@ def parse_interact(tokens) -> tuple[str, float | None, str] | None:
     return "single", duration, level
 
 
-def _ambiguous_message(channels: list[dict]) -> str:
-    entries = []
-    for channel in channels:
-        short_handle = mirror.handle(channel["id"])
-        name = channel.get("name") or "unnamed"
-        entries.append(f"{short_handle}… {name}")
-    return (
-        f"That matches {len(channels)} Channels: {', '.join(entries)}. "
-        "Type more characters."
-    )
-
-
 async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     """Resolve an Owner-facing Channel id, prefix, or exact name."""
     try:
@@ -169,26 +157,7 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return None, _relay_failure("list Channels", error)
 
-    exact_ids = [channel for channel in channels if channel.get("id") == token]
-    if exact_ids:
-        return exact_ids[0], None
-
-    prefixes = [
-        channel
-        for channel in channels
-        if isinstance(channel.get("id"), str) and channel["id"].startswith(token)
-    ]
-    if len(prefixes) == 1:
-        return prefixes[0], None
-    if len(prefixes) > 1:
-        return None, _ambiguous_message(prefixes)
-
-    exact_names = [channel for channel in channels if channel.get("name") == token]
-    if len(exact_names) == 1:
-        return exact_names[0], None
-    if len(exact_names) > 1:
-        return None, _ambiguous_message(exact_names)
-    return None, f"No Channel here starts with {token}."
+    return relay.resolve_channel(channels, token)
 
 
 def _relay_failure(action: str, error: Exception) -> str:

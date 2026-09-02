@@ -43,6 +43,7 @@ AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
 DEDUPE_MAX = state.DEDUPE_MAX
 DEDUPE_SECONDS = state.DEDUPE_SECONDS
+SEND_IDEMPOTENCY_SECONDS = state.SEND_IDEMPOTENCY_SECONDS
 CHANNELS_MAX = 200  # Remembered Channel records used for Owner-facing labels.
 PENDING_MIRRORS_MAX = state.PENDING_MIRRORS_MAX
 OWNER_POST_TIMEOUT_SECONDS = 15
@@ -51,6 +52,21 @@ TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail 
 NO_TOOLS_SENTINEL = "amessenger_none"
 DELIVERY_FAILURE_NOTICE_PREFIX = "⚠️ Message delivery failed"
 FORMATTING_FALLBACK_PREFIX = "(Response formatting failed, plain text:)"
+# Belt, not the root fix: Hermes sends these through adapter._send_with_retry
+# with ordinary thread metadata and no metadata marker. The list is matched
+# on wording, so revisit it if Hermes rewords any busy/control notice. A prefix
+# here must be specific enough that no real reply can begin with it. The
+# internal event flag below is the root fix for Channel deliveries.
+GATEWAY_NOTICE_PREFIXES = (
+    "⏩ Steered into current run",
+    "↪ Redirected current run",
+    "⏳ Subagent working",
+    "⏳ Compressing context",
+    "⏳ Another turn is still running",
+    "⏳ Queued for the next turn",
+    "⚡ Interrupting current task",
+    "💡 First-time tip",
+)
 INTERIM_SEND_KEY = "_interim_send"
 _LIVE_ADAPTER = None
 
@@ -682,7 +698,12 @@ class AMessengerAdapter(BasePlatformAdapter):
             text=framed,
             source=source,
             message_id=message["id"],
-            allow_gateway_control=False,  # Peer '/' input is never a gateway command.
+            # Internal events queue FIFO behind a busy turn instead of steering
+            # it, so a second Delivery cannot produce a busy acknowledgement.
+            internal=True,
+            # The peer '/' input is never a gateway command; authorization is
+            # already upstream because the relay only delivers joined Channels.
+            allow_gateway_control=False,
         )
         await self.handle_message(event)
 
@@ -1165,6 +1186,12 @@ class AMessengerAdapter(BasePlatformAdapter):
         ):
             logger.warning(
                 "[amessenger] dropping Hermes delivery-failure notice; it is not mail"
+            )
+            return SendResult(success=True, message_id=None)
+
+        if isinstance(content, str) and content.startswith(GATEWAY_NOTICE_PREFIXES):
+            logger.warning(
+                "[amessenger] dropping Hermes control notice; it is not mail"
             )
             return SendResult(success=True, message_id=None)
 

@@ -11,6 +11,8 @@ from .adapter import active_adapter, check_requirements
 
 logger = logging.getLogger("amessenger")
 RELAY_OUTAGE = "Error: the AMessenger relay did not answer. Try again."
+CHANNEL_ID_LENGTH = 22
+SEND_IDEMPOTENCY_SECONDS = state.SEND_IDEMPOTENCY_SECONDS
 
 
 def relay_error(error) -> str:
@@ -91,6 +93,57 @@ def _pending_recipients(channel: dict, to: str | None) -> list[str]:
     ]
 
 
+async def _resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
+    """Resolve a tool Channel argument against this Agent's own Channels."""
+    full_id = (
+        isinstance(token, str)
+        and len(token) == CHANNEL_ID_LENGTH
+        and all(character.isascii() and (character.isalnum() or character in "-_")
+                for character in token)
+    )
+    try:
+        async with relay_client(adapter) as client:
+            channels = await relay.list_channels(client)
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        # Older relay fakes used by the plugin's full-id compatibility tests
+        # expose only action routes. A real relay lists Channels successfully;
+        # retain this explicit, logged test seam rather than hiding a lookup
+        # failure for an unknown full id.
+        if (
+            full_id
+            and isinstance(error, relay.RelayRejected)
+            and error.status == 404
+            and error.code == "not_found"
+            and error.detail == "route not found"
+        ):
+            logger.warning(
+                "[amessenger] Channel listing route is unavailable; "
+                "passing the validated full id to the relay action"
+            )
+            return relay.resolve_channel([{"id": token}], token)
+        return None, relay_error(error)
+    return relay.resolve_channel(channels, token)
+
+
+def _read_shared_state(adapter) -> dict:
+    if adapter is None:
+        return adapter_module.read_state_file()
+    return state.load(adapter.state_path())
+
+
+def _update_shared_state(adapter, change) -> dict:
+    if adapter is None:
+        return adapter_module.update_state_file(change)
+    return adapter.update_state(change)
+
+
+def _already_sent_answer(channel_id: str, record: dict) -> str:
+    return (
+        f"Already sent that exact Message to channel {channel_id} a moment ago. "
+        f"Message id {record['message_id']}."
+    )
+
+
 def _send_result(
     result: dict, text: str, to: str | None, owner_copy_queued: bool = False
 ) -> str:
@@ -162,6 +215,19 @@ async def amessenger_send(args: dict, **_) -> str:
     if (to is None) == (channel_id is None):
         return "Error: provide exactly one of 'to' and 'channel_id'."
     text = args.get("text", "")
+    redacted = security.redact_outbound(text)
+    if channel_id is not None:
+        channel, resolution_error = await _resolve_channel(adapter, channel_id)
+        if resolution_error is not None:
+            return resolution_error
+        channel_id = channel["id"]
+        key = state.send_idempotency_key(channel_id, text)
+        previous = state.recent_send(
+            _read_shared_state(adapter), key, state.now()
+        )
+        if previous is not None:
+            return _already_sent_answer(channel_id, previous)
+
     count_reply = False
     reply_moment = None
     if adapter is not None and channel_id is not None:
@@ -191,7 +257,6 @@ async def amessenger_send(args: dict, **_) -> str:
         result = delivery.raw_response
         owner_copy_queued = False
     else:
-        redacted = security.redact_outbound(text)
         send_arguments = {"text": redacted}
         if to is None:
             send_arguments["channel_id"] = channel_id
@@ -216,6 +281,22 @@ async def amessenger_send(args: dict, **_) -> str:
 
     if not isinstance(result, dict):
         return "Error: the Message was not sent."
+    result_channel = result.get("channel")
+    result_message = result.get("message")
+    if (
+        isinstance(result_channel, dict)
+        and isinstance(result_channel.get("id"), str)
+        and isinstance(result_message, dict)
+        and isinstance(result_message.get("id"), str)
+    ):
+        sent_channel_id = result_channel["id"]
+        key = state.send_idempotency_key(sent_channel_id, text)
+        _update_shared_state(
+            adapter,
+            lambda document: state.remember_send(
+                document, key, result_message["id"], state.now()
+            ),
+        )
     return _send_result(result, text, to, owner_copy_queued)
 
 
@@ -230,6 +311,12 @@ async def amessenger_status(args: dict, **_) -> str:
     error = _configuration_error()
     if error:
         return error
+    channel_id = args.get("channel_id")
+    if channel_id is not None:
+        channel, resolution_error = await _resolve_channel(adapter, channel_id)
+        if resolution_error is not None:
+            return resolution_error
+        channel_id = channel["id"]
     message_id = args.get("message_id")
     try:
         async with relay_client(adapter) as client:
@@ -260,9 +347,10 @@ async def amessenger_create_channel(args: dict, **_) -> str:
         return error
     name = args.get("name")
     invite = args.get("invite") or []
+    text = args.get("text")
     try:
         async with relay_client(adapter) as client:
-            channel = await relay.create_channel(client, name, invite)
+            channel = await relay.create_channel(client, name, invite, text)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     if adapter is not None:
@@ -294,6 +382,10 @@ async def amessenger_invite(args: dict, **_) -> str:
         return error
     channel_id = args.get("channel_id")
     agent = args.get("agent")
+    channel, resolution_error = await _resolve_channel(adapter, channel_id)
+    if resolution_error is not None:
+        return resolution_error
+    channel_id = channel["id"]
     try:
         async with relay_client(adapter) as client:
             channel = await relay.invite(client, channel_id, agent)
@@ -310,6 +402,10 @@ async def amessenger_leave(args: dict, **_) -> str:
     if error:
         return error
     channel_id = args.get("channel_id")
+    channel, resolution_error = await _resolve_channel(adapter, channel_id)
+    if resolution_error is not None:
+        return resolution_error
+    channel_id = channel["id"]
     try:
         async with relay_client(adapter) as client:
             await relay.leave(client, channel_id)
@@ -331,6 +427,10 @@ async def amessenger_remove_member(args: dict, **_) -> str:
         return error
     channel_id = args.get("channel_id")
     agent = args.get("agent")
+    channel, resolution_error = await _resolve_channel(adapter, channel_id)
+    if resolution_error is not None:
+        return resolution_error
+    channel_id = channel["id"]
     try:
         async with relay_client(adapter) as client:
             await relay.remove_member(client, channel_id, agent)
@@ -362,8 +462,8 @@ _SCHEMAS = {
             "name": "amessenger_channels",
             "description": (
                 "List the Agent's own Channels. The result shows each full Channel "
-                "id; other AMessenger tools take a full id, while the short handle "
-                "in the Owner Chat is only for the Owner to type."
+                "id; Channel arguments accept a full id, a unique id prefix, or an "
+                "exact Channel name."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -372,13 +472,21 @@ _SCHEMAS = {
             "description": (
                 "Send a Message to exactly one Agent or Channel. Sending to an Agent "
                 "creates the Channel, Invite, and queued Message when no matching "
-                "Channel exists, so the Owner never has to create one first."
+                "Channel exists, so the Owner never has to create one first. A "
+                "channel_id accepts a full id, a unique id prefix, or an exact "
+                "Channel name."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "to": {"type": "string", "description": "Agent name to address."},
-                    "channel_id": {"type": "string", "description": "Full Channel id to address."},
+                    "channel_id": {
+                        "type": "string",
+                        "description": (
+                            "Channel id, unique id prefix, or exact Channel name "
+                            "to address."
+                        ),
+                    },
                     "text": {"type": "string", "description": "Message text."},
                 },
                 "required": ["text"],
@@ -390,11 +498,21 @@ _SCHEMAS = {
                 "Check which recipients are still waiting for a Message while the "
                 "relay still has it. Delivered recipients disappear from the result; "
                 "when no rows remain, the Message was delivered to everyone, and a "
-                "404 means it is gone."
+                "404 means it is gone. If supplied, channel_id accepts a full id, "
+                "a unique id prefix, or an exact Channel name."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"message_id": {"type": "string", "description": "Message id."}},
+                "properties": {
+                    "message_id": {"type": "string", "description": "Message id."},
+                    "channel_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional Channel id, unique id prefix, or exact "
+                            "Channel name."
+                        ),
+                    },
+                },
                 "required": ["message_id"],
             },
         },
@@ -403,7 +521,9 @@ _SCHEMAS = {
         "amessenger_create_channel": {
             "name": "amessenger_create_channel",
             "description": _manage_description(
-                "Create a Channel with the supplied name and Invite entries."
+                "Create a Channel with the supplied name and Invite entries. Pass "
+                "the first Message as text: it is what the invited Owner reads "
+                "when deciding whether to accept."
             ),
             "parameters": {
                 "type": "object",
@@ -414,6 +534,13 @@ _SCHEMAS = {
                         "items": {"type": "string"},
                         "description": "Agent names to Invite.",
                     },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "The first Message/request shown to invited Owners "
+                            "before they accept."
+                        ),
+                    },
                 },
                 "required": ["name", "invite"],
             },
@@ -421,12 +548,18 @@ _SCHEMAS = {
         "amessenger_invite": {
             "name": "amessenger_invite",
             "description": _manage_description(
-                "Invite an Agent to a Channel you created."
+                "Invite an Agent to a Channel you created. The channel argument "
+                "accepts a full id, a unique id prefix, or an exact Channel name."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "channel_id": {"type": "string", "description": "Full Channel id."},
+                    "channel_id": {
+                        "type": "string",
+                        "description": (
+                            "Channel id, unique id prefix, or exact Channel name."
+                        ),
+                    },
                     "agent": {"type": "string", "description": "Agent name to Invite."},
                 },
                 "required": ["channel_id", "agent"],
@@ -435,23 +568,38 @@ _SCHEMAS = {
         "amessenger_leave": {
             "name": "amessenger_leave",
             "description": _manage_description(
-                "Leave a Channel. Leaving your created Channel closes it."
+                "Leave a Channel. Leaving your created Channel closes it. The "
+                "channel argument accepts a full id, a unique id prefix, or an "
+                "exact Channel name."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"channel_id": {"type": "string", "description": "Full Channel id."}},
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": (
+                            "Channel id, unique id prefix, or exact Channel name."
+                        ),
+                    }
+                },
                 "required": ["channel_id"],
             },
         },
         "amessenger_remove_member": {
             "name": "amessenger_remove_member",
             "description": _manage_description(
-                "Remove an Agent from a Channel you created."
+                "Remove an Agent from a Channel you created. The channel argument "
+                "accepts a full id, a unique id prefix, or an exact Channel name."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "channel_id": {"type": "string", "description": "Full Channel id."},
+                    "channel_id": {
+                        "type": "string",
+                        "description": (
+                            "Channel id, unique id prefix, or exact Channel name."
+                        ),
+                    },
                     "agent": {"type": "string", "description": "Member Agent name to remove."},
                 },
                 "required": ["channel_id", "agent"],

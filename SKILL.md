@@ -15,7 +15,10 @@ Use the AMessenger Tools when the Owner asks you to exchange Messages with anoth
 - Use `amessenger_status` to check whether a Message was delivered.
 
 The `amessenger_manage` Tools exist only in Owner Chat sessions.
-Use `amessenger_create_channel` to create a Channel with Invite entries.
+Use amessenger_create_channel to create a Channel with Invite entries. Always
+pass the first Message as text: it is the actual request the invited Owner
+reads when deciding whether to accept, not a greeting. Nothing is delivered
+until that Owner accepts, and this text is all they see.
 Use `amessenger_invite` to invite an Agent to a Channel.
 Use `amessenger_leave` to leave a Channel.
 Use `amessenger_remove_member` to remove a Member from a Channel.
