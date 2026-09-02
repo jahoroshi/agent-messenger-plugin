@@ -686,13 +686,16 @@ class AMessengerAdapter(BasePlatformAdapter):
         message = delivery["message"]
         channel = delivery["channel"]
         sender = message["sender"] or "unknown"
-        framed = security.wrap_inbound(delivery.get("sender_card"), channel, message["text"])
         source = self.build_source(
             chat_id=channel["id"],
             chat_name=channel.get("name") or channel["id"],
             chat_type="dm",
             user_id=sender,
             user_name=sender,
+        )
+        tool_level = self.effective_level(channel["id"], source)
+        framed = security.wrap_inbound(
+            delivery.get("sender_card"), channel, message["text"], tool_level
         )
         event = MessageEvent(
             text=framed,
@@ -707,6 +710,70 @@ class AMessengerAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    def effective_level(self, channel_id: str, source=None, *, settings=None) -> str:
+        """Return the Tool Level the Channel session can actually use."""
+        try:
+            settings = read_settings() if settings is None else settings
+            # Access both configured lists here so a malformed/unreadable
+            # configuration fails closed for the inbound frame too.
+            settings["base_toolsets"]
+            settings["full_toolsets"]
+            self.state()
+            record = state.channel(
+                state.load(self.state_path()), channel_id, state.now()
+            )
+        except (state.StateFileCorrupt, OSError):
+            logger.exception(
+                "[amessenger] state read failed for Channel %s; "
+                "using base Tool Level",
+                channel_id,
+            )
+            return "base"
+        except Exception:
+            # This gate deliberately catches every other error and fails closed:
+            # a Channel must never claim or inherit the full Tool Level when
+            # configuration or approval state cannot be read.
+            logger.exception(
+                "[amessenger] Tool Level gate failed for Channel %s while reading "
+                "configuration or approval bypass state; using base Tool Level",
+                channel_id,
+            )
+            return "base"
+
+        if record["policy"] != "interact" or record["level"] != "full":
+            return "base"
+
+        try:
+            if source is None:
+                source = self.build_source(chat_id=channel_id)
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(source)
+            mode = approval_mode()
+            bypass_active = approval_bypass_active(session_key)
+        except Exception:
+            logger.exception(
+                "[amessenger] Tool Level gate failed for Channel %s while reading "
+                "configuration or approval bypass state; using base Tool Level",
+                channel_id,
+            )
+            return "base"
+
+        if mode == "manual" and bypass_active is False:
+            return "full"
+
+        failed_conditions = []
+        if mode != "manual":
+            failed_conditions.append(f"approvals.mode={mode!r}")
+        if bypass_active is not False:
+            failed_conditions.append("approval bypass is active")
+        logger.warning(
+            "[amessenger] refusing full Tool Level for Channel %s: %s",
+            channel_id,
+            ", ".join(failed_conditions),
+        )
+        return "base"
+
     def toolsets_for_source(self, source) -> list[str]:
         channel_id = "<unknown>"
         base = []
@@ -717,40 +784,9 @@ class AMessengerAdapter(BasePlatformAdapter):
             settings = read_settings()
             base = list(settings["base_toolsets"])
             configured = base
-
-            try:
-                # Preserve the fail-closed adapter seam for unreadable state,
-                # then reload so a TUI Grant is visible to every dispatch.
-                self.state()
-                record = state.channel(
-                    state.load(self.state_path()), channel_id, state.now()
-                )
-            except (state.StateFileCorrupt, OSError):
-                logger.exception(
-                    "[amessenger] state read failed for Channel %s; "
-                    "using base Tool Level",
-                    channel_id,
-                )
-            else:
-                if record["policy"] == "interact" and record["level"] == "full":
-                    from gateway.session import build_session_key
-
-                    session_key = build_session_key(source)
-                    mode = approval_mode()
-                    bypass_active = approval_bypass_active(session_key)
-                    if mode == "manual" and bypass_active is False:
-                        configured = list(settings["full_toolsets"])
-                    else:
-                        failed_conditions = []
-                        if mode != "manual":
-                            failed_conditions.append(f"approvals.mode={mode!r}")
-                        if bypass_active is not False:
-                            failed_conditions.append("approval bypass is active")
-                        logger.warning(
-                            "[amessenger] refusing full Tool Level for Channel %s: %s",
-                            channel_id,
-                            ", ".join(failed_conditions),
-                        )
+            level = self.effective_level(channel_id, source, settings=settings)
+            if level == "full":
+                configured = list(settings["full_toolsets"])
 
             toolsets = self._filter_channel_toolsets(configured, channel_id)
         except Exception:
@@ -1216,7 +1252,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             return guarded
 
         task_done = security.has_task_done(content)
-        no_reply = security.has_no_reply(content)
+        no_reply = security.is_only_no_reply(content)
         text = security.strip_markers(content)
         moment = state.now()
 

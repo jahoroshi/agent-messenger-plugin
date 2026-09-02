@@ -82,15 +82,24 @@ def _channel_line(channel: dict) -> str:
     return f"{channel_id} — {name}, members: {rendered_members}"
 
 
-def _pending_recipients(channel: dict, to: str | None) -> list[str]:
+def _recipient_members(result: dict, to: str | None) -> list[dict]:
+    channel = result.get("channel") or {}
+    message = result.get("message") or {}
+    sender = message.get("sender")
+    if not isinstance(sender, str) or not sender:
+        sender = adapter_module.read_settings().get("agent")
     members = channel.get("members") or []
-    if to is not None:
-        members = [member for member in members if member.get("agent") == to]
-    return [
-        member.get("agent", "unknown")
-        for member in members
-        if member.get("state") == "invited"
-    ]
+    recipients = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        if to is not None and member.get("agent") != to:
+            continue
+        if to is None and member.get("agent") == sender:
+            continue
+        if member.get("state") in {"joined", "member", "invited"}:
+            recipients.append(member)
+    return recipients
 
 
 async def _resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
@@ -151,7 +160,25 @@ def _send_result(
     message_id = security.safe_field(result["message"].get("id"))
     channel_id = security.safe_field(channel.get("id"))
     answer = f"Sent to channel {channel_id}. Message id {message_id}."
-    pending = _pending_recipients(channel, to)
+    recipients = _recipient_members(result, to)
+    delivered = [
+        security.safe_field(member.get("agent"))
+        for member in recipients
+        if member.get("state") in {"joined", "member"}
+    ]
+    pending = [
+        member.get("agent", "unknown")
+        for member in recipients
+        if member.get("state") == "invited"
+    ]
+    outcomes = [
+        f"delivered to {agent}'s inbox" for agent in delivered
+    ] + [
+        f"waiting for {security.safe_field(agent)}'s Owner to join"
+        for agent in pending
+    ]
+    if outcomes:
+        answer += " " + "; ".join(outcomes) + "."
     if pending:
         recipient = ", ".join(security.safe_field(agent) for agent in pending)
         answer += (

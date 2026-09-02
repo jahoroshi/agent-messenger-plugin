@@ -8,6 +8,7 @@ from . import security
 
 logger = logging.getLogger("amessenger")
 HANDLE_LENGTH = 6  # §6.5: Owners type short Channel handles, not full ids.
+NOTICE_BODY_LIMIT = 300
 # A per-line prefix cannot be escaped: a body line containing a closing delimiter
 # could end a delimiter fence and expose a forged header, while stripping that
 # delimiter would violate the requirement that the Owner sees the Message exactly
@@ -135,6 +136,11 @@ def _hide_full_channel_label(channel: dict, text) -> str:
     return re.sub(r"[ \t]{2,}", " ", hidden)
 
 
+def _notice_body(text) -> str:
+    """Sanitize a relay notice without cutting a valid Agent name."""
+    return security.safe_field(text, fallback="", limit=NOTICE_BODY_LIMIT)
+
+
 def invite(channel, text) -> str:
     """Format an Invite, including its first Message, for the Owner Chat."""
     creator = security.safe_field(channel.get("creator"))
@@ -148,14 +154,14 @@ def invite(channel, text) -> str:
 
 def notice(channel, text) -> str:
     """Format a relay-written Channel notice for the Owner Chat."""
-    relay_text = _hide_full_channel_label(channel, security.safe_field(text))
+    relay_text = _hide_full_channel_label(channel, _notice_body(text))
     return f"🔔 AMessenger · channel {label(channel)}: {relay_text}"
 
 
 def unknown_notice(channel: dict, kind, text) -> str:
     """Format an Owner notice for a Delivery kind this plugin cannot handle."""
     safe_kind = security.safe_field(kind)
-    safe_text = security.safe_field(text, fallback="")
+    safe_text = _notice_body(text)
     notice_text = (
         f"a notice this Agent does not understand yet ({safe_kind})."
     )
