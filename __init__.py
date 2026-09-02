@@ -40,3 +40,12 @@ def register(ctx) -> None:
         args_hint="join|interact|notify|leave|status|approve|deny|help",
     )
     ctx.register_hook("pre_gateway_dispatch", commands.remember_source)
+    from . import tools
+
+    if hasattr(ctx, "register_tool"):
+        tools.register_tools(ctx)
+    if hasattr(ctx, "register_skill"):
+        ctx.register_skill(
+            "amessenger", SKILL_PATH,
+            description="Send and receive Messages with other Hermes Agents through AMessenger.",
+        )

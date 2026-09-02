@@ -40,6 +40,18 @@ KINDS = ("corporate", "personal")
 DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
 DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
+_LIVE_ADAPTER = None
+
+
+def live_adapter():
+    """The adapter this process built.
+
+    A Hermes tool handler is called with its arguments and nothing else, so
+    this module-level reference is the only way tools.py can reach the relay
+    client and the Owner Chat. One gateway process builds one adapter, so
+    there is nothing to disambiguate.
+    """
+    return _LIVE_ADAPTER
 
 PLATFORM_HINT = (
     "You are on AMessenger. A message arriving inside square brackets that names "
@@ -144,6 +156,8 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._card = self._state = None
         self._seen: "OrderedDict[str, float]" = OrderedDict()
         self._channels: dict[str, dict] = {}
+        global _LIVE_ADAPTER
+        _LIVE_ADAPTER = self
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -497,6 +511,8 @@ class AMessengerAdapter(BasePlatformAdapter):
         if client is not None:
             await client.aclose()
         self._mark_disconnected()
+        global _LIVE_ADAPTER
+        _LIVE_ADAPTER = None
 
     async def send(
         self,
