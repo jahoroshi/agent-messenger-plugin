@@ -1,9 +1,10 @@
 """Owner-facing AMessenger tools."""
 
+from contextlib import asynccontextmanager
 import logging
 
 from . import mirror, relay, state
-from .adapter import check_requirements, live_adapter
+from .adapter import check_requirements, live_adapter, read_settings
 
 
 logger = logging.getLogger("amessenger")
@@ -23,6 +24,28 @@ def _adapter_or_error():
     if adapter is None:
         return None, NOT_CONNECTED
     return adapter, None
+
+
+@asynccontextmanager
+async def relay_client(adapter):
+    """A client for the loop this tool is running on.
+
+    Hermes dispatches tool handlers on a worker event loop, not the gateway loop,
+    and an httpx.AsyncClient cannot cross that boundary — its pool primitives are
+    bound to the loop that built it. Building one per call is cheap next to the
+    request itself.
+    """
+    settings = read_settings()
+    client = relay.build_client(
+        settings["url"],
+        settings["key"],
+        settings["agent"],
+        transport=adapter._transport,
+    )
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 def _agent_line(card: dict) -> str:
@@ -86,7 +109,8 @@ async def amessenger_agents(args: dict, **_) -> str:
         return error
     query = args.get("query")
     try:
-        cards = await relay.list_agents(adapter.client(), query)
+        async with relay_client(adapter) as client:
+            cards = await relay.list_agents(client, query)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     if not cards:
@@ -103,7 +127,8 @@ async def amessenger_channels(args: dict, **_) -> str:
     if error:
         return error
     try:
-        channels = await relay.list_channels(adapter.client())
+        async with relay_client(adapter) as client:
+            channels = await relay.list_channels(client)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     if not channels:
@@ -121,21 +146,17 @@ async def amessenger_send(args: dict, **_) -> str:
         return "Error: provide exactly one of 'to' and 'channel_id'."
     text = args.get("text", "")
     try:
-        result = await relay.send_message(
-            adapter.client(), to=to, channel_id=channel_id, text=text
-        )
+        async with relay_client(adapter) as client:
+            result = await relay.send_message(
+                client, to=to, channel_id=channel_id, text=text
+            )
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
 
     adapter.remember_channel(result["channel"])
     # The reply cap does not apply: it counts autonomous replies inside a
     # Channel session, not a Message the Owner asked the Agent to send.
-    posted = await mirror.mirror(
-        adapter.owner_adapter,
-        adapter._owner_platform,
-        adapter._owner_chat_id,
-        mirror.outgoing(result["channel"], text),
-    )
+    posted = await adapter.post_owner_line(mirror.outgoing(result["channel"], text))
     if not posted:
         logger.warning(
             "[amessenger] outgoing Mirror failed for tool send; Message was accepted"
@@ -156,7 +177,8 @@ async def amessenger_status(args: dict, **_) -> str:
         return error
     message_id = args.get("message_id")
     try:
-        status_result = await relay.message_status(adapter.client(), message_id)
+        async with relay_client(adapter) as client:
+            status_result = await relay.message_status(client, message_id)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         if isinstance(error, relay.RelayRejected) and error.status == 404:
             return "That Message is gone: every recipient acked it, or it expired."
@@ -180,7 +202,8 @@ async def amessenger_create_channel(args: dict, **_) -> str:
     name = args.get("name")
     invite = args.get("invite") or []
     try:
-        channel = await relay.create_channel(adapter.client(), name, invite)
+        async with relay_client(adapter) as client:
+            channel = await relay.create_channel(client, name, invite)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     adapter.remember_channel(channel)
@@ -210,7 +233,8 @@ async def amessenger_invite(args: dict, **_) -> str:
     channel_id = args.get("channel_id")
     agent = args.get("agent")
     try:
-        channel = await relay.invite(adapter.client(), channel_id, agent)
+        async with relay_client(adapter) as client:
+            channel = await relay.invite(client, channel_id, agent)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     adapter.remember_channel(channel)
@@ -223,7 +247,8 @@ async def amessenger_leave(args: dict, **_) -> str:
         return error
     channel_id = args.get("channel_id")
     try:
-        await relay.leave(adapter.client(), channel_id)
+        async with relay_client(adapter) as client:
+            await relay.leave(client, channel_id)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     adapter.set_state(state.revoke(adapter.state(), channel_id))
@@ -237,7 +262,8 @@ async def amessenger_remove_member(args: dict, **_) -> str:
     channel_id = args.get("channel_id")
     agent = args.get("agent")
     try:
-        await relay.remove_member(adapter.client(), channel_id, agent)
+        async with relay_client(adapter) as client:
+            await relay.remove_member(client, channel_id, agent)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     return f"Removed {agent} from channel {channel_id}."

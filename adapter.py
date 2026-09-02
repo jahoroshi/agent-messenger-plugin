@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import OrderedDict
+import concurrent.futures
 import logging
 import os
 from pathlib import Path
@@ -40,6 +41,7 @@ KINDS = ("corporate", "personal")
 DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
 DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
 PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
+OWNER_POST_TIMEOUT_SECONDS = 15
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 _LIVE_ADAPTER = None
 
@@ -150,6 +152,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._settings = None
         self._owner_platform = ""
         self._owner_chat_id = ""
+        self._loop = None
         self._client = None
         self._transport = None
         self._poll_task = None
@@ -242,11 +245,48 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
         return self._client
 
+    def on_gateway_loop(self) -> bool:
+        """Return whether the caller is running on the gateway event loop."""
+        if self._loop is None:
+            return False
+        try:
+            return asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            return False
+
+    async def post_owner_line(self, text: str) -> bool:
+        """Post an Owner-facing line from wherever the caller is running."""
+        if self.on_gateway_loop():
+            return await self.mirror_or_queue(text)
+        if self._loop is None:
+            logger.warning(
+                "[amessenger] cannot post Owner-facing line: gateway loop is unavailable"
+            )
+            return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.mirror_or_queue(text), self._loop
+            )
+            # mirror_or_queue queues the text when posting fails, so nothing the
+            # Owner should see is lost if this hand-off times out or fails.
+            return await asyncio.get_running_loop().run_in_executor(
+                None, future.result, OWNER_POST_TIMEOUT_SECONDS
+            )
+        except (concurrent.futures.TimeoutError, RuntimeError) as error:
+            logger.warning(
+                "[amessenger] Owner-facing line hand-off failed; line was queued "
+                "for retry: %s",
+                error,
+            )
+            return False
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         problem = self.configuration_problem()
         if problem:
             logger.error("[amessenger] not connecting: %s", problem)
             return False
+        self._loop = asyncio.get_running_loop()
         self._running = True
         self._poll_task = asyncio.create_task(self.run_poll_loop())
         self._housekeeping_task = asyncio.create_task(self.run_housekeeping_loop())
@@ -509,6 +549,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._client = None
         if client is not None:
             await client.aclose()
+        self._loop = None
         self._mark_disconnected()
         global _LIVE_ADAPTER
         _LIVE_ADAPTER = None
