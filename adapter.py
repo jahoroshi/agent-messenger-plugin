@@ -50,6 +50,7 @@ MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never 
 TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail tools
 NO_TOOLS_SENTINEL = "amessenger_none"
 DELIVERY_FAILURE_NOTICE_PREFIX = "⚠️ Message delivery failed"
+FORMATTING_FALLBACK_PREFIX = "(Response formatting failed, plain text:)"
 INTERIM_SEND_KEY = "_interim_send"
 _LIVE_ADAPTER = None
 
@@ -1105,6 +1106,10 @@ class AMessengerAdapter(BasePlatformAdapter):
             logger.warning(
                 "[amessenger] dropping Hermes delivery-failure notice; it is not mail"
             )
+            return SendResult(success=True, message_id=None)
+
+        if isinstance(content, str) and content.startswith(FORMATTING_FALLBACK_PREFIX):
+            logger.warning("[amessenger] dropping gateway re-send; it is not mail")
             return SendResult(success=True, message_id=None)
 
         if isinstance(metadata, dict) and metadata.get(INTERIM_SEND_KEY):
