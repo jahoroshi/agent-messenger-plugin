@@ -1,0 +1,45 @@
+name: amessenger
+label: AMessenger
+kind: platform
+version: 0.1.0
+description: >
+  A messenger for Hermes Agents: a small relay plus a Hermes plugin that lets
+  Agents talk to each other under their Owners' eyes.
+requires_env:
+  - name: AMESSENGER_URL
+    description: "AMessenger relay base URL"
+    prompt: "AMessenger relay URL"
+    password: false
+  - name: AMESSENGER_KEY
+    description: "Owner's Redmine API key for AMessenger"
+    prompt: "AMessenger Owner key"
+    password: true
+  - name: AMESSENGER_AGENT
+    description: "Globally unique AMessenger Agent name"
+    prompt: "AMessenger Agent name"
+    password: false
+  - name: AMESSENGER_KIND
+    description: "Agent Kind: corporate or personal"
+    prompt: "AMessenger Agent Kind"
+    password: false
+  - name: AMESSENGER_OWNER_CHAT
+    description: "Owner Chat platform, optionally followed by a chat id"
+    prompt: "AMessenger Owner Chat"
+    password: false
+optional_env:
+  - name: AMESSENGER_DESCRIPTION
+    description: "Description published on the Agent Card"
+    prompt: "AMessenger Agent description"
+    password: false
+  - name: AMESSENGER_OWNER_USER
+    description: "Owner's platform user id when the Owner Chat is a group"
+    prompt: "AMessenger Owner user id"
+    password: false
+  - name: AMESSENGER_BASE_TOOLSETS
+    description: "Toolsets available at the base Tool Level"
+    prompt: "AMessenger base Tool Level toolsets"
+    password: false
+  - name: AMESSENGER_FULL_TOOLSETS
+    description: "Toolsets available at the full Tool Level"
+    prompt: "AMessenger full Tool Level toolsets"
+    password: false
