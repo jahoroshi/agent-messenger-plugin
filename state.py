@@ -9,6 +9,7 @@ DEFAULT_SINGLE_GRANT_HOURS = 5.0  # A Grant with no duration (§6.6).
 SINGLE_GRANT_IDLE_HOURS = 1.0  # A single Grant's idle limit (§6.6).
 REPLY_CAP = 20  # Autonomous replies allowed per Channel (§6.4).
 REPLY_WINDOW_SECONDS = 600  # Rolling reply-cap window (§6.4).
+PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # Fixed-width UTC timestamps.
 
 
@@ -34,8 +35,14 @@ def parse_ts(value: str | None) -> datetime | None:
     except (TypeError, ValueError):
         return None
 
+
 def empty_state() -> dict:
-    return {"welcomed": False, "channels": {}, "pending_approvals": {}}
+    return {
+        "welcomed": False,
+        "channels": {},
+        "pending_approvals": {},
+        "pending_mirrors": [],
+    }
 
 
 def _copy_record(record: dict) -> dict:
@@ -50,9 +57,20 @@ def _copy_pending(pending: dict) -> dict:
     return {key: {**entry} for key, entry in pending.items()}
 
 
-def _copy_state(state: dict, channels=None, pending=None) -> dict:
-    return {**state, "channels": _copy_channels(state["channels"] if channels is None else channels),
-            "pending_approvals": _copy_pending(state["pending_approvals"] if pending is None else pending)}
+def _copy_state(state: dict, channels=None, pending=None, pending_mirrors=None) -> dict:
+    mirrors = (
+        state.get("pending_mirrors", [])
+        if pending_mirrors is None
+        else pending_mirrors
+    )
+    return {
+        **state,
+        "channels": _copy_channels(state["channels"] if channels is None else channels),
+        "pending_approvals": _copy_pending(
+            state["pending_approvals"] if pending is None else pending
+        ),
+        "pending_mirrors": [*mirrors],
+    }
 
 
 def _default_channel() -> dict:
@@ -152,6 +170,22 @@ def add_pending_approval(state: dict, session_key, chat_id, moment) -> dict:
     return _copy_state(state, pending=pending)
 
 
+def queue_mirror(state: dict, text: str) -> dict:
+    """Append an Owner-facing line, retaining only the newest queued lines."""
+    pending = [*state.get("pending_mirrors", []), text]
+    if len(pending) > PENDING_MIRRORS_MAX:
+        pending = pending[-PENDING_MIRRORS_MAX:]
+    return _copy_state(state, pending_mirrors=pending)
+
+
+def pop_mirror(state: dict) -> tuple[dict, str | None]:
+    """Remove and return the oldest queued Owner-facing line, if any."""
+    pending = state.get("pending_mirrors", [])
+    if not pending:
+        return _copy_state(state), None
+    return _copy_state(state, pending_mirrors=pending[1:]), pending[0]
+
+
 def pop_pending_approval(state: dict, session_key=None) -> tuple[dict, dict | None]:
     pending = state["pending_approvals"]
     if not pending:
@@ -193,15 +227,20 @@ def load(path) -> dict:
         return empty_state()
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise StateFileCorrupt(f"invalid state file: {target}") from error
+    pending_mirrors = (
+        document.get("pending_mirrors", []) if isinstance(document, dict) else None
+    )
     valid = (
         isinstance(document, dict)
         and isinstance(document.get("welcomed"), bool)
         and isinstance(document.get("channels"), dict)
         and isinstance(document.get("pending_approvals"), dict)
+        and isinstance(pending_mirrors, list)
+        and all(isinstance(value, str) for value in pending_mirrors)
     )
     if not valid:
         raise StateFileCorrupt(f"invalid state file: {target}")
-    return document
+    return {**document, "pending_mirrors": [*pending_mirrors]}
 
 
 def save(path, state) -> None:

@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import threading
 import time
 
 import httpx
@@ -42,7 +43,7 @@ AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
 DEDUPE_MAX = 200  # ARCHITECTURE §4: processed Delivery ids retained.
 DEDUPE_SECONDS = 3600  # ARCHITECTURE §4: processed Delivery retention.
-PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
+PENDING_MIRRORS_MAX = state.PENDING_MIRRORS_MAX
 OWNER_POST_TIMEOUT_SECONDS = 15
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail tools
@@ -222,6 +223,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._poll_task = None
         self._housekeeping_task = None
         self._card = self._state = None
+        self._state_lock = threading.Lock()
         self._seen: "OrderedDict[str, float]" = OrderedDict()
         self._channels: dict[str, dict] = {}
         self._pending_mirrors: list[str] = []
@@ -260,14 +262,23 @@ class AMessengerAdapter(BasePlatformAdapter):
         if runner is None:
             return "the gateway runner is unavailable"
 
+        if self._owner_chat_platform_is_disabled(runner, platform, owner_platform):
+            return f"the Owner Chat platform '{owner_platform}' is disabled in config.yaml"
+
         if not owner_chat_id:
-            runner_config = getattr(runner, "config", None)
             home_channel = None
-            if runner_config is not None:
+            try:
+                runner_config = getattr(runner, "config", None)
                 get_home_channel = getattr(runner_config, "get_home_channel", None)
                 if callable(get_home_channel):
                     home_channel = get_home_channel(platform)
-            owner_chat_id = getattr(home_channel, "chat_id", None)
+                owner_chat_id = getattr(home_channel, "chat_id", None)
+            except Exception as error:
+                logger.warning(
+                    "[amessenger] could not inspect the Owner Chat home channel: %s",
+                    error,
+                )
+                owner_chat_id = None
             if not owner_chat_id:
                 return (
                     "set AMESSENGER_OWNER_CHAT=<platform>:<chat id> or configure "
@@ -278,6 +289,36 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._owner_platform = owner_platform
         self._owner_chat_id = str(owner_chat_id)
         return None
+
+    @staticmethod
+    def _owner_chat_platform_is_disabled(runner, platform, platform_name) -> bool:
+        """Return whether config explicitly disables the Owner Chat platform."""
+        try:
+            runner_config = getattr(runner, "config", None)
+            platforms = getattr(runner_config, "platforms", None)
+            if platforms is None:
+                return False
+            getter = getattr(platforms, "get", None)
+            if not callable(getter):
+                return False
+            platform_config = getter(platform)
+            if platform_config is None:
+                platform_config = getter(platform_name)
+            if platform_config is None:
+                return False
+            if isinstance(platform_config, dict):
+                return (
+                    "enabled" in platform_config
+                    and platform_config.get("enabled") is False
+                )
+            return getattr(platform_config, "enabled", None) is False
+        except Exception as error:
+            logger.warning(
+                "[amessenger] could not inspect Owner Chat platform config; "
+                "continuing: %s",
+                error,
+            )
+            return False
 
     @property
     def owner_adapter(self):
@@ -329,13 +370,34 @@ class AMessengerAdapter(BasePlatformAdapter):
         return hermes_home() / STATE_DIRNAME / STATE_FILENAME
 
     def state(self) -> dict:
-        if self._state is None:
-            self._state = state.load(self.state_path())
-        return self._state
+        with self._state_lock:
+            if self._state is None:
+                self._state = state.load(self.state_path())
+                self._pending_mirrors = [
+                    *self._state.get("pending_mirrors", [])
+                ]
+            return self._state
 
     def set_state(self, new_state: dict) -> None:
-        state.save(self.state_path(), new_state)
-        self._state = new_state
+        with self._state_lock:
+            state.save(self.state_path(), new_state)
+            self._state = new_state
+            self._pending_mirrors = [*new_state.get("pending_mirrors", [])]
+
+    def update_state(self, change):
+        """Apply ``change(state) -> state`` under a lock, then write the file.
+
+        Hermes runs tool handlers on other threads, so a read here and a write there can
+        lose an expiry or revive a Grant. Every mutation goes through this.
+        """
+        with self._state_lock:
+            if self._state is None:
+                self._state = state.load(self.state_path())
+            updated = change(self._state)
+            state.save(self.state_path(), updated)
+            self._state = updated
+            self._pending_mirrors = [*updated.get("pending_mirrors", [])]
+            return updated
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -478,7 +540,9 @@ class AMessengerAdapter(BasePlatformAdapter):
             text = mirror.notice(channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
             if processed and kind in {"closed", "removed"}:
-                self.set_state(state.revoke(self.state(), channel["id"]))
+                self.update_state(
+                    lambda document: state.revoke(document, channel["id"])
+                )
         elif kind == "text":
             processed = await self._handle_text_delivery(
                 delivery, channel, sender_card, message["text"]
@@ -533,7 +597,9 @@ class AMessengerAdapter(BasePlatformAdapter):
         text = mirror.incoming(sender_card, channel, message_text, policy)
         if not await self._mirror_delivery(delivery, text):
             return False
-        self.set_state(state.note_incoming(self.state(), channel["id"], state.now()))
+        self.update_state(
+            lambda document: state.note_incoming(document, channel["id"], state.now())
+        )
         if policy == "interact":
             await self.dispatch(delivery)
         return True
@@ -644,8 +710,12 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def run_poll_loop(self) -> None:
         index = 0
+        flush_at_start = True
         while self._running:
             try:
+                if flush_at_start:
+                    await self.flush_pending_mirrors()
+                    flush_at_start = False
                 if self._card is None:
                     self._card = await self.publish_card()
                     await self.after_publish()
@@ -696,7 +766,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         if not await mirror.post(owner, self._owner_chat_id, text):
             logger.warning("[amessenger] welcome not delivered to Owner Chat %s", self._owner_chat_id)
             return
-        self.set_state(state.set_welcomed(self.state(), True))
+        self.update_state(lambda document: state.set_welcomed(document, True))
         logger.info("[amessenger] welcome delivered to Owner Chat %s", self._owner_chat_id)
 
     async def run_housekeeping_loop(self) -> None:
@@ -713,7 +783,8 @@ class AMessengerAdapter(BasePlatformAdapter):
         """Expire single Grants and tell the Owner about each one (§6.6)."""
         await self.flush_pending_mirrors()
         moment = state.now()
-        updated, ended = state.expire_grants(self.state(), moment)
+        ended = []
+        expired_approvals = []
         timeout_seconds = 300
         try:
             from tools.approval import _get_approval_config
@@ -731,11 +802,16 @@ class AMessengerAdapter(BasePlatformAdapter):
             OverflowError,
         ):
             timeout_seconds = 300
-        updated, expired_approvals = state.expire_pending_approvals(
-            updated, moment, timeout_seconds
-        )
-        if ended or expired_approvals:
-            self.set_state(updated)
+
+        def expire(document):
+            nonlocal ended, expired_approvals
+            updated, ended = state.expire_grants(document, moment)
+            updated, expired_approvals = state.expire_pending_approvals(
+                updated, moment, timeout_seconds
+            )
+            return updated
+
+        self.update_state(expire)
         if expired_approvals:
             logger.info(
                 "[amessenger] expired %d pending approval(s); Hermes already denied them",
@@ -756,9 +832,18 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def end_single_grant(self, chat_id: str) -> None:
         """End a single Grant that the Agent reported finished (§6.6)."""
-        if state.channel(self.state(), chat_id)["grant"] != "single":
+        revoked = False
+
+        def revoke_single(document):
+            nonlocal revoked
+            if state.channel(document, chat_id)["grant"] != "single":
+                return document
+            revoked = True
+            return state.revoke(document, chat_id)
+
+        self.update_state(revoke_single)
+        if not revoked:
             return
-        self.set_state(state.revoke(self.state(), chat_id))
         posted = await self.mirror_or_queue(
             mirror.grant_ended(self.known_channel(chat_id)),
         )
@@ -829,19 +914,26 @@ class AMessengerAdapter(BasePlatformAdapter):
                     error,
                 )
             else:
-                # Preserve the mail session key so the Owner's button resolves
-                # this Channel session, not the Owner Chat session.
-                return result
+                if result and getattr(result, "success", False):
+                    # Preserve the mail session key so the Owner's button resolves
+                    # this Channel session, not the Owner Chat session.
+                    return result
+                logger.warning(
+                    "[amessenger] Owner Chat approval forwarding failed: %s; "
+                    "using a text card",
+                    getattr(result, "error", result),
+                )
 
         card = mirror.approval_request(
             self.known_channel(chat_id), command, description, mirror.handle(chat_id)
         )
         # Approval cards stay direct: a stale card must never resurface after timeout.
         if await mirror.post(owner, self._owner_chat_id, card):
-            updated = state.add_pending_approval(
-                self.state(), session_key, chat_id, state.now()
+            self.update_state(
+                lambda document: state.add_pending_approval(
+                    document, session_key, chat_id, state.now()
+                )
             )
-            self.set_state(updated)
             return SendResult(success=True)
 
         error = "approval request was not delivered to the Owner Chat"
@@ -850,15 +942,17 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     def _keep_cap_record(self, channel_id: str) -> None:
         """Switch a capped Channel to notify without discarding its window."""
-        document = self.state()
-        record = document["channels"].get(channel_id)
-        if record is None:
-            return
-        channels = {
-            **document["channels"],
-            channel_id: {**record, "policy": "notify"},
-        }
-        self.set_state({**document, "channels": channels})
+        def keep_record(document):
+            record = document["channels"].get(channel_id)
+            if record is None:
+                return document
+            channels = {
+                **document["channels"],
+                channel_id: {**record, "policy": "notify"},
+            }
+            return {**document, "channels": channels}
+
+        self.update_state(keep_record)
 
     async def deliver_to_channel(
         self,
@@ -952,7 +1046,9 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
 
         if count_reply:
-            self.set_state(state.note_reply(self.state(), channel_id, moment))
+            self.update_state(
+                lambda document: state.note_reply(document, channel_id, moment)
+            )
 
         return SendResult(
             success=True,
@@ -1005,11 +1101,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         return result
 
     async def mirror_or_queue(self, text: str) -> bool:
-        """Post an Owner-facing line, and remember it for a retry when the post fails.
-
-        The queue is in memory and is lost on a gateway restart. A restart
-        re-publishes the Card and the Owner sees the Agent come back.
-        """
+        """Post an Owner-facing line, and persist it for a retry when posting fails."""
         owner = await self.wait_for_owner_adapter()
         if owner is None:
             posted = False
@@ -1023,10 +1115,16 @@ class AMessengerAdapter(BasePlatformAdapter):
         if posted:
             return True
 
-        self._pending_mirrors.append(text)
+        dropped = False
+
+        def queue(document):
+            nonlocal dropped
+            dropped = len(document.get("pending_mirrors", [])) >= PENDING_MIRRORS_MAX
+            return state.queue_mirror(document, text)
+
+        self.update_state(queue)
         logger.warning("[amessenger] Owner-facing line queued for retry")
-        if len(self._pending_mirrors) > PENDING_MIRRORS_MAX:
-            self._pending_mirrors.pop(0)
+        if dropped:
             logger.warning(
                 "[amessenger] dropped 1 oldest queued Owner-facing line; "
                 "1 line lost"
@@ -1035,13 +1133,30 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     async def flush_pending_mirrors(self) -> None:
         """Retry the Owner-facing lines the Owner Chat refused earlier."""
+        pending = self.state().get("pending_mirrors", [])
+        if self._pending_mirrors != pending:
+            if (
+                len(self._pending_mirrors) >= len(pending)
+                and self._pending_mirrors[: len(pending)] == pending
+            ):
+                for text in self._pending_mirrors[len(pending) :]:
+                    self.update_state(
+                        lambda document, text=text: state.queue_mirror(document, text)
+                    )
+            else:
+                self._pending_mirrors = [*pending]
+
+        pending = self.state().get("pending_mirrors", [])
+        if not pending:
+            return
+
         owner = await self.wait_for_owner_adapter()
         if owner is None:
             return
 
         delivered = 0
-        while self._pending_mirrors:
-            text = self._pending_mirrors[0]
+        while self.state().get("pending_mirrors", []):
+            text = self.state()["pending_mirrors"][0]
             if not await mirror.mirror(
                 owner,
                 self._owner_platform,
@@ -1049,7 +1164,15 @@ class AMessengerAdapter(BasePlatformAdapter):
                 text,
             ):
                 break
-            self._pending_mirrors.pop(0)
+
+            def remove_delivered(document):
+                pending_lines = document.get("pending_mirrors", [])
+                if pending_lines and pending_lines[0] == text:
+                    updated, _popped = state.pop_mirror(document)
+                    return updated
+                return document
+
+            self.update_state(remove_delivered)
             delivered += 1
 
         if delivered:

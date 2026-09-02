@@ -171,10 +171,9 @@ async def amessenger_send(args: dict, **_) -> str:
 
 
 def _status_line(delivery: dict) -> str:
-    return (
-        f"Pending: {delivery.get('agent', 'unknown')} — "
-        f"attempts {delivery.get('attempts', 0)}"
-    )
+    agent = delivery.get("agent", "unknown")
+    attempts = delivery.get("attempts", 0)
+    return f"{agent} ({attempts} attempts)"
 
 
 async def amessenger_status(args: dict, **_) -> str:
@@ -191,14 +190,17 @@ async def amessenger_status(args: dict, **_) -> str:
         return relay_error(error)
 
     deliveries = status_result.get("deliveries") or []
-    delivered = sum(delivery.get("state") == "acked" for delivery in deliveries)
-    lines = [f"{delivered} of {len(deliveries)} delivered"]
-    lines.extend(
-        _status_line(delivery)
-        for delivery in deliveries
-        if delivery.get("state") != "acked"
+    if not deliveries:
+        return (
+            "The Message has been delivered to everyone; no recipients are still "
+            "waiting."
+        )
+    waiting = ", ".join(_status_line(delivery) for delivery in deliveries)
+    return (
+        f"Still waiting: {waiting}. Delivered recipients no longer appear here; "
+        "when every recipient has acked, the Message is deleted and this reports "
+        "that it is gone."
     )
-    return "\n".join(lines)
 
 
 async def amessenger_create_channel(args: dict, **_) -> str:
@@ -257,7 +259,7 @@ async def amessenger_leave(args: dict, **_) -> str:
             await relay.leave(client, channel_id)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
-    adapter.set_state(state.revoke(adapter.state(), channel_id))
+    adapter.update_state(lambda document: state.revoke(document, channel_id))
     return f"Left channel {channel_id}."
 
 
@@ -322,7 +324,12 @@ _SCHEMAS = {
         },
         "amessenger_status": {
             "name": "amessenger_status",
-            "description": "Check delivery status for a Message while the relay still has it.",
+            "description": (
+                "Check which recipients are still waiting for a Message while the "
+                "relay still has it. Delivered recipients disappear from the result; "
+                "when no rows remain, the Message was delivered to everyone, and a "
+                "404 means it is gone."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"message_id": {"type": "string", "description": "Message id."}},

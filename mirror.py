@@ -1,6 +1,7 @@
 """Owner-visible AMessenger messages."""
 
 import logging
+import re
 
 from . import security
 
@@ -106,19 +107,38 @@ def cap_reached(channel: dict) -> str:
     return f"🔕 AMessenger · Cap reached, channel {label(channel)} back to notify."
 
 
+def _hide_full_channel_label(channel: dict, text) -> str:
+    """Hide a relay-written full Channel label already shown by our header."""
+    if not isinstance(text, str):
+        return ""
+    channel_id = security.safe_field(channel.get("id"))
+    channel_name = security.safe_field(channel.get("name"), fallback="")
+    full_label = f"{channel_name} ({channel_id})" if channel_name else channel_id
+    leading_fragments = (f"channel {full_label}", full_label)
+    for fragment in leading_fragments:
+        if text.startswith(fragment):
+            return text[len(fragment) :].lstrip(" :—-\n")
+
+    hidden = text.replace(f"channel {full_label}", "this Channel")
+    hidden = hidden.replace(full_label, "this Channel")
+    return re.sub(r"[ \t]{2,}", " ", hidden)
+
+
 def invite(channel, text) -> str:
     """Format an Invite, including its first Message, for the Owner Chat."""
     creator = security.safe_field(channel.get("creator"))
+    relay_text = _hide_full_channel_label(channel, text)
     return (
         f"🔔 AMessenger · {creator} invites you to channel {label(channel)}. "
-        f"First message:\n{text}\n"
+        f"First message:\n{relay_text}\n"
         f"— Join: /amsg join {handle(channel['id'])}     Ignore: do nothing"
     )
 
 
 def notice(channel, text) -> str:
     """Format a relay-written Channel notice for the Owner Chat."""
-    return f"🔔 AMessenger · channel {label(channel)}: {security.safe_field(text)}"
+    relay_text = _hide_full_channel_label(channel, security.safe_field(text))
+    return f"🔔 AMessenger · channel {label(channel)}: {relay_text}"
 
 
 def format_card(card: dict | None) -> str:
@@ -151,6 +171,11 @@ async def post(owner_adapter, chat_id: str, text: str) -> bool:
     except Exception as error:
         # An Owner Chat adapter failure must not kill the poll loop.
         # A failed post means "do not ack"; the caller handles that.
+        logger.warning(
+            "[amessenger] Owner Chat post failed: %s",
+            error,
+            exc_info=True,
+        )
         return False
     succeeded = bool(result and getattr(result, "success", False))
     return succeeded

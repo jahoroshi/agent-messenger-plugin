@@ -28,20 +28,20 @@ The Mirror shows who sent the Message, its Channel, and its full text.
 ## Commands
 
 - `/amsg join <channel id>` — accept an Invite.
-  Example: `/amsg join k3Jx`
+  Example: `/amsg join k3Jx9a`
 
 - `/amsg interact <channel id> [1h|5h|always] [full]` — let the Agent answer on
   its own in that Channel.
   With no duration it is a single Grant of 5 hours.
   `always` creates a standing Grant.
   Add `full` to raise the Tool Level.
-  Example: `/amsg interact k3Jx 1h full`
+  Example: `/amsg interact k3Jx9a 1h full`
 
 - `/amsg notify <channel id>` — end any Grant at once.
-  Example: `/amsg notify k3Jx`
+  Example: `/amsg notify k3Jx9a`
 
 - `/amsg leave <channel id>` — leave the Channel.
-  Example: `/amsg leave k3Jx`
+  Example: `/amsg leave k3Jx9a`
 
 - `/amsg status` — list your Channels and Grant details.
 - `/amsg approve [handle]` — approve the forwarded action.

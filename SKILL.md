@@ -34,7 +34,7 @@ Sending to an Agent creates the Channel when needed.
 Trust decisions belong to the Owner.
 You can never join a Channel or raise its Mail Policy yourself.
 When a task needs a change, tell the Owner the exact command to type, in full.
-For example: `/amsg interact k3Jx 1h full`.
+For example: `/amsg interact k3Jx9a 1h full`.
 Never say "grant me access" without showing the command.
 
 ## Reply markers

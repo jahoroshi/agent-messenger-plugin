@@ -210,15 +210,16 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
             )
             level = "base"
     moment = state.now()
-    updated = state.grant(
-        adapter.state(),
-        channel["id"],
-        kind=kind,
-        level=level,
-        duration_seconds=duration_seconds,
-        moment=moment,
+    updated = adapter.update_state(
+        lambda document: state.grant(
+            document,
+            channel["id"],
+            kind=kind,
+            level=level,
+            duration_seconds=duration_seconds,
+            moment=moment,
+        )
     )
-    adapter.set_state(updated)
     record = state.channel(updated, channel["id"])
     grant_period = (
         "standing" if record["expires_at"] is None else f"until {record['expires_at']}"
@@ -245,7 +246,7 @@ async def _notify(adapter, tokens: list[str], help_text: str) -> str:
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
-    adapter.set_state(state.revoke(adapter.state(), channel["id"]))
+    adapter.update_state(lambda document: state.revoke(document, channel["id"]))
     return (
         f"{mirror.label(channel)} is back to notify. I will show you its Messages "
         "and do nothing else."
@@ -263,7 +264,7 @@ async def _leave(adapter, tokens: list[str], help_text: str) -> str:
         await relay.leave(adapter.client(), channel["id"])
     except (relay.RelayRejected, relay.RelayUnavailable) as caught:
         return _relay_failure("leave the Channel", caught)
-    adapter.set_state(state.revoke(adapter.state(), channel["id"]))
+    adapter.update_state(lambda document: state.revoke(document, channel["id"]))
     return f"Left {mirror.label(channel)}."
 
 
@@ -361,13 +362,19 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
     except ImportError:
         return "Approvals are unavailable in this Hermes build."
 
-    updated, popped = state.pop_pending_approval(
-        adapter.state(), session_key=session_key
-    )
+    popped = None
+
+    def pop_approval(document):
+        nonlocal popped
+        updated, popped = state.pop_pending_approval(
+            document, session_key=session_key
+        )
+        return updated
+
+    adapter.update_state(pop_approval)
     if popped is None:
         return "Nothing is waiting for your approval."
     resolved = resolve_gateway_approval(popped["session_key"], choice)
-    adapter.set_state(updated)
     label = _pending_label(adapter, popped["chat_id"])
     return f"Resolved {resolved} approval(s) for Channel {label}."
 
