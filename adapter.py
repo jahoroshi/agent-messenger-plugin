@@ -3,11 +3,13 @@
 import asyncio
 import logging
 import os
+from pathlib import Path
 import re
 import time
 
 import httpx
 
+from . import state
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
@@ -21,6 +23,8 @@ MIN_POLL_CYCLE_SECONDS = 1.0            # a poll that returns nothing instantly 
 HOUSEKEEPING_SECONDS = 60               # §6.2: expire Grants every minute
 HTTP_TIMEOUT_SECONDS = 10               # every relay call except the long poll
 MAX_MESSAGE_LENGTH = 65536              # SYSTEM_DESIGN §5: text ≤ 64 KB
+STATE_DIRNAME = "amessenger"           # $HERMES_HOME/amessenger/state.json, §6.6
+STATE_FILENAME = "state.json"
 REQUIRED_ENV = ("AMESSENGER_URL", "AMESSENGER_KEY", "AMESSENGER_AGENT",
                 "AMESSENGER_KIND", "AMESSENGER_OWNER_CHAT")
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
@@ -34,10 +38,25 @@ PLATFORM_HINT = (
     "the exact /amsg command to type."
 )
 
-
+def hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        home = os.environ.get("HERMES_HOME", "").strip()
+        if not home:
+            raise RuntimeError("cannot resolve Hermes home via hermes_constants.get_hermes_home or HERMES_HOME")
+        return Path(home)
+def format_card(card: dict | None) -> str:
+    if card is None: return "Your Card is published."
+    owner = card.get("owner") or {}
+    lines = ["Your Card is published:",
+             f"  Agent: {card.get('name') or 'unknown'} ({card.get('kind') or 'unknown'})",
+             f"  Owner: {owner.get('name') or owner.get('login') or 'unknown'} <{owner.get('email') or 'unknown'}>"]
+    if card.get("description"): lines.append(f"  About: {card['description']}")
+    return "\n".join(lines)
 class CardConflict(Exception):
     """The relay rejected this Agent's Card because its identity conflicts."""
-
 
 class RelayUnavailable(Exception):
     """The relay could not complete a request."""
@@ -47,11 +66,9 @@ async def sleep(seconds: float) -> None:
     """Sleep behind a module seam so tests never wait real seconds."""
     await asyncio.sleep(seconds)
 
-
 def monotonic() -> float:
     """Read monotonic time behind a module seam for poll-cycle timing tests."""
     return time.monotonic()
-
 
 def _toolsets(name: str, default: str) -> list[str]:
     raw = os.getenv(name) or default
@@ -145,7 +162,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._transport = None
         self._poll_task = None
         self._housekeeping_task = None
-        self._card = None
+        self._card = self._state = None
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -204,6 +221,13 @@ class AMessengerAdapter(BasePlatformAdapter):
     @property
     def owner_adapter(self):
         return self.gateway_runner.adapters[Platform(self._owner_platform)]
+    def state_path(self) -> Path: return hermes_home() / STATE_DIRNAME / STATE_FILENAME
+    def state(self) -> dict:
+        if self._state is None: self._state = state.load(self.state_path())
+        return self._state
+    def set_state(self, new_state: dict) -> None:
+        state.save(self.state_path(), new_state)
+        self._state = new_state
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -319,8 +343,15 @@ class AMessengerAdapter(BasePlatformAdapter):
                 await sleep(wait)
 
     async def after_publish(self) -> None:
-        # Task T4.2 posts the welcome here, once.
-        return None
+        if self.state()["welcomed"]:
+            return
+        text = self._help_text + "\n\n" + format_card(self._card)
+        result = await self.owner_adapter.send(self._owner_chat_id, text)
+        if not result or not getattr(result, "success", False):
+            logger.warning("[amessenger] welcome not delivered to Owner Chat %s", self._owner_chat_id)
+            return
+        self.set_state(state.set_welcomed(self.state(), True))
+        logger.info("[amessenger] welcome delivered to Owner Chat %s", self._owner_chat_id)
 
     async def run_housekeeping_loop(self) -> None:
         while self._running:
