@@ -660,12 +660,20 @@ class AMessengerAdapter(BasePlatformAdapter):
         if kind == "invite":
             text = mirror.invite(channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
+            if processed:
+                self.update_state(
+                    lambda document: state.remember_pending_invite(
+                        document, channel
+                    )
+                )
         elif kind in {"joined", "left", "closed", "removed"}:
             text = mirror.notice(channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
             if processed and kind in {"closed", "removed"}:
                 self.update_state(
-                    lambda document: state.revoke(document, channel["id"])
+                    lambda document: state.drop_pending_invite(
+                        state.revoke(document, channel["id"]), channel["id"]
+                    )
                 )
         elif kind == "text":
             processed = await self._handle_text_delivery(

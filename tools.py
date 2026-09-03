@@ -132,7 +132,16 @@ async def _resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
             )
             return relay.resolve_channel([{"id": token}], token)
         return None, relay_error(error)
-    return relay.resolve_channel(channels, token)
+    pending_invites = _read_shared_state(adapter).get("pending_invites", {})
+    combined = []
+    seen_ids = set()
+    for channel in [*channels, *pending_invites.values()]:
+        channel_id = channel.get("id")
+        if channel_id in seen_ids:
+            continue
+        seen_ids.add(channel_id)
+        combined.append(channel)
+    return relay.resolve_channel(combined, token)
 
 
 def _read_shared_state(adapter) -> dict:

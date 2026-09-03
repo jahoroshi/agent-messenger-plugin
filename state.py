@@ -21,6 +21,7 @@ REPLY_CAP = 20  # Autonomous replies allowed per Channel (§6.4).
 REPLY_WINDOW_SECONDS = 600  # Rolling reply-cap window (§6.4).
 PENDING_MIRRORS_MAX = 200  # Bound queued Owner-facing outbound Mirrors.
 DEDUPE_MAX = 200  # Processed Delivery ids retained for restart-safe dedupe.
+PENDING_INVITES_MAX = DEDUPE_MAX  # Pending Invite snapshots retained for restart-safe lookup.
 DEDUPE_SECONDS = 3600  # Processed Delivery retention window.
 SEND_IDEMPOTENCY_SECONDS = 60  # Exact tool sends are coalesced for one minute.
 SEND_IDEMPOTENCY_MAX = DEDUPE_MAX
@@ -62,6 +63,7 @@ def empty_state() -> dict:
         "welcomed": False,
         "channels": {},
         "pending_approvals": {},
+        "pending_invites": {},
         "pending_mirrors": [],
         "seen_deliveries": {},
         # None is the uninitialised value used by old/in-memory state. The
@@ -104,10 +106,21 @@ def _copy_pending(pending: dict) -> dict:
     return {key: {**entry} for key, entry in pending.items()}
 
 
+def _copy_pending_invites(pending_invites: dict) -> dict:
+    return {key: {**entry} for key, entry in pending_invites.items()}
+
+
+def _bound_pending_invites(pending_invites: dict) -> dict:
+    if len(pending_invites) <= PENDING_INVITES_MAX:
+        return pending_invites
+    return dict(list(pending_invites.items())[-PENDING_INVITES_MAX:])
+
+
 def _copy_state(
     state: dict,
     channels=None,
     pending=None,
+    pending_invites=None,
     pending_mirrors=None,
     seen_deliveries=None,
     send_idempotency=None,
@@ -122,11 +135,19 @@ def _copy_state(
         if seen_deliveries is None
         else seen_deliveries
     )
+    invites = (
+        state.get("pending_invites", {})
+        if pending_invites is None
+        else pending_invites
+    )
     updated = {
         **state,
         "channels": _copy_channels(state["channels"] if channels is None else channels),
         "pending_approvals": _copy_pending(
             state["pending_approvals"] if pending is None else pending
+        ),
+        "pending_invites": _bound_pending_invites(
+            _copy_pending_invites(invites)
         ),
         "pending_mirrors": [*mirrors],
         "seen_deliveries": {**seen},
@@ -171,6 +192,52 @@ def grant(state: dict, channel_id, *, kind, level, duration_seconds, moment) -> 
 def revoke(state: dict, channel_id) -> dict:
     channels = {key: value for key, value in state["channels"].items() if key != channel_id}
     return _copy_state(state, channels=channels)
+
+
+def _pending_invite_snapshot(channel: dict) -> dict:
+    if not isinstance(channel, dict):
+        raise ValueError("pending Invite Channel must be an object")
+    channel_id = channel.get("id")
+    name = channel.get("name")
+    if not isinstance(channel_id, str) or not channel_id:
+        raise ValueError("pending Invite Channel id must be a non-empty string")
+    if name is not None and not isinstance(name, str):
+        raise ValueError("pending Invite Channel name must be a string or null")
+    return {"id": channel_id, "name": name}
+
+
+def _pending_invite_is_valid(key, entry) -> bool:
+    return (
+        isinstance(key, str)
+        and bool(key)
+        and isinstance(entry, dict)
+        and entry.get("id") == key
+        and "name" in entry
+        and (entry["name"] is None or isinstance(entry["name"], str))
+    )
+
+
+def remember_pending_invite(state: dict, channel: dict) -> dict:
+    """Remember the id and name needed to resolve a newly posted Invite."""
+    snapshot = _pending_invite_snapshot(channel)
+    channel_id = snapshot["id"]
+    pending_invites = {**state.get("pending_invites", {})}
+    pending_invites.pop(channel_id, None)
+    pending_invites[channel_id] = snapshot
+    return _copy_state(
+        state,
+        pending_invites=_bound_pending_invites(pending_invites),
+    )
+
+
+def drop_pending_invite(state: dict, channel_id: str) -> dict:
+    """Forget a pending Invite without mutating the input state."""
+    pending_invites = {
+        key: value
+        for key, value in state.get("pending_invites", {}).items()
+        if key != channel_id
+    }
+    return _copy_state(state, pending_invites=pending_invites)
 
 
 def note_incoming(state: dict, channel_id, moment) -> dict:
@@ -451,6 +518,9 @@ def load(path) -> dict:
     seen_deliveries = (
         document.get("seen_deliveries", {}) if isinstance(document, dict) else None
     )
+    pending_invites = (
+        document.get("pending_invites", {}) if isinstance(document, dict) else None
+    )
     send_idempotency = (
         document.get("send_idempotency", {}) if isinstance(document, dict) else None
     )
@@ -459,6 +529,11 @@ def load(path) -> dict:
         and isinstance(document.get("welcomed"), bool)
         and isinstance(document.get("channels"), dict)
         and isinstance(document.get("pending_approvals"), dict)
+        and isinstance(pending_invites, dict)
+        and all(
+            _pending_invite_is_valid(channel_id, entry)
+            for channel_id, entry in pending_invites.items()
+        )
         and isinstance(pending_mirrors, list)
         and all(
             (
@@ -498,6 +573,9 @@ def load(path) -> dict:
         raise StateFileCorrupt(f"invalid state file: {target}")
     loaded = {
         **document,
+        "pending_invites": _bound_pending_invites(
+            _copy_pending_invites(pending_invites)
+        ),
         "pending_mirrors": [*pending_mirrors],
         "seen_deliveries": {**seen_deliveries},
         AUTHENTICITY_SECRET_KEY: authenticity_secret,
@@ -510,6 +588,13 @@ def load(path) -> dict:
 def save(path, state) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    if "pending_invites" in state:
+        state = {
+            **state,
+            "pending_invites": _bound_pending_invites(
+                _copy_pending_invites(state["pending_invites"])
+            ),
+        }
     state = forget_old_sends(state, now()) if "send_idempotency" in state else state
     temporary_name = None
     try:

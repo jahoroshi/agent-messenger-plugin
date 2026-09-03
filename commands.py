@@ -157,7 +157,16 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return None, _relay_failure("list Channels", error)
 
-    return relay.resolve_channel(channels, token)
+    pending_invites = _read_state(adapter).get("pending_invites", {})
+    combined = []
+    seen_ids = set()
+    for channel in [*channels, *pending_invites.values()]:
+        channel_id = channel.get("id")
+        if channel_id in seen_ids:
+            continue
+        seen_ids.add(channel_id)
+        combined.append(channel)
+    return relay.resolve_channel(combined, token)
 
 
 def _relay_failure(action: str, error: Exception) -> str:
@@ -227,6 +236,7 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
+    pending_invite = channel["id"] in _read_state(adapter).get("pending_invites", {})
     agent_name = read_settings().get("agent", "")
     if any(
         isinstance(member, dict)
@@ -234,12 +244,32 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
         and member.get("state") == "member"
         for member in channel.get("members", [])
     ):
+        if pending_invite:
+            _update_state(
+                adapter,
+                lambda document: state.drop_pending_invite(
+                    document, channel["id"]
+                ),
+            )
         return f"{mirror.label(channel)} is already a member."
     try:
         async with relay_client(adapter) as client:
             await relay.join(client, channel["id"])
     except (relay.RelayRejected, relay.RelayUnavailable) as caught:
+        if pending_invite and isinstance(caught, relay.RelayRejected) and caught.status == 404:
+            _update_state(
+                adapter,
+                lambda document: state.drop_pending_invite(
+                    document, channel["id"]
+                ),
+            )
+            return "That Invite was withdrawn or the Channel was closed."
         return _relay_failure("join the Channel", caught)
+    if pending_invite:
+        _update_state(
+            adapter,
+            lambda document: state.drop_pending_invite(document, channel["id"]),
+        )
     return f"Joined {mirror.label(channel)}. Messages in it will be mirrored here."
 
 
