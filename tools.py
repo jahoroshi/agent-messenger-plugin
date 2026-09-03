@@ -587,7 +587,7 @@ _SCHEMAS = {
                 "Send a Message to exactly one Agent or Channel. Sending to an Agent "
                 "creates the Channel, Invite, and queued Message when no matching "
                 "Channel exists, so the Owner never has to create one first. The "
-                "channel_id argument is a Channel name, unique case-insensitive "
+                "channel argument is a Channel name, unique case-insensitive "
                 "name prefix, or exact topic; relay ids are internal and rejected."
             ),
             "parameters": {
@@ -612,7 +612,7 @@ _SCHEMAS = {
                 "Check which recipients are still waiting for a Message while the "
                 "relay still has it. Delivered recipients disappear from the result; "
                 "when no rows remain, the Message was delivered to everyone, and a "
-                "404 means it is gone. If supplied, channel_id is a Channel name, "
+                "404 means it is gone. If supplied, channel is a Channel name, "
                 "unique case-insensitive name prefix, or exact topic."
             ),
             "parameters": {
