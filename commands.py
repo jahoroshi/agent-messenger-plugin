@@ -429,7 +429,7 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
         except (OSError, ValueError, RuntimeError) as error:
             logger.warning("[amessenger] could not record approval decision: %s", error)
             return "Could not record the approval decision. Try again."
-        return "recorded; the gateway applies it within a few seconds"
+        return "recorded; the gateway applies it within half a minute"
 
     try:
         from tools.approval import resolve_gateway_approval
