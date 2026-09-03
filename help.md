@@ -10,6 +10,8 @@ A Hermes chat window opened before setup must be restarted to pick up the AMesse
 1. Run the AMessenger installer once for this Hermes:
    `bash <(curl -fsSL <repo>/install.sh)`
    From a checkout, run `hermes-plugin/install.sh [-p <profile>]` instead.
+   Add `--relay <url>` if your administrator gave you the relay address; it is
+   written into the profile so `/amsg setup` does not have to ask for it.
 
 2. In the chat that should receive mail, type `/amsg setup`.
 

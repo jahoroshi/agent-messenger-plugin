@@ -38,8 +38,17 @@ MAX_MESSAGE_LENGTH = 65536              # SYSTEM_DESIGN §5: text ≤ 64 KB
 STATE_DIRNAME = "amessenger"           # $HERMES_HOME/amessenger/state.json, §6.6
 STATE_FILENAME = "state.json"
 OWNER_LOG_FILENAME = "owner_log.jsonl"
+# Complete-configuration question: are all five values needed to run an Agent present?
 REQUIRED_ENV = ("AMESSENGER_URL", "AMESSENGER_KEY", "AMESSENGER_AGENT",
                 "AMESSENGER_KIND", "AMESSENGER_OWNER_CHAT")
+# Enablement question: has the Owner supplied one of the four values expressing
+# intent to run an Agent?  AMESSENGER_URL is only an address written by install.
+OWNER_CONFIGURATION_ENV = (
+    "AMESSENGER_KEY",
+    "AMESSENGER_AGENT",
+    "AMESSENGER_KIND",
+    "AMESSENGER_OWNER_CHAT",
+)
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
 DEDUPE_MAX = state.DEDUPE_MAX
@@ -382,18 +391,16 @@ def parse_owner_chat(value: str) -> tuple[str, str | None]:
 
 
 def has_any_configuration() -> bool:
-    # Enablement question: did the operator express intent to use AMessenger?
-    return any(os.getenv(name, "").strip() for name in REQUIRED_ENV)
+    return any(os.getenv(name, "").strip() for name in OWNER_CONFIGURATION_ENV)
 
 
 def configuration_state() -> str:
     """Classify the five storage variables for startup and validation."""
-    present = [bool(os.getenv(name, "").strip()) for name in REQUIRED_ENV]
     # These three states are intentionally distinct: none is a fresh install,
     # some is an operator mistake, and all five is a usable stored profile.
-    if not any(present):
+    if not has_any_configuration():
         return "unconfigured"
-    if not all(present):
+    if not check_requirements():
         return "half-configured"
     return "configured"
 
@@ -413,9 +420,11 @@ def check_dependencies() -> bool:
 
 def validate_config(config) -> bool:
     """Validate environment configuration; config.extra is intentionally ignored."""
-    if configuration_state() == "unconfigured":
+    if not has_any_configuration():
         # This is the fresh-install state.  It must reach connect() so the
         # /amsg setup command can configure this profile from a chat.
+        return True
+    if check_requirements():
         return True
     missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
     if missing:
@@ -429,7 +438,7 @@ def validate_config(config) -> bool:
 
 def is_connected(config) -> bool:
     """Report whether Hermes should enable this platform from its environment."""
-    # Hermes's enablement question is whether any AMESSENGER_* value was set;
+    # Hermes's enablement question is whether an Owner value was supplied;
     # check_requirements() remains the adapter's complete-configuration gate.
     return has_any_configuration()
 

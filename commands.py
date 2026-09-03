@@ -27,6 +27,11 @@ SETUP_NO_RELAY = (
     "No relay address is configured. Ask your administrator for it and type "
     "/amsg setup … --relay <url>."
 )
+SETUP_GATEWAY_SOURCE = (
+    "AMessenger setup reached the gateway, but this event has no usable platform "
+    "or chat id, so the Owner Chat cannot be identified. Type `/amsg setup` from "
+    "a real chat message; nothing was written."
+)
 SETUP_KEY_GROUP_WARNING = (
     "Warning: a key typed into a group chat is visible to everyone in this group; "
     "use `--key` only in a private chat with this Agent."
@@ -118,6 +123,31 @@ def _log_refusal(source) -> None:
 def _setup_source_is_usable(source) -> bool:
     platform, chat_id, _user_id = _source_details(source)
     return bool(platform and str(chat_id or "").strip())
+
+
+def _setup_gateway_adapter_message() -> str:
+    missing = [
+        name
+        for name in adapter_module.REQUIRED_ENV
+        if not os.getenv(name, "").strip()
+    ]
+    if missing:
+        command = (
+            "`/amsg setup --relay <url>`"
+            if "AMESSENGER_URL" in missing
+            else "`/amsg setup`"
+        )
+        return (
+            "AMessenger is running in the gateway, but its adapter is unavailable "
+            "because the profile is incomplete: missing "
+            f"{', '.join(missing)}. Type {command} in this chat to write the "
+            "missing values and connect AMessenger."
+        )
+    return (
+        "AMessenger is running in the gateway, but its adapter is unavailable even "
+        "though all five configuration variables are present. Restart the gateway, "
+        "then type `/amsg setup` in this chat."
+    )
 
 
 def _setup_owner_check(adapter, source) -> bool:
@@ -289,8 +319,12 @@ def _setup_relay_error(url: str, error: Exception, secret: str = "") -> str:
 
 
 async def _setup(adapter, tokens: list[str], source) -> str:
-    if not in_gateway_process() or not _setup_source_is_usable(source):
+    if not in_gateway_process():
         return SETUP_TUI
+    if not _setup_source_is_usable(source):
+        return SETUP_GATEWAY_SOURCE
+    if adapter is None:
+        return _setup_gateway_adapter_message()
     parsed = _parse_setup_arguments(tokens)
     if parsed is None:
         return _setup_argument_error()
@@ -424,8 +458,6 @@ async def _setup(adapter, tokens: list[str], source) -> str:
                 secret=key if key_supplied else "",
             )
 
-    if adapter is None:
-        return SETUP_TUI
     env_values = dict(values)
     try:
         adapter_module.update_profile_env(env_values, clear=clear)
@@ -985,6 +1017,8 @@ def make_handler():
         if command == "setup":
             if not in_gateway_process():
                 return await _setup(None, tokens, source)
+            if not _setup_source_is_usable(source):
+                return await _setup(adapter, tokens, source)
             if not _setup_owner_check(adapter, source):
                 _log_refusal(source)
                 return REFUSAL
