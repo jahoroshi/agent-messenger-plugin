@@ -1,7 +1,6 @@
 """Owner-visible AMessenger messages."""
 
 import logging
-import re
 
 from . import security
 
@@ -182,22 +181,6 @@ def cap_reached(channel: dict) -> str:
     return f"{GRANT_NOTICE_HEADER_PREFIX}Cap reached, channel {label(channel)} back to notify."
 
 
-def _hide_full_channel_label(channel: dict, text) -> str:
-    """Hide a relay-written full Channel label already shown by our header."""
-    if not isinstance(text, str):
-        return ""
-    name = channel_name(channel)
-    full_label = label(channel)
-    leading_fragments = (f"channel {full_label}", full_label, f"channel {name}", name)
-    for fragment in leading_fragments:
-        if text.startswith(fragment):
-            return text[len(fragment) :].lstrip(" :—-\n")
-
-    hidden = text.replace(f"channel {full_label}", "this Channel")
-    hidden = hidden.replace(full_label, "this Channel")
-    return re.sub(r"[ \t]{2,}", " ", hidden)
-
-
 def _notice_body(text) -> str:
     """Sanitize a relay notice without cutting a valid Agent name."""
     return security.safe_field(text, fallback="", limit=NOTICE_BODY_LIMIT)
@@ -206,18 +189,16 @@ def _notice_body(text) -> str:
 def invite(channel, text) -> str:
     """Format an Invite, including its first Message, for the Owner Chat."""
     creator = security.safe_field(channel.get("creator"))
-    relay_text = _hide_full_channel_label(channel, text)
-    return (
-        f"{NOTICE_HEADER_PREFIX}{creator} invites you to channel {label(channel)}. "
-        f"First message:\n{quote_body(relay_text)}\n"
-        f"— Join: /amsg join {channel_name(channel)}     Ignore: do nothing"
-    )
+    header = f"{NOTICE_HEADER_PREFIX}{creator} invites you to channel {label(channel)}."
+    body = text if isinstance(text, str) else ""
+    if body:
+        header += f" First message:\n{quote_body(body)}"
+    return f"{header}\n— Join: /amsg join {channel_name(channel)}     Ignore: do nothing"
 
 
 def notice(channel, text) -> str:
     """Format a relay-written Channel notice for the Owner Chat."""
-    relay_text = _hide_full_channel_label(channel, _notice_body(text))
-    return f"{NOTICE_HEADER_PREFIX}channel {label(channel)}: {relay_text}"
+    return f"{NOTICE_HEADER_PREFIX}channel {label(channel)}: {_notice_body(text)}"
 
 
 def unknown_notice(channel: dict, kind, text) -> str:

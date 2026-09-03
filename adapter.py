@@ -94,6 +94,16 @@ def active_adapter():
     return adapter
 
 
+def _invite_channel_with_topic(channel: dict, message: dict) -> dict:
+    """Add the Invite-only topic metadata to the ChannelRef when present."""
+    if not isinstance(channel, dict):
+        return channel
+    meta = message.get("meta") if isinstance(message, dict) else None
+    if not isinstance(meta, dict) or "topic" not in meta:
+        return channel
+    return {**channel, "topic": meta["topic"]}
+
+
 def approval_mode() -> str:
     """Return Hermes's effective approval mode, or ``"unknown"`` if unreadable.
 
@@ -708,18 +718,24 @@ class AMessengerAdapter(BasePlatformAdapter):
         logger.info("[amessenger] Delivery %s kind=%s", delivery_id, kind)
 
         if self.already_processed(delivery_id):
-            self.remember_channel(channel)
+            remembered_channel = (
+                _invite_channel_with_topic(channel, message)
+                if kind == "invite"
+                else channel
+            )
+            self.remember_channel(remembered_channel)
             logger.debug("[amessenger] Delivery %s already processed", delivery_id)
             return True
 
         if kind == "invite":
-            text = mirror.invite(channel, message["text"])
+            invite_channel = _invite_channel_with_topic(channel, message)
+            text = mirror.invite(invite_channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
             if processed:
-                self.remember_channel(channel)
+                self.remember_channel(invite_channel)
                 self.update_state(
                     lambda document: state.remember_pending_invite(
-                        document, channel
+                        document, invite_channel
                     )
                 )
         elif kind in {"joined", "left", "closed", "removed"}:
