@@ -258,8 +258,13 @@ def parse_owner_chat(value: str) -> tuple[str, str | None]:
     return platform, chat_id or None
 
 
+def has_any_configuration() -> bool:
+    # Enablement question: did the operator express intent to use AMessenger?
+    return any(os.getenv(name, "").strip() for name in REQUIRED_ENV)
+
+
 def check_requirements() -> bool:
-    """Return whether all required environment values are non-blank."""
+    # Validation/connect question: are all values needed to use AMessenger present?
     return all(os.getenv(name, "").strip() for name in REQUIRED_ENV)
 
 
@@ -284,13 +289,17 @@ def validate_config(config) -> bool:
 
 
 def is_connected(config) -> bool:
-    """Report whether the platform has the minimum environment configuration."""
-    return check_requirements()
+    """Report whether Hermes should enable this platform from its environment."""
+    # Hermes's enablement question is whether any AMESSENGER_* value was set;
+    # check_requirements() remains the adapter's complete-configuration gate.
+    return has_any_configuration()
 
 
 def env_enablement() -> dict | None:
     """Return the values needed to seed a minimally configured platform."""
-    if not check_requirements():
+    # Probe-seeding question: should the env values be offered to the enablement
+    # probe? Match is_connected() so partial configuration reaches validation.
+    if not has_any_configuration():
         return None
     settings = read_settings()
     return {
