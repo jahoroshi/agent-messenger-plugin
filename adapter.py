@@ -263,9 +263,24 @@ def check_requirements() -> bool:
     return all(os.getenv(name, "").strip() for name in REQUIRED_ENV)
 
 
+def check_dependencies() -> bool:
+    """Passively probe dependencies for the pure-Python plugin."""
+    # Hermes calls check_fn before an adapter exists. It is for passive
+    # dependency availability, not credentials; AMessenger has no optional
+    # dependency to probe, so its check always succeeds.
+    return True
+
+
 def validate_config(config) -> bool:
     """Validate environment configuration; config.extra is intentionally ignored."""
-    return check_requirements()
+    missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
+    if missing:
+        logger.error(
+            "[amessenger] missing required environment variables: %s",
+            ", ".join(missing),
+        )
+        return False
+    return True
 
 
 def is_connected(config) -> bool:

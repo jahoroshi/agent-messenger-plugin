@@ -16,8 +16,7 @@ from .adapter import (
     MAX_MESSAGE_LENGTH,
     PLATFORM_HINT,
     PLATFORM_NAME,
-    REQUIRED_ENV,
-    check_requirements,
+    check_dependencies,
     env_enablement,
     is_connected,
     validate_config,
@@ -114,11 +113,12 @@ def register(ctx) -> None:
     # if Hermes later registered amessenger as a cron delivery platform or
     # otherwise used this fallback variable as a real delivery destination.
     os.environ.setdefault("AMESSENGER_HOME_CHANNEL", HOME_CHANNEL_SENTINEL)
+    # check_fn is Hermes's passive dependency probe, not a credential gate.
     ctx.register_platform(
         name=PLATFORM_NAME, label="AMessenger",
         adapter_factory=lambda cfg: AMessengerAdapter(cfg, help_text=HELP_TEXT),
-        check_fn=check_requirements, validate_config=validate_config,
-        is_connected=is_connected, required_env=list(REQUIRED_ENV),
+        check_fn=check_dependencies, validate_config=validate_config,
+        is_connected=is_connected,
         install_hint="Set the AMESSENGER_* variables in $HERMES_HOME/.env",
         env_enablement_fn=env_enablement, platform_hint=PLATFORM_HINT,
         emoji="📨", max_message_length=MAX_MESSAGE_LENGTH, pii_safe=False,
