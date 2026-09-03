@@ -12,6 +12,10 @@ from .adapter import active_adapter, read_settings
 
 logger = logging.getLogger("amessenger")
 REFUSAL = "AMessenger commands are accepted only from the Owner in the Owner Chat."
+MISSING_GROUP_OWNER_USER_HINT = (
+    "This Owner Chat is a group and AMESSENGER_OWNER_USER is not set; set it to "
+    "your platform user id and restart the gateway."
+)
 _DURATION = re.compile(r"^(\d+)([hm])$")
 
 _SOURCE: ContextVar = ContextVar("amessenger_source", default=None)
@@ -57,6 +61,20 @@ def owner_check(adapter, source) -> bool:
         named_owner = bool(owner_user) and str(source.user_id) == owner_user
         return same_platform and same_chat and (
             source.chat_type == "dm" or named_owner
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def missing_group_owner_user(adapter, source) -> bool:
+    """Return whether this refusal is caused by an unnamed group Owner."""
+    try:
+        settings = read_settings()
+        return (
+            source.platform.value == adapter._owner_platform
+            and str(source.chat_id) == str(adapter._owner_chat_id)
+            and source.chat_type == "group"
+            and not str(settings.get("owner_user") or "").strip()
         )
     except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
         return False
@@ -232,7 +250,7 @@ async def _log(tokens: list[str]) -> str:
 async def _join(adapter, tokens: list[str], help_text: str) -> str:
     token = _channel_token(tokens)
     if token is None:
-        return help_text
+        return _argument_error("join")
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
@@ -275,13 +293,15 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
 
 async def _interact(adapter, tokens: list[str], help_text: str) -> str:
     if len(tokens) < 2:
-        return help_text
+        return _argument_error("interact")
+    if parse_interact(tokens[2:]) is None:
+        return _argument_error("interact")
     channel, error = await resolve_channel(adapter, tokens[1])
     if error is not None:
         return error
+    if adapter is not None:
+        adapter.remember_channel(channel)
     parsed = parse_interact(tokens[2:])
-    if parsed is None:
-        return help_text
     kind, duration_seconds, level = parsed
     approval_mode = None
     if level == "full":
@@ -328,7 +348,7 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
 async def _notify(adapter, tokens: list[str], help_text: str) -> str:
     token = _channel_token(tokens)
     if token is None:
-        return help_text
+        return _argument_error("notify")
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
@@ -345,7 +365,7 @@ async def _notify(adapter, tokens: list[str], help_text: str) -> str:
 async def _leave(adapter, tokens: list[str], help_text: str) -> str:
     token = _channel_token(tokens)
     if token is None:
-        return help_text
+        return _argument_error("leave")
     channel, error = await resolve_channel(adapter, token)
     if error is not None:
         return error
@@ -364,6 +384,20 @@ def _is_invited(channel: dict, agent_name: str) -> bool:
         for member in channel.get("members", [])
         if isinstance(member, dict)
     )
+
+
+def _argument_error(command: str) -> str:
+    accepted = {
+        "join": "<ch>",
+        "interact": "1h, 5h, Nh, Nm, always, full",
+        "notify": "<ch>",
+        "leave": "<ch>",
+        "status": "no arguments",
+        "approve": "[handle]",
+        "deny": "[handle]",
+        "help": "no arguments",
+    }
+    return f"Accepted forms for {command}: {accepted[command]}."
 
 
 async def _status(adapter) -> str:
@@ -490,13 +524,17 @@ def make_handler():
         adapter = active_adapter()
         if not owner_check(adapter, source):
             _log_refusal(source)
+            if missing_group_owner_user(adapter, source):
+                return f"{REFUSAL}\n{MISSING_GROUP_OWNER_USER_HINT}"
             return REFUSAL
 
         from . import HELP_TEXT
 
         tokens = (raw_args or "").split()
         if not tokens or tokens[0] == "help":
-            return HELP_TEXT
+            if not tokens or len(tokens) == 1:
+                return HELP_TEXT
+            return _argument_error("help")
         command = tokens[0]
         if command == "join":
             return await _join(adapter, tokens, HELP_TEXT)
@@ -508,9 +546,13 @@ def make_handler():
             return await _leave(adapter, tokens, HELP_TEXT)
         if command == "log":
             return await _log(tokens)
-        if command == "status" and len(tokens) == 1:
+        if command == "status":
+            if len(tokens) != 1:
+                return _argument_error("status")
             return await _status(adapter)
-        if command in {"approve", "deny"} and len(tokens) in {1, 2}:
+        if command in {"approve", "deny"}:
+            if len(tokens) not in {1, 2}:
+                return _argument_error(command)
             approval_handle = tokens[1] if len(tokens) == 2 else None
             choice = "once" if command == "approve" else "deny"
             return await _approval(adapter, choice, approval_handle)

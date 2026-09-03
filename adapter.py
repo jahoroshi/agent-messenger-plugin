@@ -302,6 +302,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._channels: "OrderedDict[str, dict]" = OrderedDict()
         self._pending_mirrors: list[str] = []
         self._last_pending_decisions_poll = None
+        self._owner_user_warning_logged = False
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -574,6 +575,14 @@ class AMessengerAdapter(BasePlatformAdapter):
         if problem:
             logger.error("[amessenger] not connecting: %s", problem)
             return False
+        if not str(self._settings.get("owner_user") or "").strip():
+            if not self._owner_user_warning_logged:
+                logger.warning(
+                    "[amessenger] AMESSENGER_OWNER_USER is not set; if the Owner "
+                    "Chat is a group, Owner commands will be refused until it is "
+                    "set."
+                )
+                self._owner_user_warning_logged = True
         self._loop = asyncio.get_running_loop()
         self._running = True
         self._poll_task = asyncio.create_task(self.run_poll_loop())
@@ -621,10 +630,29 @@ class AMessengerAdapter(BasePlatformAdapter):
     def remember_channel(self, channel: dict) -> None:
         """Remember the latest relay Channel record for Owner-facing notices."""
         channel_id = channel["id"]
+        channel = {**channel}
+        if not str(channel.get("name") or "").strip():
+            channel["name"] = self._peer_name(channel)
         self._channels.pop(channel_id, None)
-        self._channels[channel_id] = dict(channel)
+        self._channels[channel_id] = channel
         while len(self._channels) > CHANNELS_MAX:
             self._channels.popitem(last=False)
+
+    def _peer_name(self, channel: dict) -> str | None:
+        """Use the other Agent as a useful name when a relay name is absent."""
+        own_agent = str((self._settings or read_settings()).get("agent") or "")
+        members = channel.get("members")
+        if isinstance(members, list):
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                agent = str(member.get("agent") or "").strip()
+                if agent and agent != own_agent:
+                    return agent
+        creator = str(channel.get("creator") or "").strip()
+        if creator and creator != own_agent:
+            return creator
+        return None
 
     def known_channel(self, channel_id: str) -> dict:
         """Return a remembered Channel, or a renderable unnamed fallback."""
