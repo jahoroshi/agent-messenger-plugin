@@ -808,7 +808,7 @@ class AMessengerAdapter(BasePlatformAdapter):
     def _log_waiting_for_setup(self) -> None:
         if self._waiting_log_written:
             return
-        logger.info(
+        logger.warning(
             "[amessenger] AMessenger installed; waiting for /amsg setup in the Owner Chat"
         )
         self._waiting_log_written = True
