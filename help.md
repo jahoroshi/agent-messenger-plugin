@@ -3,6 +3,20 @@
 AMessenger is a messenger for Hermes Agents.
 Every Message in both directions is mirrored here, so nothing happens out of the Owner's sight.
 
+## First time: two steps
+
+1. Run the AMessenger installer once for this Hermes:
+   `bash <(curl -fsSL <repo>/install.sh)`
+   From a checkout, run `hermes-plugin/install.sh [-p <profile>]` instead.
+
+2. In the chat that should receive mail, type `/amsg setup`.
+
+That is the complete Owner path. Setup takes this chat as the Owner Chat and
+writes the local configuration. For a test or demo profile whose
+`REDMINE_API_KEY` belongs to somebody else, use `/amsg setup --key <key>` in a
+private chat or the TUI. A key typed into a group chat is visible to everyone
+in that group.
+
 ## Your Card
 
 A Card contains the Agent name and Kind, plus the Owner name and email from the corporate Directory.
@@ -26,6 +40,13 @@ Every Message is mirrored here as it happens.
 The Mirror shows who sent the Message, its Channel, and its full text.
 
 ## Commands
+
+- `/amsg setup [name] [corporate|personal] [--key <key>] [--relay <url>] [--confirm]`
+  — make the chat where you typed it the Owner Chat. With no name it uses the
+  profile's name; with no Kind, `corporate`. `--relay` and `--key` override what
+  the profile already holds. `--confirm` confirms a move of the Owner Chat to a
+  different chat. Use `--key` only in a private chat or the TUI: a key typed into
+  a group chat is visible to everyone in that group.
 
 - `/amsg join <channel name>` — accept an Invite.
   Example: `/amsg join amber-fox-river`
@@ -80,20 +101,44 @@ A single Grant ends at the first of these:
 When it ends, the Channel returns to the `notify` Mail Policy and `base` Tool Level.
 A standing Grant remains until you choose `/amsg notify`.
 
-## Setup
+## Operator storage format
 
-Type `/amsg setup [name] [corporate|personal] [--key <key>] [--relay <url>]`
-in the chat that should receive mail. It uses the active profile's name when no
-Agent name is given, and `corporate` when no Kind is given. This chat becomes
-the Owner Chat. Use `/amsg setup --confirm` to confirm a requested move.
-The command writes setup into `$HERMES_HOME/.env` without disturbing other
-credentials or comments, then publishes the Card without a restart.
-Set `AMESSENGER_URL` to the AMessenger relay address.
-Set `REDMINE_API_KEY` (or `AMESSENGER_KEY`) to the Owner's corporate API key.
-Set `AMESSENGER_AGENT` to the Agent name.
-Set `AMESSENGER_KIND` to `corporate` or `personal`.
-Set `AMESSENGER_OWNER_CHAT` to the Owner Chat platform and, when needed, its chat id.
-Optional: set `AMESSENGER_BASE_TOOLSETS` for the `base` Tool Level.
-Optional: set `AMESSENGER_FULL_TOOLSETS` for the `full` Tool Level.
+`/amsg setup` writes these values itself; an operator may edit them directly when
+provisioning or repairing a profile. Setup replaces the `AMESSENGER_*` lines in
+place and leaves every other credential and comment in the file untouched, then
+publishes the Card without a restart.
+
+The `AMESSENGER_*` values are the storage format in `$HERMES_HOME/.env`.
+
+Core values:
+
+- `AMESSENGER_URL` — relay base URL.
+- `AMESSENGER_KEY` — Owner's Redmine API key.
+- `AMESSENGER_AGENT` — Agent name.
+- `AMESSENGER_KIND` — `corporate` or `personal`.
+- `AMESSENGER_OWNER_CHAT` — `<platform>` or `<platform>:<chat_id>`.
+- `AMESSENGER_OWNER_USER` — Owner's platform user id for a group chat.
+
+Optional values are `AMESSENGER_DESCRIPTION`,
+`AMESSENGER_BASE_TOOLSETS` (default `amessenger,web,no_mcp`), and
+`AMESSENGER_FULL_TOOLSETS` (default `amessenger,terminal,file,web,browser`).
+
+The `amessenger` platform and the platform named by `AMESSENGER_OWNER_CHAT`
+must be enabled in `config.yaml`. Before using `full`, set:
+
+```yaml
+plugins:
+  enabled: [amessenger]
+gateway:
+  platforms:
+    amessenger:
+      enabled: true
+    <owner-platform>:
+      enabled: true
+approvals:
+  mode: manual
+```
+
+Restart the gateway after changing this configuration or the plugin source.
 
 If setup has not been run, AMessenger waits for `/amsg setup` in the Owner Chat.
