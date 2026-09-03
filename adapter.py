@@ -319,6 +319,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._last_pending_decisions_poll = None
         self._owner_user_warning_logged = False
 
+    def _drop_forgotten_channel(self, channel_id: str) -> None:
+        self.update_state(lambda document: state.drop_channel(document, channel_id))
+        self._channels.pop(channel_id, None)
+
     @property
     def authorization_is_upstream(self) -> bool:
         # The relay only delivers Messages from Channels this Agent has joined,
@@ -1078,12 +1082,23 @@ class AMessengerAdapter(BasePlatformAdapter):
                 logger.exception("[amessenger] housekeeping pass failed; continuing")
 
     async def housekeeping_once(self) -> None:
-        """Expire single Grants and tell the Owner about each one (§6.6)."""
+        """Expire Grants and reconcile state with the relay (§6.6)."""
         await self.flush_pending_mirrors()
         moment = state.now()
         ended = []
+        forgotten_grants = []
         expired_approvals = []
         timeout_seconds = 300
+        listed_ids = None
+        try:
+            listed_channels = await relay.list_channels(self.client())
+            listed_ids = {channel["id"] for channel in listed_channels}
+        except (RelayRejected, RelayUnavailable) as error:
+            logger.warning(
+                "[amessenger] Channel reconciliation skipped because the relay "
+                "listing failed: %s",
+                error,
+            )
         try:
             from tools.approval import _get_approval_config
 
@@ -1102,20 +1117,33 @@ class AMessengerAdapter(BasePlatformAdapter):
             timeout_seconds = 300
 
         def expire(document):
-            nonlocal ended, expired_approvals
+            nonlocal ended, expired_approvals, forgotten_grants
             updated, ended = state.expire_grants(document, moment)
             updated, expired_approvals = state.expire_pending_approvals(
                 updated, moment, timeout_seconds
             )
+            if listed_ids is not None:
+                updated, forgotten = state.reconcile_channels(updated, listed_ids)
+                forgotten_grants = [
+                    channel_id
+                    for channel_id in forgotten
+                    if channel_id not in ended
+                ]
             return updated
 
         self.update_state(expire)
+        forgotten_channel_records = {
+            channel_id: self.known_channel(channel_id)
+            for channel_id in forgotten_grants
+        }
+        for channel_id in forgotten_grants:
+            self._channels.pop(channel_id, None)
         if expired_approvals:
             logger.info(
                 "[amessenger] expired %d pending approval(s); Hermes already denied them",
                 len(expired_approvals),
             )
-        if not ended:
+        if not ended and not forgotten_grants:
             return
         # Write before notices: a Grant must never survive its own expiry because
         # a chat post failed; this is the opposite of the receive path.
@@ -1126,6 +1154,17 @@ class AMessengerAdapter(BasePlatformAdapter):
             if not posted:
                 logger.warning(
                     "[amessenger] Grant-ended notice failed for Channel %s", channel_id
+                )
+        for channel_id in forgotten_grants:
+            posted = await self.mirror_or_queue(
+                mirror.grant_ended_channel_gone(
+                    forgotten_channel_records[channel_id]
+                ),
+            )
+            if not posted:
+                logger.warning(
+                    "[amessenger] forgotten-Grant notice failed for Channel %s",
+                    channel_id,
                 )
 
     async def end_single_grant(self, chat_id: str) -> None:
@@ -1248,7 +1287,10 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True)
 
-        error = "approval request was not delivered to the Owner Chat"
+        error = (
+            "approval request was not delivered to the Owner Chat because its "
+            "adapter is unavailable; start the Owner Chat platform and retry."
+        )
         logger.error("[amessenger] %s", error)
         return SendResult(success=False, error=error)
 
@@ -1267,7 +1309,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         if owner is None:
             return SendResult(
                 success=False,
-                error="approval request was not delivered to the Owner Chat",
+                error=(
+                    "approval request was not delivered to the Owner Chat because "
+                    "its adapter is unavailable; start the Owner Chat platform and retry."
+                ),
             )
         # Nothing in this method may post into the Channel: the peer must never
         # learn that an approval was asked for, let alone answer it.
@@ -1361,9 +1406,11 @@ class AMessengerAdapter(BasePlatformAdapter):
                 result = await relay.send_message(client, **send_arguments)
             except RelayRejected as error:
                 logger.warning("[amessenger] outbound relay send failed: %s", error)
+                if error.status == 404 and channel_id is not None:
+                    self._drop_forgotten_channel(channel_id)
                 return SendResult(
                     success=False,
-                    error=str(error),
+                    error=(relay.CHANNEL_GONE if error.status == 404 else str(error)),
                     raw_response=error,
                     retryable=False,
                 )
@@ -1378,6 +1425,22 @@ class AMessengerAdapter(BasePlatformAdapter):
         finally:
             if close_client:
                 await client.aclose()
+
+        if not (
+            isinstance(result, dict)
+            and isinstance(result.get("channel"), dict)
+            and isinstance(result["channel"].get("id"), str)
+            and bool(result["channel"]["id"])
+            and isinstance(result.get("message"), dict)
+            and isinstance(result["message"].get("id"), str)
+            and bool(result["message"]["id"])
+        ):
+            return SendResult(
+                success=False,
+                error=relay.MALFORMED_SEND,
+                raw_response=result,
+                retryable=False,
+            )
 
         self.remember_channel(result["channel"])
         outgoing_line = mirror.outgoing(result["channel"], redacted)

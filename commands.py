@@ -184,13 +184,45 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
             continue
         seen_ids.add(channel_id)
         combined.append(channel)
-    return relay.resolve_channel(combined, token)
+    channel, error = relay.resolve_channel(combined, token)
+    if channel is not None or error != f"No Channel here starts with {token}.":
+        return channel, error
+
+    current_ids = {channel.get("id") for channel in channels}
+    stale = []
+    document = _read_state(adapter)
+    pending_ids = set(document.get("pending_invites", {}))
+    for channel_id in document.get("channels", {}):
+        if channel_id in current_ids or channel_id in pending_ids:
+            continue
+        stale.append(
+            adapter.known_channel(channel_id)
+            if adapter is not None
+            else {"id": channel_id, "name": None}
+        )
+    forgotten, _forgotten_error = relay.resolve_channel(stale, token)
+    if forgotten is None:
+        return channel, error
+    _drop_forgotten_channel(adapter, forgotten["id"])
+    return None, relay.CHANNEL_GONE
 
 
 def _relay_failure(action: str, error: Exception) -> str:
     if isinstance(error, relay.RelayRejected):
-        return error.detail
-    return f"Could not {action}: {error}"
+        return (
+            f"Could not {action}: the relay rejected the request ({error.detail}); "
+            "fix the named Channel, Agent, or permission, then retry."
+        )
+    return (
+        f"Could not {action}: the relay did not answer ({error}); check "
+        "AMESSENGER_URL and relay health, then retry."
+    )
+
+
+def _drop_forgotten_channel(adapter, channel_id: str) -> None:
+    _update_state(adapter, lambda document: state.drop_channel(document, channel_id))
+    if adapter is not None:
+        adapter._channels.pop(channel_id, None)
 
 
 def _channel_token(tokens: list[str]) -> str | None:
@@ -228,9 +260,12 @@ async def _log(tokens: list[str]) -> str:
         entries = state.read_owner_log(adapter_module.owner_log_path_for_process(), limit)
     except OSError as error:
         logger.warning("[amessenger] could not read Owner log: %s", error)
-        return "The Owner log is unavailable."
+        return (
+            "The Owner log could not be read because owner_log.jsonl is unavailable; "
+            "fix its permissions or disk space, then run /amsg log again."
+        )
     if not entries:
-        return "The Owner log is empty."
+        return "The Owner log is empty; nothing to do."
 
     try:
         document = adapter_module.read_state_file()
@@ -243,7 +278,10 @@ async def _log(tokens: list[str]) -> str:
         )
     except (OSError, state.StateFileCorrupt, KeyError) as error:
         logger.warning("[amessenger] could not load Owner log mark: %s", error)
-        return "The Owner log is unavailable."
+        return (
+            "The Owner log could not be shown because state.json's authenticity mark "
+            "is unavailable; fix state.json, then run /amsg log again."
+        )
     return "\n".join(f"{entry['text']} {mark}" for entry in entries)
 
 
@@ -274,14 +312,14 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
         async with relay_client(adapter) as client:
             await relay.join(client, channel["id"])
     except (relay.RelayRejected, relay.RelayUnavailable) as caught:
-        if pending_invite and isinstance(caught, relay.RelayRejected) and caught.status == 404:
+        if isinstance(caught, relay.RelayRejected) and caught.status == 404:
             _update_state(
                 adapter,
-                lambda document: state.drop_pending_invite(
-                    document, channel["id"]
-                ),
+                lambda document: state.drop_channel(document, channel["id"]),
             )
-            return "That Invite was withdrawn or the Channel was closed."
+            if pending_invite:
+                return "That Invite was withdrawn or the Channel was closed."
+            return relay.CHANNEL_GONE
         return _relay_failure("join the Channel", caught)
     if pending_invite:
         _update_state(
@@ -373,6 +411,9 @@ async def _leave(adapter, tokens: list[str], help_text: str) -> str:
         async with relay_client(adapter) as client:
             await relay.leave(client, channel["id"])
     except (relay.RelayRejected, relay.RelayUnavailable) as caught:
+        if isinstance(caught, relay.RelayRejected) and caught.status == 404:
+            _drop_forgotten_channel(adapter, channel["id"])
+            return relay.CHANNEL_GONE
         return _relay_failure("leave the Channel", caught)
     _update_state(adapter, lambda document: state.revoke(document, channel["id"]))
     return f"Left {mirror.label(channel)}."
@@ -407,7 +448,7 @@ async def _status(adapter) -> str:
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return _relay_failure("list Channels", error)
     if not channels:
-        return "No Channels yet."
+        return "No Channels yet; nothing to do."
 
     agent_name = read_settings().get("agent", "")
     lines = []
@@ -481,7 +522,10 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
             if str(item[1].get("chat_id", "")).startswith(approval_handle)
         ]
         if not matches:
-            return f"No pending approval matches `{approval_handle}`."
+            return (
+                f"No pending approval matches `{approval_handle}`; use a handle shown by "
+                "/amsg approve or /amsg deny."
+            )
         if len(matches) != 1:
             return _waiting_approvals_message(adapter, choice, matches)
         selected = matches[0]
@@ -492,13 +536,21 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
             adapter_module.append_pending_decision_file(entry["chat_id"], choice)
         except (OSError, ValueError, RuntimeError) as error:
             logger.warning("[amessenger] could not record approval decision: %s", error)
-            return "Could not record the approval decision. Try again."
+            command = "approve" if choice == "once" else "deny"
+            return (
+                "Could not record the approval decision because "
+                "pending_decisions.jsonl could not be written; fix its permissions "
+                f"or disk space, then run /amsg {command} again."
+            )
         return "recorded; the gateway applies it within half a minute"
 
     try:
         from tools.approval import resolve_gateway_approval
     except ImportError:
-        return "Approvals are unavailable in this Hermes build."
+        return (
+            "Approvals are unavailable because this Hermes build lacks "
+            "tools.approval; upgrade Hermes, then run /amsg approve or /amsg deny again."
+        )
 
     popped = None
 

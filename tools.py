@@ -10,16 +10,23 @@ from .adapter import active_adapter, check_requirements
 
 
 logger = logging.getLogger("amessenger")
-RELAY_OUTAGE = "Error: the AMessenger relay did not answer. Try again."
+RELAY_OUTAGE = (
+    "Error: the AMessenger relay at AMESSENGER_URL did not answer; check "
+    "AMESSENGER_URL and relay health, then retry."
+)
 CHANNEL_ID_LENGTH = 22
 SEND_IDEMPOTENCY_SECONDS = state.SEND_IDEMPOTENCY_SECONDS
+_MALFORMED_SEND = relay.MALFORMED_SEND
 
 
 def relay_error(error) -> str:
     """The sentence the model reads when the relay refused or did not answer."""
     if isinstance(error, relay.RelayRejected):
         detail = security.safe_field(error.detail, fallback=RELAY_OUTAGE)
-        return f"Error: {detail}"
+        return (
+            "Error: the relay rejected the request: "
+            f"{detail}; fix the named Channel, Agent, or permission, then retry."
+        )
     return RELAY_OUTAGE
 
 
@@ -141,7 +148,27 @@ async def _resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
             continue
         seen_ids.add(channel_id)
         combined.append(channel)
-    return relay.resolve_channel(combined, token)
+    channel, error = relay.resolve_channel(combined, token)
+    if channel is not None or error != f"No Channel here starts with {token}.":
+        return channel, error
+
+    current_ids = {channel.get("id") for channel in channels}
+    stale = []
+    document = _read_shared_state(adapter)
+    pending_ids = set(document.get("pending_invites", {}))
+    for channel_id in document.get("channels", {}):
+        if channel_id in current_ids or channel_id in pending_ids:
+            continue
+        stale.append(
+            adapter.known_channel(channel_id)
+            if adapter is not None
+            else {"id": channel_id, "name": None}
+        )
+    forgotten, _forgotten_error = relay.resolve_channel(stale, token)
+    if forgotten is None:
+        return channel, error
+    _drop_forgotten_channel(adapter, forgotten["id"])
+    return None, relay.CHANNEL_GONE
 
 
 def _read_shared_state(adapter) -> dict:
@@ -156,10 +183,28 @@ def _update_shared_state(adapter, change) -> dict:
     return adapter.update_state(change)
 
 
+def _drop_forgotten_channel(adapter, channel_id: str) -> None:
+    _update_shared_state(adapter, lambda document: state.drop_channel(document, channel_id))
+    if adapter is not None:
+        adapter._channels.pop(channel_id, None)
+
+
 def _already_sent_answer(channel_id: str, record: dict) -> str:
     return (
         f"Already sent that exact Message to channel {channel_id} a moment ago. "
-        f"Message id {record['message_id']}."
+        f"Message id {record['message_id']}; nothing to do."
+    )
+
+
+def _usable_send_result(result) -> bool:
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("channel"), dict)
+        and isinstance(result["channel"].get("id"), str)
+        and bool(result["channel"]["id"])
+        and isinstance(result.get("message"), dict)
+        and isinstance(result["message"].get("id"), str)
+        and bool(result["message"]["id"])
     )
 
 
@@ -220,9 +265,10 @@ async def amessenger_agents(args: dict, **_) -> str:
         return relay_error(error)
     if not cards:
         return (
-            f"No Agents match '{query}'."
+            f"No Agents match '{query}'; change the query or publish the missing "
+            "Agent's Card."
             if query is not None
-            else "The Directory is empty."
+            else "The Directory is empty; publish an Agent Card before searching."
         )
     return "\n".join(_agent_line(card) for card in cards)
 
@@ -238,7 +284,7 @@ async def amessenger_channels(args: dict, **_) -> str:
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     if not channels:
-        return "No Channels yet."
+        return "No Channels yet; create one with amessenger_create_channel or send to an Agent."
     return "\n".join(_channel_line(channel) for channel in channels)
 
 
@@ -288,8 +334,17 @@ async def amessenger_send(args: dict, **_) -> str:
         )
         if not delivery.success:
             error = delivery.raw_response
+            if (
+                channel_id is not None
+                and isinstance(error, relay.RelayRejected)
+                and error.status == 404
+            ):
+                _drop_forgotten_channel(adapter, channel_id)
+                return relay.CHANNEL_GONE
             if isinstance(error, (relay.RelayRejected, relay.RelayUnavailable)):
                 return relay_error(error)
+            if delivery.error == relay.MALFORMED_SEND:
+                return relay.MALFORMED_SEND
             return RELAY_OUTAGE
         result = delivery.raw_response
         owner_copy_queued = False
@@ -303,7 +358,16 @@ async def amessenger_send(args: dict, **_) -> str:
             async with relay_client(None) as client:
                 result = await relay.send_message(client, **send_arguments)
         except (relay.RelayRejected, relay.RelayUnavailable) as error:
+            if (
+                channel_id is not None
+                and isinstance(error, relay.RelayRejected)
+                and error.status == 404
+            ):
+                _drop_forgotten_channel(adapter, channel_id)
+                return relay.CHANNEL_GONE
             return relay_error(error)
+        if not _usable_send_result(result):
+            return _MALFORMED_SEND
         owner_line = mirror.outgoing(result["channel"], redacted)
         adapter_module.update_state_file(
             lambda document: state.queue_mirror(document, owner_line)
@@ -316,16 +380,11 @@ async def amessenger_send(args: dict, **_) -> str:
             )
         owner_copy_queued = True
 
-    if not isinstance(result, dict):
-        return "Error: the Message was not sent."
-    result_channel = result.get("channel")
-    result_message = result.get("message")
-    if (
-        isinstance(result_channel, dict)
-        and isinstance(result_channel.get("id"), str)
-        and isinstance(result_message, dict)
-        and isinstance(result_message.get("id"), str)
-    ):
+    if not _usable_send_result(result):
+        return _MALFORMED_SEND
+    result_channel = result["channel"]
+    result_message = result["message"]
+    if isinstance(result_channel, dict) and isinstance(result_message, dict):
         sent_channel_id = result_channel["id"]
         key = state.send_idempotency_key(sent_channel_id, text)
         _update_shared_state(
@@ -360,7 +419,10 @@ async def amessenger_status(args: dict, **_) -> str:
             status_result = await relay.message_status(client, message_id)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         if isinstance(error, relay.RelayRejected) and error.status == 404:
-            return "That Message is gone: every recipient acked it, or it expired."
+            return (
+                "That Message is gone because every recipient acked it or it expired; "
+                "nothing to do."
+            )
         return relay_error(error)
 
     deliveries = status_result.get("deliveries") or []
@@ -428,6 +490,9 @@ async def amessenger_invite(args: dict, **_) -> str:
         async with relay_client(adapter) as client:
             channel = await relay.invite(client, channel_id, agent, text)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        if isinstance(error, relay.RelayRejected) and error.status == 404:
+            _drop_forgotten_channel(adapter, channel_id)
+            return relay.CHANNEL_GONE
         return relay_error(error)
     if adapter is not None:
         adapter.remember_channel(channel)
@@ -465,6 +530,9 @@ async def amessenger_leave(args: dict, **_) -> str:
         async with relay_client(adapter) as client:
             await relay.leave(client, channel_id)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        if isinstance(error, relay.RelayRejected) and error.status == 404:
+            _drop_forgotten_channel(adapter, channel_id)
+            return relay.CHANNEL_GONE
         return relay_error(error)
     if adapter is not None:
         adapter.update_state(lambda document: state.revoke(document, channel_id))
@@ -490,6 +558,9 @@ async def amessenger_remove_member(args: dict, **_) -> str:
         async with relay_client(adapter) as client:
             await relay.remove_member(client, channel_id, agent)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        if isinstance(error, relay.RelayRejected) and error.status == 404:
+            _drop_forgotten_channel(adapter, channel_id)
+            return relay.CHANNEL_GONE
         return relay_error(error)
     return f"Removed {agent} from channel {channel_id}."
 

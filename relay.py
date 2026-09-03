@@ -7,6 +7,11 @@ import httpx
 
 HTTP_TIMEOUT_SECONDS = 10       # every relay call except the long poll
 WAIT_TIMEOUT_SECONDS = 25       # §6.2: GET /v1/inbox/wait?timeout=25
+CHANNEL_GONE = "That Channel no longer exists on the relay."
+MALFORMED_SEND = (
+    "Error: the relay returned an unusable send response, so no Message was sent; "
+    "check relay health and retry."
+)
 
 
 class RelayRejected(Exception):
@@ -199,7 +204,15 @@ async def list_agents(client, q=None) -> list[dict]:
 
 async def list_channels(client) -> list[dict]:
     response = await request(client, "GET", "/v1/channels")
-    return _array(response)
+    channels = _array(response)
+    if not all(
+        isinstance(channel, dict)
+        and isinstance(channel.get("id"), str)
+        and bool(channel["id"])
+        for channel in channels
+    ):
+        raise RelayUnavailable("malformed channels response")
+    return channels
 
 
 def _ambiguous_channel_message(channels: list[dict]) -> str:

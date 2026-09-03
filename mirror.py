@@ -165,12 +165,20 @@ def grant_ended(channel: dict) -> str:
     return f"{GRANT_NOTICE_HEADER_PREFIX}Grant for {label(channel)} ended, back to notify."
 
 
+def grant_ended_channel_gone(channel: dict) -> str:
+    """Format the notice for a Grant removed by relay reconciliation."""
+    return (
+        f"{GRANT_NOTICE_HEADER_PREFIX}Grant for {label(channel)} ended because the "
+        "Channel no longer exists on the relay, back to notify."
+    )
+
+
 def approval_decision_too_late(channel: dict, choice: str) -> str:
     """Tell the Owner that a gateway-less answer arrived after the prompt ended."""
     answer = "approval" if choice == "once" else "denial"
     return (
         f"{NOTICE_HEADER_PREFIX}Your {answer} for Channel {label(channel)} "
-        "arrived too late; no pending approval was waiting."
+        "arrived too late; no pending approval was waiting, so nothing to do."
     )
 
 
@@ -223,7 +231,8 @@ def unknown_notice(channel: dict, kind, text) -> str:
     safe_kind = security.safe_field(kind)
     safe_text = _notice_body(text)
     notice_text = (
-        f"a notice this Agent does not understand yet ({safe_kind})."
+        f"a notice this Agent does not understand yet ({safe_kind}); upgrade "
+        "AMessenger to handle this Delivery."
     )
     if safe_text:
         notice_text += f"\n{safe_text}"

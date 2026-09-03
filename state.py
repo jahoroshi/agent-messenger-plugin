@@ -194,6 +194,56 @@ def revoke(state: dict, channel_id) -> dict:
     return _copy_state(state, channels=channels)
 
 
+def drop_channel(state: dict, channel_id) -> dict:
+    """Forget a Channel and any pending Invite for it."""
+    channels = {
+        key: value for key, value in state["channels"].items() if key != channel_id
+    }
+    pending_invites = {
+        key: value
+        for key, value in state.get("pending_invites", {}).items()
+        if key != channel_id
+    }
+    return _copy_state(
+        state,
+        channels=channels,
+        pending_invites=pending_invites,
+    )
+
+
+def reconcile_channels(state: dict, listed_ids) -> tuple[dict, list[str]]:
+    """Drop Channels absent from one successful relay listing.
+
+    The caller decides whether a listing is trustworthy.  This function only
+    applies the authoritative set it is given and returns the dropped Channel
+    ids so an active Grant can be explained to the Owner.
+    """
+    listed = {channel_id for channel_id in listed_ids if isinstance(channel_id, str)}
+    dropped = sorted(
+        channel_id
+        for channel_id in state["channels"]
+        if channel_id not in listed
+    )
+    channels = {
+        key: value
+        for key, value in state["channels"].items()
+        if key in listed
+    }
+    pending_invites = {
+        key: value
+        for key, value in state.get("pending_invites", {}).items()
+        if key in listed
+    }
+    return (
+        _copy_state(
+            state,
+            channels=channels,
+            pending_invites=pending_invites,
+        ),
+        dropped,
+    )
+
+
 def _pending_invite_snapshot(channel: dict) -> dict:
     if not isinstance(channel, dict):
         raise ValueError("pending Invite Channel must be an object")
