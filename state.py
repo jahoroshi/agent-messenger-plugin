@@ -606,6 +606,91 @@ def append_owner_log(path, text: str, moment: datetime | None = None) -> None:
             log_file.flush()
 
 
+def append_pending_decision(
+    path, channel_id: str, choice: str, moment: datetime | None = None
+) -> None:
+    """Append one gateway-less approval decision under the shared file lock."""
+    if not isinstance(channel_id, str) or not channel_id:
+        raise ValueError("pending decision Channel id must be a non-empty string")
+    if choice not in {"once", "deny"}:
+        raise ValueError("pending decision choice must be once or deny")
+    if moment is None:
+        moment = now()
+    record = json.dumps(
+        {"channel_id": channel_id, "choice": choice, "at": ts(moment)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+    target = Path(path)
+    with file_lock(target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a+", encoding="utf-8") as decision_file:
+            decision_file.seek(0)
+            existing = decision_file.read()
+            decision_file.seek(0, os.SEEK_END)
+            # A process may have crashed halfway through a JSONL record. Keep
+            # that malformed record skippable, but separate the next decision
+            # so it remains parseable and is not lost during the next drain.
+            if existing and not existing.endswith("\n"):
+                decision_file.write("\n")
+            decision_file.write(record)
+            decision_file.flush()
+
+
+def read_pending_decisions(path) -> tuple[list[dict], str]:
+    """Read valid decisions and return them with the exact file snapshot."""
+    target = Path(path)
+    try:
+        with file_lock(target):
+            try:
+                snapshot = target.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return [], ""
+    except (OSError, UnicodeDecodeError):
+        return [], ""
+
+    decisions = []
+    for line in snapshot.splitlines():
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not (
+            isinstance(value, dict)
+            and isinstance(value.get("channel_id"), str)
+            and bool(value["channel_id"])
+            and value.get("choice") in {"once", "deny"}
+            and isinstance(value.get("at"), str)
+        ):
+            continue
+        decisions.append(value)
+    return decisions, snapshot
+
+
+def truncate_pending_decisions(path, consumed_snapshot: str) -> bool:
+    """Remove a consumed snapshot while preserving decisions appended later."""
+    if not consumed_snapshot:
+        return True
+    target = Path(path)
+    with file_lock(target):
+        try:
+            current = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return True
+        except (OSError, UnicodeDecodeError):
+            return False
+        # Writers append under the same sibling lock. If the prefix is still
+        # present, dropping exactly that prefix cannot erase a later decision.
+        if not current.startswith(consumed_snapshot):
+            return False
+        remaining = current[len(consumed_snapshot) :]
+        with target.open("w", encoding="utf-8") as decision_file:
+            decision_file.write(remaining)
+            decision_file.flush()
+    return True
+
+
 def read_owner_log(path, limit: int) -> list[dict]:
     """Read the newest valid Owner log records, skipping malformed lines."""
     target = Path(path)

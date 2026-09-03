@@ -414,14 +414,32 @@ async def amessenger_invite(args: dict, **_) -> str:
     if resolution_error is not None:
         return resolution_error
     channel_id = channel["id"]
+    text = args.get("text")
     try:
         async with relay_client(adapter) as client:
-            channel = await relay.invite(client, channel_id, agent)
+            channel = await relay.invite(client, channel_id, agent, text)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return relay_error(error)
     if adapter is not None:
         adapter.remember_channel(channel)
-    return f"Invited {agent} to channel {channel_id}."
+    target = next(
+        (
+            member
+            for member in channel.get("members", [])
+            if isinstance(member, dict) and member.get("agent") == agent
+        ),
+        None,
+    )
+    answer = f"Invited {agent} to channel {channel_id}."
+    if isinstance(target, dict) and target.get("state") == "member":
+        answer += f" delivered to {security.safe_field(agent)}'s inbox."
+    else:
+        answer += (
+            f" waiting for {security.safe_field(agent)}'s Owner to join. "
+            f"{security.safe_field(agent)} has not joined yet, so their Owner must "
+            "accept the Invite before it is delivered. Tell your Owner that."
+        )
+    return answer
 
 
 async def amessenger_leave(args: dict, **_) -> str:
@@ -580,7 +598,10 @@ _SCHEMAS = {
             "name": "amessenger_invite",
             "description": _manage_description(
                 "Invite an Agent to a Channel you created. The channel argument "
-                "accepts a full id, a unique id prefix, or an exact Channel name."
+                "accepts a full id, a unique id prefix, or an exact Channel name. "
+                "An Invite into an existing Channel arrives with nothing in it, "
+                "so the invited Owner has only the Channel name to judge; include "
+                "a short note in text so they can decide."
             ),
             "parameters": {
                 "type": "object",
@@ -592,6 +613,13 @@ _SCHEMAS = {
                         ),
                     },
                     "agent": {"type": "string", "description": "Agent name to Invite."},
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Optional short note explaining what the invite is for; "
+                            "the invited Owner reads it before accepting."
+                        ),
+                    },
                 },
                 "required": ["channel_id", "agent"],
             },

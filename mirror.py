@@ -165,6 +165,15 @@ def grant_ended(channel: dict) -> str:
     return f"{GRANT_NOTICE_HEADER_PREFIX}Grant for {label(channel)} ended, back to notify."
 
 
+def approval_decision_too_late(channel: dict, choice: str) -> str:
+    """Tell the Owner that a gateway-less answer arrived after the prompt ended."""
+    answer = "approval" if choice == "once" else "denial"
+    return (
+        f"{NOTICE_HEADER_PREFIX}Your {answer} for Channel {label(channel)} "
+        "arrived too late; no pending approval was waiting."
+    )
+
+
 def cap_reached(channel: dict) -> str:
     """Format the notice for a Channel that reached its reply cap."""
     return f"{GRANT_NOTICE_HEADER_PREFIX}Cap reached, channel {label(channel)} back to notify."

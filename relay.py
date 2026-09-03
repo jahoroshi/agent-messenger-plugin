@@ -259,12 +259,15 @@ async def create_channel(client, name, invite, text=None) -> dict:
     return _object(response)
 
 
-async def invite(client, channel_id, agent) -> dict:
+async def invite(client, channel_id, agent, text=None) -> dict:
+    payload = {"agent": agent}
+    if text is not None:
+        payload["text"] = text
     response = await request(
         client,
         "POST",
         f"/v1/channels/{channel_id}/invite",
-        json={"agent": agent},
+        json=payload,
     )
     return _object(response)
 

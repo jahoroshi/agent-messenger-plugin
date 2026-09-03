@@ -385,7 +385,11 @@ def _waiting_approvals_message(
     descriptions = []
     for _session_key, entry in entries:
         channel_id = entry["chat_id"]
-        channel = adapter.known_channel(channel_id)
+        channel = (
+            adapter.known_channel(channel_id)
+            if adapter is not None
+            else {"id": channel_id, "name": None}
+        )
         channel_name = security.safe_field(channel.get("name"), fallback="unnamed")
         descriptions.append(
             f"`{mirror.handle(channel_id)}` `{channel_name}`"
@@ -398,11 +402,6 @@ def _waiting_approvals_message(
 
 
 async def _approval(adapter, choice: str, approval_handle: str | None = None) -> str:
-    if adapter is None:
-        return (
-            "Approvals are resolved by the gateway and there is none in this process. "
-            "Run /amsg approve in your Owner Chat."
-        )
     entries = _pending_entries(adapter)
     if not entries:
         return "Nothing is waiting for your approval."
@@ -410,7 +409,7 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
     if approval_handle is None:
         if len(entries) != 1:
             return _waiting_approvals_message(adapter, choice, entries)
-        session_key = entries[0][0]
+        selected = entries[0]
     else:
         matches = [
             item
@@ -421,7 +420,16 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
             return f"No pending approval matches `{approval_handle}`."
         if len(matches) != 1:
             return _waiting_approvals_message(adapter, choice, matches)
-        session_key = matches[0][0]
+        selected = matches[0]
+
+    session_key, entry = selected
+    if adapter is None:
+        try:
+            adapter_module.append_pending_decision_file(entry["chat_id"], choice)
+        except (OSError, ValueError, RuntimeError) as error:
+            logger.warning("[amessenger] could not record approval decision: %s", error)
+            return "Could not record the approval decision. Try again."
+        return "recorded; the gateway applies it within a few seconds"
 
     try:
         from tools.approval import resolve_gateway_approval

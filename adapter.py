@@ -48,6 +48,8 @@ SEND_IDEMPOTENCY_SECONDS = state.SEND_IDEMPOTENCY_SECONDS
 CHANNELS_MAX = 200  # Remembered Channel records used for Owner-facing labels.
 PENDING_MIRRORS_MAX = state.PENDING_MIRRORS_MAX
 OWNER_POST_TIMEOUT_SECONDS = 15
+PENDING_DECISION_POLL_SECONDS = 5
+PENDING_DECISIONS_FILENAME = "pending_decisions.jsonl"
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail tools
 NO_TOOLS_SENTINEL = "amessenger_none"
@@ -179,6 +181,17 @@ def owner_log_path_for_process() -> Path:
     return hermes_home() / STATE_DIRNAME / OWNER_LOG_FILENAME
 
 
+def pending_decisions_path_for_process() -> Path:
+    """Return the shared gateway-less approval hand-off path."""
+    return hermes_home() / STATE_DIRNAME / PENDING_DECISIONS_FILENAME
+
+
+def append_pending_decision_file(channel_id: str, choice: str) -> None:
+    state.append_pending_decision(
+        pending_decisions_path_for_process(), channel_id, choice
+    )
+
+
 def read_state_file() -> dict:
     """Read the shared state without requiring a constructed platform adapter."""
     return state.load(state_path_for_process())
@@ -288,6 +301,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._state_lock = threading.Lock()
         self._channels: "OrderedDict[str, dict]" = OrderedDict()
         self._pending_mirrors: list[str] = []
+        self._last_pending_decisions_poll = None
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -866,8 +880,16 @@ class AMessengerAdapter(BasePlatformAdapter):
                     await self.after_publish()
                 started = monotonic()
                 deliveries = await self.poll_once()
-                if not deliveries and monotonic() - started < MIN_POLL_CYCLE_SECONDS:
+                finished = monotonic()
+                if not deliveries and finished - started < MIN_POLL_CYCLE_SECONDS:
                     await sleep(MIN_POLL_CYCLE_SECONDS)
+                if (
+                    self._last_pending_decisions_poll is None
+                    or finished - self._last_pending_decisions_poll
+                    >= PENDING_DECISION_POLL_SECONDS
+                ):
+                    await self.poll_pending_decisions()
+                    self._last_pending_decisions_poll = finished
                 index = 0
             except asyncio.CancelledError:
                 raise
@@ -906,6 +928,66 @@ class AMessengerAdapter(BasePlatformAdapter):
                 self._card = None
                 index += 1
                 await sleep(wait)
+
+    async def poll_pending_decisions(self) -> None:
+        """Apply gateway-less approval decisions and consume their snapshot."""
+        path = pending_decisions_path_for_process()
+        decisions, snapshot = state.read_pending_decisions(path)
+        if not snapshot:
+            return
+
+        for decision in decisions:
+            await self._apply_pending_decision(decision)
+        if not state.truncate_pending_decisions(path, snapshot):
+            logger.warning(
+                "[amessenger] pending decision file changed while applying; "
+                "leaving it intact"
+            )
+
+    async def _apply_pending_decision(self, decision: dict) -> None:
+        channel_id = decision["channel_id"]
+        choice = decision["choice"]
+        pending = self.state().get("pending_approvals", {})
+        matches = sorted(
+            (
+                (session_key, entry)
+                for session_key, entry in pending.items()
+                if isinstance(entry, dict) and entry.get("chat_id") == channel_id
+            ),
+            key=lambda item: (item[1].get("created_at", ""), item[0]),
+        )
+        if not matches:
+            notice = mirror.approval_decision_too_late(
+                self.known_channel(channel_id), choice
+            )
+            await self.mirror_or_queue(notice)
+            logger.info(
+                "[amessenger] dropped late approval decision for Channel %s",
+                channel_id,
+            )
+            return
+
+        session_key = matches[0][0]
+        popped = None
+
+        def pop_approval(document):
+            nonlocal popped
+            updated, popped = state.pop_pending_approval(
+                document, session_key=session_key
+            )
+            return updated
+
+        self.update_state(pop_approval)
+        if popped is None:
+            return
+        from tools.approval import resolve_gateway_approval
+
+        resolved = resolve_gateway_approval(popped["session_key"], choice)
+        line = (
+            f"Resolved {resolved} approval(s) for Channel "
+            f"{mirror.label(self.known_channel(channel_id))}."
+        )
+        await self.mirror_or_queue(line)
 
     async def after_publish(self) -> None:
         if self.state()["welcomed"]:
