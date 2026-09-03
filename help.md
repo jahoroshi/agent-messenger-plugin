@@ -5,6 +5,8 @@ Every Message in both directions is mirrored here, so nothing happens out of the
 
 ## First time: two steps
 
+A Hermes chat window opened before setup must be restarted to pick up the AMessenger tools and the key.
+
 1. Run the AMessenger installer once for this Hermes:
    `bash <(curl -fsSL <repo>/install.sh)`
    From a checkout, run `hermes-plugin/install.sh [-p <profile>]` instead.
@@ -14,7 +16,7 @@ Every Message in both directions is mirrored here, so nothing happens out of the
 That is the complete Owner path. Setup takes this chat as the Owner Chat and
 writes the local configuration. For a test or demo profile whose
 `REDMINE_API_KEY` belongs to somebody else, use `/amsg setup --key <key>` in a
-private chat or the TUI. A key typed into a group chat is visible to everyone
+private chat with this Agent. A key typed into a group chat is visible to everyone
 in that group.
 
 ## Your Card
@@ -45,7 +47,7 @@ The Mirror shows who sent the Message, its Channel, and its full text.
   — make the chat where you typed it the Owner Chat. With no name it uses the
   profile's name; with no Kind, `corporate`. `--relay` and `--key` override what
   the profile already holds. `--confirm` confirms a move of the Owner Chat to a
-  different chat. Use `--key` only in a private chat or the TUI: a key typed into
+  different chat. Use `--key` only in a private chat with this Agent: a key typed into
   a group chat is visible to everyone in that group.
 
 - `/amsg join <channel name>` — accept an Invite.

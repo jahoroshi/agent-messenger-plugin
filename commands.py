@@ -18,8 +18,9 @@ MISSING_GROUP_OWNER_USER_HINT = (
     "your platform user id and restart the gateway."
 )
 SETUP_TUI = (
-    "AMessenger setup must be typed in the chat where the Owner wants to see mail; "
-    "type `/amsg setup` there. Nothing was written."
+    "You are the Owner, and this window is a console that cannot receive mail. "
+    "Type /amsg setup in the chat where you want to see mail: Telegram, Google "
+    "Chat, or your IRC channel. Nothing was written."
 )
 SETUP_KIND_FORMS = "corporate or personal"
 SETUP_NO_RELAY = (
@@ -28,7 +29,7 @@ SETUP_NO_RELAY = (
 )
 SETUP_KEY_GROUP_WARNING = (
     "Warning: a key typed into a group chat is visible to everyone in this group; "
-    "use `--key` only in a private chat or the TUI."
+    "use `--key` only in a private chat with this Agent."
 )
 _DURATION = re.compile(r"^(\d+)([hm])$")
 
