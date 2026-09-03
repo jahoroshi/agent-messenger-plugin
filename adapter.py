@@ -486,6 +486,8 @@ class AMessengerAdapter(BasePlatformAdapter):
     def set_state(self, new_state: dict) -> None:
         with self._state_lock:
             new_state = state.ensure_authenticity_secret(new_state)
+            for channel in self._channels.values():
+                new_state = state.remember_channel(new_state, channel)
             state.save(self.state_path(), new_state)
             self._state = new_state
             self._pending_mirrors = [
@@ -657,35 +659,32 @@ class AMessengerAdapter(BasePlatformAdapter):
 
     def remember_channel(self, channel: dict) -> None:
         """Remember the latest relay Channel record for Owner-facing notices."""
-        channel_id = channel["id"]
+        channel_id = channel.get("id") if isinstance(channel, dict) else None
+        if not isinstance(channel_id, str) or not channel_id:
+            return
         channel = {**channel}
-        if not str(channel.get("name") or "").strip():
-            channel["name"] = self._peer_name(channel)
         self._channels.pop(channel_id, None)
         self._channels[channel_id] = channel
         while len(self._channels) > CHANNELS_MAX:
             self._channels.popitem(last=False)
-
-    def _peer_name(self, channel: dict) -> str | None:
-        """Use the other Agent as a useful name when a relay name is absent."""
-        own_agent = str((self._settings or read_settings()).get("agent") or "")
-        members = channel.get("members")
-        if isinstance(members, list):
-            for member in members:
-                if not isinstance(member, dict):
-                    continue
-                agent = str(member.get("agent") or "").strip()
-                if agent and agent != own_agent:
-                    return agent
-        creator = str(channel.get("creator") or "").strip()
-        if creator and creator != own_agent:
-            return creator
-        return None
+        self.update_state(lambda document: state.remember_channel(document, channel))
 
     def known_channel(self, channel_id: str) -> dict:
-        """Return a remembered Channel, or a renderable unnamed fallback."""
+        """Return a remembered Channel, or a truthful name-unavailable fallback."""
         channel = self._channels.get(channel_id)
-        return dict(channel) if channel is not None else {"id": channel_id, "name": None}
+        if channel is not None:
+            return dict(channel)
+        try:
+            record = self.state().get("channels", {}).get(channel_id)
+        except (OSError, state.StateFileCorrupt):
+            record = None
+        if isinstance(record, dict):
+            return {
+                "id": channel_id,
+                "name": record.get("name"),
+                "topic": record.get("topic"),
+            }
+        return {"id": channel_id, "name": None, "topic": None}
 
     async def poll_once(self) -> list[dict]:
         deliveries = await self.fetch_deliveries()
@@ -704,12 +703,12 @@ class AMessengerAdapter(BasePlatformAdapter):
         delivery_id = delivery["id"]
         message = delivery["message"]
         channel = delivery["channel"]
-        self.remember_channel(channel)
         sender_card = delivery.get("sender_card")
         kind = message["kind"]
         logger.info("[amessenger] Delivery %s kind=%s", delivery_id, kind)
 
         if self.already_processed(delivery_id):
+            self.remember_channel(channel)
             logger.debug("[amessenger] Delivery %s already processed", delivery_id)
             return True
 
@@ -717,6 +716,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             text = mirror.invite(channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
             if processed:
+                self.remember_channel(channel)
                 self.update_state(
                     lambda document: state.remember_pending_invite(
                         document, channel
@@ -725,6 +725,8 @@ class AMessengerAdapter(BasePlatformAdapter):
         elif kind in {"joined", "left", "closed", "removed"}:
             text = mirror.notice(channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
+            if processed:
+                self.remember_channel(channel)
             if processed and kind in {"closed", "removed"}:
                 self.update_state(
                     lambda document: state.drop_pending_invite(
@@ -739,6 +741,8 @@ class AMessengerAdapter(BasePlatformAdapter):
             logger.warning("[amessenger] unknown Delivery kind=%s", kind)
             text = mirror.unknown_notice(channel, kind, message.get("text", ""))
             processed = await self._mirror_delivery(delivery, text)
+            if processed:
+                self.remember_channel(channel)
 
         if processed:
             self.remember(delivery_id)
@@ -774,6 +778,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         text = mirror.incoming(sender_card, channel, message_text, policy)
         if not await self._mirror_delivery(delivery, text):
             return False
+        self.remember_channel(channel)
         self.update_state(
             lambda document: state.note_incoming(document, channel["id"], state.now())
         )
@@ -787,7 +792,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         sender = message["sender"] or "unknown"
         source = self.build_source(
             chat_id=channel["id"],
-            chat_name=channel.get("name") or channel["id"],
+            chat_name=mirror.channel_name(channel),
             chat_type="dm",
             user_id=sender,
             user_name=sender,
@@ -1132,11 +1137,17 @@ class AMessengerAdapter(BasePlatformAdapter):
                 updated, moment, timeout_seconds
             )
             if listed_ids is not None:
+                grant_ids = {
+                    channel_id
+                    for channel_id, record in updated.get("channels", {}).items()
+                    if isinstance(record, dict)
+                    and record.get("grant") in {"single", "standing"}
+                }
                 updated, forgotten = state.reconcile_channels(updated, listed_ids)
                 forgotten_grants = [
                     channel_id
                     for channel_id in forgotten
-                    if channel_id not in ended
+                    if channel_id not in ended and channel_id in grant_ids
                 ]
             return updated
 
@@ -1265,7 +1276,6 @@ class AMessengerAdapter(BasePlatformAdapter):
                         self.known_channel(chat_id),
                         command,
                         description,
-                        mirror.handle(chat_id),
                     )
                 )
                 return result
@@ -1281,7 +1291,7 @@ class AMessengerAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Post and record the text-card approval fallback."""
         card = mirror.approval_request(
-            self.known_channel(chat_id), command, description, mirror.handle(chat_id)
+            self.known_channel(chat_id), command, description
         )
         # Approval cards use the same marked/logged Owner-Chat path as Mirrors.
         # Approval cards are also retried by the approval request itself; do
@@ -1291,7 +1301,11 @@ class AMessengerAdapter(BasePlatformAdapter):
         ):
             self.update_state(
                 lambda document: state.add_pending_approval(
-                    document, session_key, chat_id, state.now()
+                    document,
+                    session_key,
+                    chat_id,
+                    state.now(),
+                    channel=self.known_channel(chat_id),
                 )
             )
             return SendResult(success=True)
@@ -1667,4 +1681,4 @@ class AMessengerAdapter(BasePlatformAdapter):
             logger.info("[amessenger] delivered %d queued Owner-facing lines", delivered)
 
     async def get_chat_info(self, chat_id: str) -> dict:
-        return {"name": chat_id, "type": "dm"}
+        return {"name": mirror.channel_name(self.known_channel(chat_id)), "type": "dm"}

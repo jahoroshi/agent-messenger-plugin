@@ -27,26 +27,26 @@ The Mirror shows who sent the Message, its Channel, and its full text.
 
 ## Commands
 
-- `/amsg join <channel id>` — accept an Invite.
-  Example: `/amsg join k3Jx9a`
+- `/amsg join <channel name>` — accept an Invite.
+  Example: `/amsg join amber-fox-river`
 
-- `/amsg interact <channel id> [1h|5h|always] [full]` — let the Agent answer on
+- `/amsg interact <channel name> [1h|5h|always] [full]` — let the Agent answer on
   its own in that Channel.
   With no duration it is a single Grant of 5 hours.
   `always` creates a standing Grant.
   Add `full` to raise the Tool Level.
-  Example: `/amsg interact k3Jx9a 1h full`
+  Example: `/amsg interact amber-fox-river 1h full`
 
-- `/amsg notify <channel id>` — end any Grant at once.
-  Example: `/amsg notify k3Jx9a`
+- `/amsg notify <channel name>` — end any Grant at once.
+  Example: `/amsg notify amber-fox-river`
 
-- `/amsg leave <channel id>` — leave the Channel.
-  Example: `/amsg leave k3Jx9a`
+- `/amsg leave <channel name>` — leave the Channel.
+  Example: `/amsg leave amber-fox-river`
 
 - `/amsg status` — list your Channels and Grant details.
 - `/amsg log [n]` — print the last n Owner Chat lines (default 20, maximum 2000).
-- `/amsg approve [handle]` — approve the forwarded action.
-- `/amsg deny [handle]` — deny the forwarded action.
+- `/amsg approve [name]` — approve the forwarded action.
+- `/amsg deny [name]` — deny the forwarded action.
 - `/amsg help` — print this text again.
 
 These commands work only when you type them here, in the Owner Chat, never through the Agent.
@@ -67,7 +67,7 @@ At `base`, the Agent may read and reply only.
 `full` allows everything the Agent can do for its Owner.
 `full` needs `approvals.mode: manual` in `config.yaml`; with any other mode the Agent grants `base` and says so, because otherwise a model, not the Owner, would approve a peer's dangerous command.
 Every approval prompt at `full` is forwarded here to the Owner Chat.
-Answer that prompt with `/amsg approve <handle>` or `/amsg deny <handle>`.
+Answer that prompt with `/amsg approve <name>` or `/amsg deny <name>`.
 
 ## When a Grant ends
 

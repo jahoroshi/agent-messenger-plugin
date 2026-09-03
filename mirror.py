@@ -7,8 +7,8 @@ from . import security
 
 
 logger = logging.getLogger("amessenger")
-HANDLE_LENGTH = 6  # §6.5: Owners type short Channel handles, not full ids.
 NOTICE_BODY_LIMIT = 300
+UNKNOWN_CHANNEL_NAME = "Channel name unavailable"
 INCOMING_HEADER_PREFIX = "📨 AMessenger · from "
 OUTGOING_HEADER_PREFIX = "📤 AMessenger · to "
 NOTICE_HEADER_PREFIX = "🔔 AMessenger · "
@@ -77,18 +77,17 @@ def quote_body(text) -> str:
     return "\n".join(f"{BODY_QUOTE}{line}" for line in body.split("\n"))
 
 
-def handle(channel_id: str) -> str:
-    """Return the short handle shown to the Owner for a Channel."""
-    return security.safe_field(channel_id)[:HANDLE_LENGTH]
+def channel_name(channel: dict | None) -> str:
+    """Return the only human-facing Channel identifier."""
+    value = channel.get("name") if isinstance(channel, dict) else None
+    return security.safe_field(value, fallback=UNKNOWN_CHANNEL_NAME)
 
 
 def label(channel: dict) -> str:
-    """Return a Channel's Owner-facing name and short handle."""
-    channel_id = security.safe_field(channel.get("id"))
-    short_handle = handle(channel_id)
-    suffix = f"({short_handle}…)"
-    name = security.safe_field(channel.get("name"), fallback="")
-    return f"{name} {suffix}" if name else suffix
+    """Return a Channel's safe human-facing name and optional topic."""
+    name = channel_name(channel)
+    topic = security.safe_field(channel.get("topic"), fallback="")
+    return f"{name} ({topic})" if topic else name
 
 
 def _sender_details(sender_card: dict | None) -> tuple[str, str, str]:
@@ -115,7 +114,7 @@ def incoming(sender_card, channel, text, policy) -> str:
     if policy == "notify":
         rendered += (
             f"\n— notify mode. To let me answer on my own: /amsg interact "
-            f"{handle(channel['id'])} 1h   (add \"full\" for all tools)"
+            f"{channel_name(channel)} 1h   (add \"full\" for all tools)"
         )
     return rendered
 
@@ -131,13 +130,9 @@ def incoming_transcript(sender_card, channel, text) -> str:
     )
 
 
-def approval_request(
-    channel: dict, command: str, description: str, handle: str | None = None
-) -> str:
+def approval_request(channel: dict, command: str, description: str) -> str:
     """Format a dangerous-command approval for the Owner Chat."""
-    channel_handle = security.safe_field(handle, fallback="", limit=HANDLE_LENGTH)
-    if not channel_handle:
-        channel_handle = security.safe_field(channel.get("id"))[:HANDLE_LENGTH]
+    name = channel_name(channel)
     description = security.safe_field(description, fallback="")
     lines = [
         f"{APPROVAL_HEADER_PREFIX}channel {label(channel)} asked me to run a command "
@@ -148,8 +143,8 @@ def approval_request(
     lines.extend(
         (
             f"    {command}",
-            f"— Allow once: /amsg approve {channel_handle}     "
-            f"Refuse: /amsg deny {channel_handle}     Silence refuses it.",
+            f"— Allow once: /amsg approve {name}     "
+            f"Refuse: /amsg deny {name}     Silence refuses it.",
         )
     )
     return "\n".join(lines)
@@ -191,10 +186,9 @@ def _hide_full_channel_label(channel: dict, text) -> str:
     """Hide a relay-written full Channel label already shown by our header."""
     if not isinstance(text, str):
         return ""
-    channel_id = security.safe_field(channel.get("id"))
-    channel_name = security.safe_field(channel.get("name"), fallback="")
-    full_label = f"{channel_name} ({channel_id})" if channel_name else channel_id
-    leading_fragments = (f"channel {full_label}", full_label)
+    name = channel_name(channel)
+    full_label = label(channel)
+    leading_fragments = (f"channel {full_label}", full_label, f"channel {name}", name)
     for fragment in leading_fragments:
         if text.startswith(fragment):
             return text[len(fragment) :].lstrip(" :—-\n")
@@ -216,7 +210,7 @@ def invite(channel, text) -> str:
     return (
         f"{NOTICE_HEADER_PREFIX}{creator} invites you to channel {label(channel)}. "
         f"First message:\n{quote_body(relay_text)}\n"
-        f"— Join: /amsg join {handle(channel['id'])}     Ignore: do nothing"
+        f"— Join: /amsg join {channel_name(channel)}     Ignore: do nothing"
     )
 
 

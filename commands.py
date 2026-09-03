@@ -168,7 +168,7 @@ def parse_interact(tokens) -> tuple[str, float | None, str] | None:
 
 
 async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
-    """Resolve an Owner-facing Channel id, prefix, or exact name."""
+    """Resolve an Owner-facing Channel name, prefix, or exact topic."""
     try:
         async with relay_client(adapter) as client:
             channels = await relay.list_channels(client)
@@ -179,13 +179,15 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     combined = []
     seen_ids = set()
     for channel in [*channels, *pending_invites.values()]:
+        if not isinstance(channel, dict):
+            continue
         channel_id = channel.get("id")
         if channel_id in seen_ids:
             continue
         seen_ids.add(channel_id)
         combined.append(channel)
     channel, error = relay.resolve_channel(combined, token)
-    if channel is not None or error != f"No Channel here starts with {token}.":
+    if channel is not None or not (error or "").startswith("No Channel here is named "):
         return channel, error
 
     current_ids = {channel.get("id") for channel in channels}
@@ -195,11 +197,17 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
     for channel_id in document.get("channels", {}):
         if channel_id in current_ids or channel_id in pending_ids:
             continue
-        stale.append(
-            adapter.known_channel(channel_id)
-            if adapter is not None
-            else {"id": channel_id, "name": None}
-        )
+        if adapter is not None:
+            stale.append(adapter.known_channel(channel_id))
+        else:
+            record = document.get("channels", {}).get(channel_id, {})
+            stale.append(
+                {
+                    "id": channel_id,
+                    "name": record.get("name"),
+                    "topic": record.get("topic"),
+                }
+            )
     forgotten, _forgotten_error = relay.resolve_channel(stale, token)
     if forgotten is None:
         return channel, error
@@ -375,11 +383,11 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
             f"'{approval_mode}', so a dangerous command from a peer would be approved "
             "by a model instead of by you. To use full, set approvals.mode: manual "
             "in config.yaml and restart the gateway, then grant it again.\n"
-            f"End it any time with /amsg notify {mirror.handle(channel['id'])}."
+            f"End it any time with /amsg notify {mirror.channel_name(channel)}."
         )
     return (
         f"{mirror.label(channel)} is now interact, Tool Level {level}, {grant_period}. "
-        f"End it any time with `/amsg notify {mirror.handle(channel['id'])}`."
+        f"End it any time with `/amsg notify {mirror.channel_name(channel)}`."
     )
 
 
@@ -434,8 +442,8 @@ def _argument_error(command: str) -> str:
         "notify": "<ch>",
         "leave": "<ch>",
         "status": "no arguments",
-        "approve": "[handle]",
-        "deny": "[handle]",
+        "approve": "[name]",
+        "deny": "[name]",
         "help": "no arguments",
     }
     return f"Accepted forms for {command}: {accepted[command]}."
@@ -456,7 +464,7 @@ async def _status(adapter) -> str:
         label = mirror.label(channel)
         if _is_invited(channel, agent_name):
             lines.append(
-                f"{label} — invited. Join with /amsg join {mirror.handle(channel['id'])}"
+                f"{label} — invited. Join with /amsg join {mirror.channel_name(channel)}"
             )
             continue
         record = state.channel(_read_state(adapter), channel["id"])
@@ -472,8 +480,30 @@ async def _status(adapter) -> str:
     return "\n".join(lines)
 
 
-def _pending_label(adapter, channel_id) -> str:
-    return mirror.label(adapter.known_channel(channel_id))
+def _pending_label(adapter, channel_id, entry=None) -> str:
+    if adapter is not None:
+        channel = _pending_channel(adapter, channel_id, entry)
+        return mirror.label(channel)
+    channel = _pending_channel(adapter, channel_id, entry)
+    return mirror.label(channel)
+
+
+def _pending_channel(adapter, channel_id, entry=None) -> dict:
+    if adapter is not None:
+        channel = adapter.known_channel(channel_id)
+    else:
+        record = _read_state(adapter).get("channels", {}).get(channel_id, {})
+        channel = {
+            "id": channel_id,
+            "name": record.get("name"),
+            "topic": record.get("topic"),
+        }
+    if isinstance(entry, dict):
+        if channel.get("name") is None and "name" in entry:
+            channel["name"] = entry.get("name")
+        if channel.get("topic") is None and "topic" in entry:
+            channel["topic"] = entry.get("topic")
+    return channel
 
 
 def _pending_entries(adapter) -> list[tuple[str, dict]]:
@@ -490,40 +520,45 @@ def _waiting_approvals_message(
     descriptions = []
     for _session_key, entry in entries:
         channel_id = entry["chat_id"]
-        channel = (
-            adapter.known_channel(channel_id)
-            if adapter is not None
-            else {"id": channel_id, "name": None}
-        )
-        channel_name = security.safe_field(channel.get("name"), fallback="unnamed")
-        descriptions.append(
-            f"`{mirror.handle(channel_id)}` `{channel_name}`"
-        )
-    example_handle = mirror.handle(entries[0][1]["chat_id"])
+        channel = _pending_channel(adapter, channel_id, entry)
+        descriptions.append(f"`{mirror.label(channel)}`")
+    example_name = mirror.channel_name(
+        _pending_channel(adapter, entries[0][1]["chat_id"], entries[0][1])
+    )
     return (
         f"There are {len(entries)} waiting: {', '.join(descriptions)}. "
-        f"Say which, for example `/amsg {choice} {example_handle}`."
+        f"Say which, for example `/amsg {choice} {example_name}`."
     )
 
 
-async def _approval(adapter, choice: str, approval_handle: str | None = None) -> str:
+async def _approval(adapter, choice: str, approval_name: str | None = None) -> str:
     entries = _pending_entries(adapter)
     if not entries:
         return "Nothing is waiting for your approval."
 
-    if approval_handle is None:
+    if approval_name is None:
         if len(entries) != 1:
             return _waiting_approvals_message(adapter, choice, entries)
         selected = entries[0]
     else:
-        matches = [
-            item
-            for item in entries
-            if str(item[1].get("chat_id", "")).startswith(approval_handle)
-        ]
+        pending_channels = []
+        for session_key, entry in entries:
+            channel = _pending_channel(adapter, entry["chat_id"], entry)
+            pending_channels.append({**channel, "_session_key": session_key})
+        selected_channel, resolution_error = relay.resolve_channel(
+            pending_channels, approval_name
+        )
+        matches = []
+        if selected_channel is not None:
+            session_key = selected_channel.get("_session_key")
+            matches = [item for item in entries if item[0] == session_key]
+        elif resolution_error is not None and not resolution_error.startswith(
+            "No Channel here is named "
+        ):
+            return resolution_error
         if not matches:
             return (
-                f"No pending approval matches `{approval_handle}`; use a handle shown by "
+                f"No pending approval matches `{approval_name}`; use a Channel name shown by "
                 "/amsg approve or /amsg deny."
             )
         if len(matches) != 1:
@@ -565,7 +600,7 @@ async def _approval(adapter, choice: str, approval_handle: str | None = None) ->
     if popped is None:
         return "Nothing is waiting for your approval."
     resolved = resolve_gateway_approval(popped["session_key"], choice)
-    label = _pending_label(adapter, popped["chat_id"])
+    label = _pending_label(adapter, popped["chat_id"], popped)
     return f"Resolved {resolved} approval(s) for Channel {label}."
 
 
@@ -605,9 +640,9 @@ def make_handler():
         if command in {"approve", "deny"}:
             if len(tokens) not in {1, 2}:
                 return _argument_error(command)
-            approval_handle = tokens[1] if len(tokens) == 2 else None
+            approval_name = tokens[1] if len(tokens) == 2 else None
             choice = "once" if command == "approve" else "deny"
-            return await _approval(adapter, choice, approval_handle)
+            return await _approval(adapter, choice, approval_name)
         return HELP_TEXT
 
     return handle

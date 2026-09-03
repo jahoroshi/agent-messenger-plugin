@@ -95,7 +95,12 @@ def ensure_authenticity_secret(document: dict) -> dict:
 
 
 def _copy_record(record: dict) -> dict:
-    return {**record, "replies": [*record.get("replies", [])]}
+    return {
+        **record,
+        "name": record.get("name"),
+        "topic": record.get("topic"),
+        "replies": [*record.get("replies", [])],
+    }
 
 
 def _copy_channels(channels: dict) -> dict:
@@ -107,7 +112,10 @@ def _copy_pending(pending: dict) -> dict:
 
 
 def _copy_pending_invites(pending_invites: dict) -> dict:
-    return {key: {**entry} for key, entry in pending_invites.items()}
+    return {
+        key: {**entry, "topic": entry.get("topic")}
+        for key, entry in pending_invites.items()
+    }
 
 
 def _bound_pending_invites(pending_invites: dict) -> dict:
@@ -165,7 +173,7 @@ def _copy_state(
 
 
 def _default_channel() -> dict:
-    return dict(policy="notify", level="base", grant=None, granted_at=None,
+    return dict(name=None, topic=None, policy="notify", level="base", grant=None, granted_at=None,
                 expires_at=None, last_incoming_at=None, replies=[])
 
 
@@ -183,10 +191,39 @@ def grant(state: dict, channel_id, *, kind, level, duration_seconds, moment) -> 
         raise ValueError("invalid Grant kind or Tool Level")
     granted_at = ts(moment)
     expires_at = None if kind == "standing" else ts(moment + timedelta(seconds=duration_seconds))
-    record = {"policy": "interact", "level": level, "grant": kind, "granted_at": granted_at,
-              "expires_at": expires_at, "last_incoming_at": granted_at, "replies": []}
+    existing = state["channels"].get(channel_id, _default_channel())
+    record = {
+        "name": existing.get("name"),
+        "topic": existing.get("topic"),
+        "policy": "interact",
+        "level": level,
+        "grant": kind,
+        "granted_at": granted_at,
+        "expires_at": expires_at,
+        "last_incoming_at": granted_at,
+        "replies": [],
+    }
     channels = {**state["channels"], channel_id: record}
     return _copy_state(state, channels=channels)
+
+
+def remember_channel(state: dict, channel: dict) -> dict:
+    """Persist the relay-owned name and topic alongside a Channel's policy."""
+    if not isinstance(channel, dict):
+        return _copy_state(state)
+    channel_id = channel.get("id")
+    if not isinstance(channel_id, str) or not channel_id:
+        return _copy_state(state)
+    existing = state["channels"].get(channel_id, _default_channel())
+    record = _copy_record(existing)
+    if "name" in channel:
+        record["name"] = channel.get("name")
+    if "topic" in channel:
+        record["topic"] = channel.get("topic")
+    return _copy_state(
+        state,
+        channels={**state["channels"], channel_id: record},
+    )
 
 
 def revoke(state: dict, channel_id) -> dict:
@@ -253,7 +290,10 @@ def _pending_invite_snapshot(channel: dict) -> dict:
         raise ValueError("pending Invite Channel id must be a non-empty string")
     if name is not None and not isinstance(name, str):
         raise ValueError("pending Invite Channel name must be a string or null")
-    return {"id": channel_id, "name": name}
+    topic = channel.get("topic")
+    if topic is not None and not isinstance(topic, str):
+        raise ValueError("pending Invite Channel topic must be a string or null")
+    return {"id": channel_id, "name": name, "topic": topic}
 
 
 def _pending_invite_is_valid(key, entry) -> bool:
@@ -264,6 +304,7 @@ def _pending_invite_is_valid(key, entry) -> bool:
         and entry.get("id") == key
         and "name" in entry
         and (entry["name"] is None or isinstance(entry["name"], str))
+        and (entry.get("topic") is None or isinstance(entry.get("topic"), str))
     )
 
 
@@ -437,6 +478,10 @@ def _timestamps_are_valid(record: dict) -> bool:
 
 
 def _grant_ended(record: dict, moment: datetime) -> bool:
+    # A remembered Channel can exist without a Grant.  Its name and topic are
+    # still useful metadata and must not be mistaken for an expired Grant.
+    if record.get("grant") is None:
+        return False
     if not _timestamps_are_valid(record):
         return True
     if record["grant"] == "standing":
@@ -449,7 +494,12 @@ def _grant_ended(record: dict, moment: datetime) -> bool:
 
 
 def expire_grants(state: dict, moment) -> tuple[dict, list[str]]:
-    ended = sorted(key for key, value in state["channels"].items() if _grant_ended(value, moment))
+    ended = sorted(
+        key
+        for key, value in state["channels"].items()
+        if value.get("grant") in {"single", "standing"}
+        and _grant_ended(value, moment)
+    )
     channels = {key: value for key, value in state["channels"].items() if key not in ended}
     return _copy_state(state, channels=channels), ended
 
@@ -458,8 +508,14 @@ def set_welcomed(state: dict, value=True) -> dict:
     return {**_copy_state(state), "welcomed": value}
 
 
-def add_pending_approval(state: dict, session_key, chat_id, moment) -> dict:
-    pending = {**state["pending_approvals"], session_key: {"chat_id": chat_id, "created_at": ts(moment)}}
+def add_pending_approval(
+    state: dict, session_key, chat_id, moment, channel: dict | None = None
+) -> dict:
+    entry = {"chat_id": chat_id, "created_at": ts(moment)}
+    if isinstance(channel, dict):
+        entry["name"] = channel.get("name")
+        entry["topic"] = channel.get("topic")
+    pending = {**state["pending_approvals"], session_key: entry}
     return _copy_state(state, pending=pending)
 
 
@@ -562,23 +618,17 @@ def load(path) -> dict:
         return empty_state()
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise StateFileCorrupt(f"invalid state file: {target}") from error
-    pending_mirrors = (
-        document.get("pending_mirrors", []) if isinstance(document, dict) else None
-    )
-    seen_deliveries = (
-        document.get("seen_deliveries", {}) if isinstance(document, dict) else None
-    )
-    pending_invites = (
-        document.get("pending_invites", {}) if isinstance(document, dict) else None
-    )
-    send_idempotency = (
-        document.get("send_idempotency", {}) if isinstance(document, dict) else None
-    )
+    pending_mirrors = document.get("pending_mirrors", []) if isinstance(document, dict) else None
+    seen_deliveries = document.get("seen_deliveries", {}) if isinstance(document, dict) else None
+    pending_invites = document.get("pending_invites", {}) if isinstance(document, dict) else None
+    send_idempotency = document.get("send_idempotency", {}) if isinstance(document, dict) else None
+    pending_approvals = document.get("pending_approvals", {}) if isinstance(document, dict) else None
     valid = (
         isinstance(document, dict)
         and isinstance(document.get("welcomed"), bool)
         and isinstance(document.get("channels"), dict)
-        and isinstance(document.get("pending_approvals"), dict)
+        and all(isinstance(record, dict) for record in document["channels"].values())
+        and isinstance(pending_approvals, dict)
         and isinstance(pending_invites, dict)
         and all(
             _pending_invite_is_valid(channel_id, entry)
@@ -623,6 +673,8 @@ def load(path) -> dict:
         raise StateFileCorrupt(f"invalid state file: {target}")
     loaded = {
         **document,
+        "channels": _copy_channels(document["channels"]),
+        "pending_approvals": _copy_pending(pending_approvals),
         "pending_invites": _bound_pending_invites(
             _copy_pending_invites(pending_invites)
         ),
