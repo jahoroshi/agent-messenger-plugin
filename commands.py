@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 import logging
+import os
 import re
 
 from . import adapter as adapter_module
@@ -15,6 +16,19 @@ REFUSAL = "AMessenger commands are accepted only from the Owner in the Owner Cha
 MISSING_GROUP_OWNER_USER_HINT = (
     "This Owner Chat is a group and AMESSENGER_OWNER_USER is not set; set it to "
     "your platform user id and restart the gateway."
+)
+SETUP_TUI = (
+    "AMessenger setup must be typed in the chat where the Owner wants to see mail; "
+    "type `/amsg setup` there. Nothing was written."
+)
+SETUP_KIND_FORMS = "corporate or personal"
+SETUP_NO_RELAY = (
+    "No relay address is configured. Ask your administrator for it and type "
+    "/amsg setup … --relay <url>."
+)
+SETUP_KEY_GROUP_WARNING = (
+    "Warning: a key typed into a group chat is visible to everyone in this group; "
+    "use `--key` only in a private chat or the TUI."
 )
 _DURATION = re.compile(r"^(\d+)([hm])$")
 
@@ -82,7 +96,7 @@ def missing_group_owner_user(adapter, source) -> bool:
 
 def _source_details(source) -> tuple[object, object, object]:
     try:
-        platform = source.platform.value
+        platform = getattr(source.platform, "value", source.platform)
         chat_id = source.chat_id
         user_id = source.user_id
     except (AttributeError, TypeError):
@@ -97,6 +111,362 @@ def _log_refusal(source) -> None:
         platform,
         chat_id,
         user_id,
+    )
+
+
+def _setup_source_is_usable(source) -> bool:
+    platform, chat_id, _user_id = _source_details(source)
+    return bool(platform and str(chat_id or "").strip())
+
+
+def _setup_owner_check(adapter, source) -> bool:
+    """Allow first setup, and let the current Owner request a move."""
+    if adapter is None:
+        return _setup_source_is_usable(source)
+    if adapter_module.configuration_state() != "configured":
+        return _setup_source_is_usable(source)
+    if owner_check(adapter, source):
+        return True
+    # A move starts in the new chat, so the configured group Owner identity is
+    # the proof that this setup command belongs to the current Owner.
+    try:
+        settings = read_settings()
+        platform, _chat_id, user_id = _source_details(source)
+        return (
+            bool(settings.get("owner_user"))
+            and platform == adapter._owner_platform
+            and str(user_id) == str(settings["owner_user"])
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _not_setup_message() -> str:
+    missing = [
+        name
+        for name in adapter_module.REQUIRED_ENV
+        if not os.getenv(name, "").strip()
+    ]
+    cause = (
+        "missing " + ", ".join(missing)
+        if missing
+        else "the Owner Chat and Agent are not configured"
+    )
+    return (
+        f"AMessenger is not set up yet: {cause}; type `/amsg setup` in the chat "
+        "where the Owner wants to see mail."
+    )
+
+
+def _setup_agent_error(agent: str) -> str:
+    return (
+        f"Agent name `{security.safe_field(agent, fallback='')}` is invalid: it must "
+        "match `[a-z0-9][a-z0-9-]{1,31}`. Pass a valid name as the first argument, "
+        "for example `/amsg setup my-agent`."
+    )
+
+
+def _setup_argument_error() -> str:
+    return (
+        "Accepted forms for setup: `/amsg setup [name] [corporate|personal] "
+        "[--key <key>] [--relay <url>] [--confirm]`; to confirm a requested "
+        "Owner Chat move, type `/amsg setup --confirm`."
+    )
+
+
+def _setup_card_reply(card: dict) -> str:
+    card_lines = [line.strip() for line in mirror.format_card(card).splitlines()]
+    published = card_lines[0] + " " + "; ".join(card_lines[1:])
+    return f"{published}; this chat is your Owner Chat; type /amsg help."
+
+
+def _redact_setup_secret(text, secret: str = "") -> str:
+    rendered = str(text)
+    if secret:
+        rendered = rendered.replace(secret, "[redacted]")
+    return rendered
+
+
+def _setup_reply(
+    text: str,
+    source,
+    *,
+    key_supplied: bool = False,
+    secret: str = "",
+) -> str:
+    reply = _redact_setup_secret(text, secret)
+    if key_supplied:
+        try:
+            chat_type = str(source.chat_type or "").casefold()
+        except (AttributeError, TypeError):
+            chat_type = ""
+        if chat_type in {"group", "forum", "channel"}:
+            reply = f"{reply} {SETUP_KEY_GROUP_WARNING}"
+    return _redact_setup_secret(reply, secret)
+
+
+def _setup_move_message(old_owner_chat: str, owner_chat: str) -> str:
+    return (
+        f"Moving the Owner Chat from {old_owner_chat} to {owner_chat} will "
+        "change where AMessenger mail is shown. Nothing moved yet; type "
+        "/amsg setup --confirm to confirm, or type another setup command "
+        "to leave it unchanged."
+    )
+
+
+def _parse_setup_arguments(tokens: list[str]) -> dict | None:
+    """Parse setup's two optional positionals and non-colliding flags."""
+    positionals = []
+    values = {"key": None, "relay": None, "confirm": False}
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--confirm":
+            if values["confirm"]:
+                return None
+            values["confirm"] = True
+            index += 1
+            continue
+        if token in {"--key", "--relay"}:
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+                return None
+            option = "key" if token == "--key" else "relay"
+            if values[option] is not None:
+                return None
+            values[option] = tokens[index + 1]
+            index += 2
+            continue
+        if token.startswith("--"):
+            return None
+        positionals.append(token)
+        if len(positionals) > 2:
+            return None
+        index += 1
+    values["positionals"] = positionals
+    return values
+
+
+def _stored_setup_value(profile_values: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = profile_values.get(name, "").strip()
+        if value:
+            return value
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _setup_relay_error(url: str, error: Exception, secret: str = "") -> str:
+    safe_url = _redact_setup_secret(url, secret)
+    if isinstance(error, relay.CardConflict) or (
+        isinstance(error, relay.RelayRejected) and error.status == 409
+    ):
+        return (
+            f"AMessenger setup failed: Agent name is already taken by another Owner "
+            f"at {safe_url}; choose another name as the first argument and type "
+            "`/amsg setup <agent-name> [corporate|personal]`."
+        )
+    if isinstance(error, relay.RelayRejected):
+        if error.status in {401, 403}:
+            return (
+                f"AMessenger setup failed: the relay at {safe_url} rejected the key; put "
+                "a valid Redmine API key in REDMINE_API_KEY or AMESSENGER_KEY in the "
+                "profile .env, then type `/amsg setup` again."
+            )
+        return (
+            f"AMessenger setup failed: the relay at {safe_url} rejected the request "
+            f"({_redact_setup_secret(error.detail, secret)}); fix that cause and type "
+            "/amsg setup again."
+        )
+    return (
+        f"AMessenger setup failed: the relay at {safe_url} is unreachable "
+        f"({_redact_setup_secret(error, secret)}); check AMESSENGER_URL or the relay "
+        "health, then type `/amsg setup` again."
+    )
+
+
+async def _setup(adapter, tokens: list[str], source) -> str:
+    if not in_gateway_process() or not _setup_source_is_usable(source):
+        return SETUP_TUI
+    parsed = _parse_setup_arguments(tokens)
+    if parsed is None:
+        return _setup_argument_error()
+
+    pending = getattr(adapter, "_pending_setup", None) if adapter is not None else None
+    if parsed["confirm"]:
+        if (
+            parsed["positionals"]
+            or parsed["key"] is not None
+            or parsed["relay"] is not None
+        ):
+            return _setup_argument_error()
+        if not isinstance(pending, dict):
+            return (
+                "AMessenger setup has no Owner Chat move waiting for confirmation; "
+                "type /amsg setup in the chat you want to use, or type /amsg setup "
+                "without `--confirm` to start setup."
+            )
+        values = dict(pending["values"])
+        clear = tuple(pending.get("clear", ()))
+        key_supplied = bool(pending.get("key_supplied"))
+        key = str(values.get("AMESSENGER_KEY") or "")
+    else:
+        profile = adapter_module.profile_name()
+        positionals = parsed["positionals"]
+        agent = positionals[0] if positionals else profile
+        kind = positionals[1] if len(positionals) == 2 else "corporate"
+        if re.fullmatch(adapter_module.AGENT_NAME_PATTERN, agent) is None:
+            return _setup_agent_error(agent)
+        if kind not in adapter_module.KINDS:
+            return (
+                f"Agent kind {security.safe_field(kind)} is invalid; use "
+                f"{SETUP_KIND_FORMS} as the second argument and type /amsg setup again."
+            )
+        platform, chat_id, user_id = _source_details(source)
+        try:
+            profile_values = adapter_module._profile_env_values()
+        except OSError as error:
+            return _setup_reply(
+                f"AMessenger setup failed: the profile .env could not be read ({error}); "
+                "fix its permissions, then type /amsg setup again.",
+                source,
+                key_supplied=parsed["key"] is not None,
+            )
+
+        key_supplied = parsed["key"] is not None
+        key = parsed["key"].strip() if key_supplied else _stored_setup_value(
+            profile_values,
+            "REDMINE_API_KEY",
+            "AMESSENGER_KEY",
+        )
+        relay_url = (
+            parsed["relay"].strip()
+            if parsed["relay"] is not None
+            else _stored_setup_value(profile_values, "AMESSENGER_URL")
+        )
+        if not relay_url:
+            return _setup_reply(
+                SETUP_NO_RELAY,
+                source,
+                key_supplied=key_supplied,
+                secret=key if key_supplied else "",
+            )
+        if not key:
+            return _setup_reply(
+                "AMessenger setup failed: no key was found; put your Redmine API key "
+                "in REDMINE_API_KEY in the profile .env (or AMESSENGER_KEY), then "
+                "type /amsg setup again.",
+                source,
+                key_supplied=key_supplied,
+            )
+        url = relay_url.rstrip("/")
+        owner_chat = f"{platform}:{chat_id}"
+        values = {
+            "AMESSENGER_URL": url,
+            "AMESSENGER_KEY": key,
+            "AMESSENGER_AGENT": agent,
+            "AMESSENGER_KIND": kind,
+            "AMESSENGER_OWNER_CHAT": owner_chat,
+        }
+        clear = ()
+        if str(getattr(source, "chat_type", "") or "").casefold() in {
+            "group", "forum", "channel"
+        }:
+            owner_user = str(user_id or "").strip()
+            if not owner_user:
+                return _setup_reply(
+                    "AMessenger setup failed: this group event has no Owner user id; "
+                    "type /amsg setup from a group message that includes your user id.",
+                    source,
+                    key_supplied=key_supplied,
+                    secret=key if key_supplied else "",
+                )
+            values["AMESSENGER_OWNER_USER"] = owner_user
+        else:
+            clear = ("AMESSENGER_OWNER_USER",)
+
+        old_owner_chat = str(read_settings().get("owner_chat") or "").strip()
+        if (
+            old_owner_chat
+            and old_owner_chat != owner_chat
+            and adapter_module.configuration_state() == "configured"
+        ):
+            if adapter is None:
+                return SETUP_TUI
+            if (
+                isinstance(pending, dict)
+                and not positionals
+                and parsed["key"] is None
+                and parsed["relay"] is None
+            ):
+                return _setup_reply(
+                    _setup_move_message(old_owner_chat, owner_chat),
+                    source,
+                    key_supplied=bool(pending.get("key_supplied")),
+                    secret=(
+                        str(pending["values"].get("AMESSENGER_KEY") or "")
+                        if pending.get("key_supplied")
+                        else ""
+                    ),
+                )
+            adapter._pending_setup = {
+                "values": values,
+                "clear": clear,
+                "key_supplied": key_supplied,
+            }
+            return _setup_reply(
+                _setup_move_message(old_owner_chat, owner_chat),
+                source,
+                key_supplied=key_supplied,
+                secret=key if key_supplied else "",
+            )
+
+    if adapter is None:
+        return SETUP_TUI
+    env_values = dict(values)
+    try:
+        adapter_module.update_profile_env(env_values, clear=clear)
+    except Exception as error:
+        return _setup_reply(
+            f"AMessenger setup failed: the profile .env is not writable ({error}); "
+            "fix its permissions or disk space, then type /amsg setup again.",
+            source,
+            key_supplied=key_supplied,
+            secret=key if key_supplied else "",
+        )
+    for name, value in env_values.items():
+        os.environ[name] = value
+    for name in clear:
+        os.environ[name] = ""
+    adapter._pending_setup = None
+    try:
+        await adapter.reload_configuration()
+    except Exception as error:
+        return _setup_reply(
+            "AMessenger setup failed while applying the new configuration "
+            f"({_redact_setup_secret(error, key if key_supplied else '')}); "
+            "fix that cause and type /amsg setup again.",
+            source,
+            key_supplied=key_supplied,
+            secret=key if key_supplied else "",
+        )
+    url = str(env_values.get("AMESSENGER_URL") or read_settings().get("url") or "")
+    try:
+        card = await adapter.publish_card()
+    except Exception as error:
+        return _setup_reply(
+            _setup_relay_error(url, error, key if key_supplied else ""),
+            source,
+            key_supplied=key_supplied,
+            secret=key if key_supplied else "",
+        )
+    return _setup_reply(
+        _setup_card_reply(card),
+        source,
+        key_supplied=key_supplied,
+        secret=key if key_supplied else "",
     )
 
 
@@ -609,6 +979,18 @@ def make_handler():
     async def handle(raw_args: str) -> str:
         source = _SOURCE.get()
         adapter = active_adapter()
+        tokens = (raw_args or "").split()
+        command = tokens[0] if tokens else ""
+        if command == "setup":
+            if not in_gateway_process():
+                return await _setup(None, tokens, source)
+            if not _setup_owner_check(adapter, source):
+                _log_refusal(source)
+                return REFUSAL
+            return await _setup(adapter, tokens, source)
+
+        if adapter_module.configuration_state() != "configured":
+            return _not_setup_message()
         if not owner_check(adapter, source):
             _log_refusal(source)
             if missing_group_owner_user(adapter, source):
@@ -617,7 +999,6 @@ def make_handler():
 
         from . import HELP_TEXT
 
-        tokens = (raw_args or "").split()
         if not tokens or tokens[0] == "help":
             if not tokens or len(tokens) == 1:
                 return HELP_TEXT

@@ -129,7 +129,7 @@ def register(ctx) -> None:
         "amsg",
         commands.make_handler(),
         description="AMessenger: join Channels and set the Mail Policy",
-        args_hint="join|interact|notify|leave|log|status|approve|deny|help",
+        args_hint="setup|join|interact|notify|leave|log|status|approve|deny|help",
     )
     ctx.register_hook("pre_gateway_dispatch", commands.remember_source)
     ctx.register_hook("transform_llm_output", transform_llm_output)

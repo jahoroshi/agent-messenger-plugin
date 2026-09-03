@@ -49,7 +49,9 @@ CHANNELS_MAX = 200  # Remembered Channel records used for Owner-facing labels.
 PENDING_MIRRORS_MAX = state.PENDING_MIRRORS_MAX
 OWNER_POST_TIMEOUT_SECONDS = 15
 PENDING_DECISION_POLL_SECONDS = 5
+CONFIG_WAIT_SECONDS = 5
 PENDING_DECISIONS_FILENAME = "pending_decisions.jsonl"
+PROFILE_ENV_FILENAME = ".env"
 MANAGE_TOOLSET = "amessenger_manage"   # §6.9: Owner Chat sessions only, never a Channel session
 TOOLSET = "amessenger"                 # §6.9: Channel sessions never get mail tools
 NO_TOOLS_SENTINEL = "amessenger_none"
@@ -73,6 +75,117 @@ GATEWAY_NOTICE_PREFIXES = (
 )
 INTERIM_SEND_KEY = "_interim_send"
 _LIVE_ADAPTER = None
+
+
+def env_path_for_process() -> Path:
+    """Return the active profile's dotenv file."""
+    return hermes_home() / PROFILE_ENV_FILENAME
+
+
+def _profile_env_values(path: Path | None = None) -> dict[str, str]:
+    """Read simple ``KEY=value`` entries without changing the source file."""
+    target = env_path_for_process() if path is None else Path(path)
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    values = {}
+    for line in raw.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#"):
+            continue
+        if candidate.startswith("export "):
+            candidate = candidate[7:].lstrip()
+        name, separator, value = candidate.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name.strip()):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[name.strip()] = value
+    return values
+
+
+def profile_name() -> str:
+    """Resolve a useful default Agent name for the active Hermes profile."""
+    for variable in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = os.getenv(variable, "").strip()
+        if value:
+            return value
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        value = str(get_active_profile_name() or "").strip()
+        if value and value != "default":
+            return value
+    except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return "hermes-agent"
+
+
+def _safe_env_bytes(value: str) -> bytes:
+    if "\r" in value or "\n" in value:
+        raise ValueError("dotenv values cannot contain newlines")
+    return value.encode("utf-8")
+
+
+def update_profile_env(
+    values: dict[str, str], *, clear: tuple[str, ...] = ()
+) -> Path:
+    """Replace selected AMessenger lines while preserving every other byte.
+
+    The lock is deliberately the same sibling-lock protocol used by state.json;
+    the profile dotenv can contain credentials owned by other plugins.
+    """
+    target = env_path_for_process()
+    replacements = {**values, **{name: "" for name in clear}}
+    for name, value in replacements.items():
+        if not re.fullmatch(r"AMESSENGER_[A-Z0-9_]+", name):
+            raise ValueError(f"invalid AMessenger dotenv variable: {name}")
+        _safe_env_bytes(str(value))
+
+    line_pattern = re.compile(
+        rb"(?m)^(?P<prefix>[ \t]*(?:export[ \t]+)?)"
+        rb"(?P<name>AMESSENGER_[A-Z0-9_]+)[ \t]*=(?P<value>[^\r\n]*)"
+        rb"(?P<ending>\r\n|\r|\n|$)"
+    )
+    with state.file_lock(target):
+        try:
+            original = target.read_bytes()
+        except FileNotFoundError:
+            original = b""
+        seen = set()
+
+        def replace(match):
+            name = match.group("name").decode("ascii")
+            if name not in replacements:
+                return match.group(0)
+            seen.add(name)
+            inline_comment = b""
+            comment_match = re.search(rb"[ \t]+#.*$", match.group("value"))
+            if comment_match is not None:
+                inline_comment = comment_match.group(0)
+            return (
+                match.group("prefix")
+                + name.encode("ascii")
+                + b"="
+                + _safe_env_bytes(str(replacements[name]))
+                + inline_comment
+                + match.group("ending")
+            )
+
+        updated = line_pattern.sub(replace, original)
+        missing = [name for name in replacements if name not in seen and name not in clear]
+        if missing:
+            if updated and updated[-1:] not in {b"\n", b"\r"}:
+                updated += b"\n"
+            updated += b"".join(
+                name.encode("ascii") + b"=" + _safe_env_bytes(str(replacements[name])) + b"\n"
+                for name in missing
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(updated)
+    return target
 
 
 def live_adapter():
@@ -273,6 +386,18 @@ def has_any_configuration() -> bool:
     return any(os.getenv(name, "").strip() for name in REQUIRED_ENV)
 
 
+def configuration_state() -> str:
+    """Classify the five storage variables for startup and validation."""
+    present = [bool(os.getenv(name, "").strip()) for name in REQUIRED_ENV]
+    # These three states are intentionally distinct: none is a fresh install,
+    # some is an operator mistake, and all five is a usable stored profile.
+    if not any(present):
+        return "unconfigured"
+    if not all(present):
+        return "half-configured"
+    return "configured"
+
+
 def check_requirements() -> bool:
     # Validation/connect question: are all values needed to use AMessenger present?
     return all(os.getenv(name, "").strip() for name in REQUIRED_ENV)
@@ -288,6 +413,10 @@ def check_dependencies() -> bool:
 
 def validate_config(config) -> bool:
     """Validate environment configuration; config.extra is intentionally ignored."""
+    if configuration_state() == "unconfigured":
+        # This is the fresh-install state.  It must reach connect() so the
+        # /amsg setup command can configure this profile from a chat.
+        return True
     missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
     if missing:
         logger.error(
@@ -337,6 +466,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._pending_mirrors: list[str] = []
         self._last_pending_decisions_poll = None
         self._owner_user_warning_logged = False
+        self._waiting_log_written = False
+        self._disabled_owner_log_written = False
+        self._pending_setup = None
+        self._connected_via_connect = False
 
     def _drop_forgotten_channel(self, channel_id: str) -> None:
         self.update_state(lambda document: state.drop_channel(document, channel_id))
@@ -351,8 +484,15 @@ class AMessengerAdapter(BasePlatformAdapter):
     def configuration_problem(self) -> str | None:
         """Return the first reason this Agent cannot use AMessenger mail."""
         settings = read_settings()
+        profile_state = configuration_state()
+        if profile_state == "unconfigured":
+            self._settings = settings
+            self._owner_platform = ""
+            self._owner_chat_id = ""
+            return None
         missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
         if missing:
+            self._settings = settings
             return "missing " + ", ".join(missing)
 
         agent = settings["agent"]
@@ -377,6 +517,9 @@ class AMessengerAdapter(BasePlatformAdapter):
             return "the gateway runner is unavailable"
 
         if self._owner_chat_platform_is_disabled(runner, platform, owner_platform):
+            self._settings = settings
+            self._owner_platform = owner_platform
+            self._owner_chat_id = str(owner_chat_id or "")
             return f"the Owner Chat platform '{owner_platform}' is disabled in config.yaml"
 
         if not owner_chat_id:
@@ -612,9 +755,21 @@ class AMessengerAdapter(BasePlatformAdapter):
         _LIVE_ADAPTER = None
         self._running = False
         problem = self.configuration_problem()
-        if problem:
+        fresh_install = configuration_state() == "unconfigured"
+        disabled_owner_chat = bool(problem and "disabled in config.yaml" in problem)
+        waiting_for_setup = not str(self._settings.get("owner_chat") or "").strip() or not str(
+            self._settings.get("agent") or ""
+        ).strip()
+        if problem and not (fresh_install or disabled_owner_chat or waiting_for_setup):
             logger.error("[amessenger] not connecting: %s", problem)
             return False
+        if disabled_owner_chat:
+            logger.error(
+                "[amessenger] Owner Chat platform is disabled in config.yaml; "
+                "enable '%s' and run /amsg setup again",
+                self._owner_platform,
+            )
+            self._disabled_owner_log_written = True
         if not str(self._settings.get("owner_user") or "").strip():
             if not self._owner_user_warning_logged:
                 logger.warning(
@@ -625,8 +780,12 @@ class AMessengerAdapter(BasePlatformAdapter):
                 self._owner_user_warning_logged = True
         self._loop = asyncio.get_running_loop()
         self._running = True
+        self._connected_via_connect = True
         self._poll_task = asyncio.create_task(self.run_poll_loop())
-        self._housekeeping_task = asyncio.create_task(self.run_housekeeping_loop())
+        if self._configuration_ready():
+            self._housekeeping_task = asyncio.create_task(self.run_housekeeping_loop())
+        else:
+            self._log_waiting_for_setup()
         self._mark_connected()
         _LIVE_ADAPTER = self
         logger.info(
@@ -636,6 +795,50 @@ class AMessengerAdapter(BasePlatformAdapter):
             self._owner_chat_id,
         )
         return True
+
+    def _log_waiting_for_setup(self) -> None:
+        if self._waiting_log_written:
+            return
+        logger.info(
+            "[amessenger] AMessenger installed; waiting for /amsg setup in the Owner Chat"
+        )
+        self._waiting_log_written = True
+
+    def _configuration_ready(self) -> bool:
+        """Refresh settings and report whether mail tasks may run."""
+        if configuration_state() != "configured":
+            return False
+        problem = self.configuration_problem()
+        if problem:
+            if "disabled in config.yaml" in problem:
+                if not self._disabled_owner_log_written:
+                    logger.error(
+                        "[amessenger] Owner Chat platform is disabled in config.yaml; "
+                        "enable '%s' and run /amsg setup again",
+                        self._owner_platform,
+                    )
+                    self._disabled_owner_log_written = True
+            else:
+                logger.error("[amessenger] not connecting: %s", problem)
+            return False
+        return True
+
+    async def reload_configuration(self) -> bool:
+        """Apply dotenv values written by /amsg setup to this live adapter."""
+        old_client = self._client
+        self._client = None
+        self._settings = None
+        ready = self._configuration_ready()
+        if old_client is not None:
+            await old_client.aclose()
+        if (
+            ready
+            and self._running
+            and self._connected_via_connect
+            and self._housekeeping_task is None
+        ):
+            self._housekeeping_task = asyncio.create_task(self.run_housekeeping_loop())
+        return ready
 
     async def publish_card(self) -> dict:
         settings = self._settings or read_settings()
@@ -957,6 +1160,14 @@ class AMessengerAdapter(BasePlatformAdapter):
         flush_at_start = True
         while self._running:
             try:
+                if not self._configuration_ready():
+                    self._log_waiting_for_setup()
+                    await sleep(CONFIG_WAIT_SECONDS)
+                    continue
+                if self._connected_via_connect and self._housekeeping_task is None:
+                    self._housekeeping_task = asyncio.create_task(
+                        self.run_housekeeping_loop()
+                    )
                 if flush_at_start:
                     await self.flush_pending_mirrors()
                     flush_at_start = False

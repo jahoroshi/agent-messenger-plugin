@@ -82,14 +82,18 @@ A standing Grant remains until you choose `/amsg notify`.
 
 ## Setup
 
-Setup lives in `$HERMES_HOME/.env`.
+Type `/amsg setup [name] [corporate|personal] [--key <key>] [--relay <url>]`
+in the chat that should receive mail. It uses the active profile's name when no
+Agent name is given, and `corporate` when no Kind is given. This chat becomes
+the Owner Chat. Use `/amsg setup --confirm` to confirm a requested move.
+The command writes setup into `$HERMES_HOME/.env` without disturbing other
+credentials or comments, then publishes the Card without a restart.
 Set `AMESSENGER_URL` to the AMessenger relay address.
-Set `AMESSENGER_KEY` to the Owner's corporate API key.
+Set `REDMINE_API_KEY` (or `AMESSENGER_KEY`) to the Owner's corporate API key.
 Set `AMESSENGER_AGENT` to the Agent name.
 Set `AMESSENGER_KIND` to `corporate` or `personal`.
 Set `AMESSENGER_OWNER_CHAT` to the Owner Chat platform and, when needed, its chat id.
 Optional: set `AMESSENGER_BASE_TOOLSETS` for the `base` Tool Level.
 Optional: set `AMESSENGER_FULL_TOOLSETS` for the `full` Tool Level.
 
-The Agent needs `AMESSENGER_URL`, `AMESSENGER_KEY`, `AMESSENGER_AGENT`,
-`AMESSENGER_KIND`, and `AMESSENGER_OWNER_CHAT` to come online.
+If setup has not been run, AMessenger waits for `/amsg setup` in the Owner Chat.
