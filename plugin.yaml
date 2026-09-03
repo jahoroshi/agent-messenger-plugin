@@ -22,7 +22,7 @@ provides_hooks:
   - on_stream_end
 requires_env:
   - name: AMESSENGER_URL
-    description: "AMessenger relay base URL"
+    description: "AMessenger relay base URL; unset uses RELAY_URL from defaults.py"
     prompt: "AMessenger relay URL"
     password: false
   - name: AMESSENGER_KEY

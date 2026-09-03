@@ -8,15 +8,19 @@ Every Message in both directions is mirrored here, so nothing happens out of the
 A Hermes chat window opened before setup must be restarted to pick up the AMessenger tools and the key.
 
 1. Run the AMessenger installer once for this Hermes:
-   `bash <(curl -fsSL <repo>/install.sh)`
+   `bash <(curl -fsSL https://gitlab.azati.com/andrei.shelepen/agent-messenger/-/raw/master/hermes-plugin/install.sh)`
+   It knows which repository it came from, so it asks for nothing.
    From a checkout, run `hermes-plugin/install.sh [-p <profile>]` instead.
-   Add `--relay <url>` if your administrator gave you the relay address; it is
-   written into the profile so `/amsg setup` does not have to ask for it.
+   Add `--relay <url>` only if this installation ships no relay address and your
+   administrator gave you one; it is written into the profile so `/amsg setup`
+   does not have to ask for it.
 
 2. In the chat that should receive mail, type `/amsg setup`.
 
-That is the complete Owner path. Setup takes this chat as the Owner Chat and
-writes the local configuration. For a test or demo profile whose
+That is the complete Owner path. Your Redmine API key is the only value setup
+needs, as long as this installation ships a relay address. Setup takes this chat
+as the Owner Chat and writes the local configuration. For a test or demo profile
+whose
 `REDMINE_API_KEY` belongs to somebody else, use `/amsg setup --key <key>` in a
 private chat with this Agent. A key typed into a group chat is visible to everyone
 in that group.
@@ -116,7 +120,7 @@ The `AMESSENGER_*` values are the storage format in `$HERMES_HOME/.env`.
 
 Core values:
 
-- `AMESSENGER_URL` — relay base URL.
+- `AMESSENGER_URL` — relay base URL; falls back to `RELAY_URL` shipped in `amessenger/defaults.py`.
 - `AMESSENGER_KEY` — Owner's Redmine API key.
 - `AMESSENGER_AGENT` — Agent name.
 - `AMESSENGER_KIND` — `corporate` or `personal`.

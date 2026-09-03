@@ -12,7 +12,7 @@ import time
 
 import httpx
 
-from . import security, state
+from . import defaults, security, state
 from . import mirror, relay
 from .mirror import format_card
 from .relay import (
@@ -39,6 +39,8 @@ STATE_DIRNAME = "amessenger"           # $HERMES_HOME/amessenger/state.json, §6
 STATE_FILENAME = "state.json"
 OWNER_LOG_FILENAME = "owner_log.jsonl"
 # Complete-configuration question: are all five values needed to run an Agent present?
+# Read them through missing_requirements(), never with a bare getenv:
+# AMESSENGER_URL also has a shipped default in defaults.py.
 REQUIRED_ENV = ("AMESSENGER_URL", "AMESSENGER_KEY", "AMESSENGER_AGENT",
                 "AMESSENGER_KIND", "AMESSENGER_OWNER_CHAT")
 # Enablement question: has the Owner supplied one of the four values expressing
@@ -358,10 +360,18 @@ def _toolsets(name: str, default: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def relay_url() -> str:
+    """The relay address: the profile's AMESSENGER_URL, else the shipped default."""
+    # The shipped default is what makes the Redmine key the only value a new
+    # Owner supplies. It is an address, never intent to run an Agent, so it is
+    # deliberately absent from OWNER_CONFIGURATION_ENV.
+    return (os.getenv("AMESSENGER_URL", "").strip() or defaults.relay_url()).rstrip("/")
+
+
 def read_settings() -> dict:
     """Read AMessenger settings from the environment at call time."""
     return {
-        "url": os.getenv("AMESSENGER_URL", "").rstrip("/"),
+        "url": relay_url(),
         "key": os.getenv("AMESSENGER_KEY", ""),
         "agent": os.getenv("AMESSENGER_AGENT", ""),
         "kind": os.getenv("AMESSENGER_KIND", ""),
@@ -405,9 +415,21 @@ def configuration_state() -> str:
     return "configured"
 
 
+def configured_value(name: str) -> str:
+    """Read one required variable, honouring the shipped relay default."""
+    if name == "AMESSENGER_URL":
+        return relay_url()
+    return os.getenv(name, "").strip()
+
+
+def missing_requirements() -> list[str]:
+    """Name the required variables that are neither set nor shipped."""
+    return [name for name in REQUIRED_ENV if not configured_value(name)]
+
+
 def check_requirements() -> bool:
     # Validation/connect question: are all values needed to use AMessenger present?
-    return all(os.getenv(name, "").strip() for name in REQUIRED_ENV)
+    return not missing_requirements()
 
 
 def check_dependencies() -> bool:
@@ -426,7 +448,7 @@ def validate_config(config) -> bool:
         return True
     if check_requirements():
         return True
-    missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
+    missing = missing_requirements()
     if missing:
         logger.error(
             "[amessenger] missing required environment variables: %s",
@@ -499,7 +521,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             self._owner_platform = ""
             self._owner_chat_id = ""
             return None
-        missing = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
+        missing = missing_requirements()
         if missing:
             self._settings = settings
             return "missing " + ", ".join(missing)

@@ -2,7 +2,6 @@
 
 from contextlib import asynccontextmanager
 import logging
-import os
 
 from . import adapter as adapter_module
 from . import mirror, relay, security, state
@@ -32,11 +31,7 @@ def relay_error(error) -> str:
 def _configuration_error() -> str | None:
     if check_requirements():
         return None
-    missing = [
-        name
-        for name in adapter_module.REQUIRED_ENV
-        if not os.getenv(name, "").strip()
-    ]
+    missing = adapter_module.missing_requirements()
     if not missing:
         # This also keeps a monkeypatched check_requirements failure actionable.
         missing = list(adapter_module.REQUIRED_ENV)

@@ -126,11 +126,7 @@ def _setup_source_is_usable(source) -> bool:
 
 
 def _setup_gateway_adapter_message() -> str:
-    missing = [
-        name
-        for name in adapter_module.REQUIRED_ENV
-        if not os.getenv(name, "").strip()
-    ]
+    missing = adapter_module.missing_requirements()
     if missing:
         command = (
             "`/amsg setup --relay <url>`"
@@ -173,11 +169,7 @@ def _setup_owner_check(adapter, source) -> bool:
 
 
 def _not_setup_message() -> str:
-    missing = [
-        name
-        for name in adapter_module.REQUIRED_ENV
-        if not os.getenv(name, "").strip()
-    ]
+    missing = adapter_module.missing_requirements()
     cause = (
         "missing " + ", ".join(missing)
         if missing
@@ -380,6 +372,7 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             parsed["relay"].strip()
             if parsed["relay"] is not None
             else _stored_setup_value(profile_values, "AMESSENGER_URL")
+            or adapter_module.relay_url()
         )
         if not relay_url:
             return _setup_reply(
