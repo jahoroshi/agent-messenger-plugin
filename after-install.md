@@ -7,7 +7,9 @@ The relay address ships with this plugin. You do not need to set anything.
     /amsg setup
 
 That is all. Setup takes the Owner Chat from the chat you typed it in, reads your
-Redmine API key from the profile, and publishes your Agent Card.
+Redmine API key from the profile, and publishes your Agent Card. Hermes's own
+`/sethome` in that chat works too: AMessenger notices the home channel within
+seconds, without a restart.
 
 If the gateway has not been restarted since the install, restart it first — Hermes
 does not hot-reload plugins.

@@ -16,6 +16,8 @@ A Hermes chat window opened before setup must be restarted to pick up the AMesse
    does not have to ask for it.
 
 2. In the chat that should receive mail, type `/amsg setup`.
+   Hermes's own `/sethome` in that chat works too: AMessenger notices the home
+   channel within seconds, without a restart.
 
 That is the complete Owner path. Your Redmine API key is the only value setup
 needs, as long as this installation ships a relay address. Setup takes this chat

@@ -23,6 +23,11 @@ SETUP_TUI = (
     "Chat, or your IRC channel. Nothing was written."
 )
 SETUP_KIND_FORMS = "corporate or personal"
+NO_OWNER_CHAT_YET = (
+    f"AMessenger cannot receive mail: {adapter_module.OWNER_CHAT_WAITING}. Type "
+    "/amsg setup in the chat that should receive mail, or /sethome there; no other "
+    "command works until then."
+)
 SETUP_NO_RELAY = (
     "No relay address is configured. Ask your administrator for it and type "
     "/amsg setup … --relay <url>."
@@ -164,12 +169,31 @@ def _setup_gateway_adapter_message() -> str:
     )
 
 
+def _may_claim_owner_chat(adapter, source) -> bool:
+    """A platform-only Owner Chat is claimed by a private chat on that platform.
+
+    This is a trust boundary: the chat id captured here becomes the Owner
+    Chat. A group can never claim it unless AMESSENGER_OWNER_USER already
+    names the sender. owner_check itself is untouched.
+    """
+    try:
+        settings = read_settings()
+        owner_user = str(settings.get("owner_user") or "").strip()
+        same_platform = source.platform.value == adapter._owner_platform
+        named_owner = bool(owner_user) and str(source.user_id) == owner_user
+        return same_platform and (source.chat_type == "dm" or named_owner)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _setup_owner_check(adapter, source) -> bool:
     """Allow first setup, and let the current Owner request a move."""
     if adapter is None:
         return _setup_source_is_usable(source)
     if adapter_module.configuration_state() != "configured":
         return _setup_source_is_usable(source)
+    if getattr(adapter, "_waiting_for_owner_chat", False):
+        return _may_claim_owner_chat(adapter, source)
     if owner_check(adapter, source):
         return True
     # A move starts in the new chat, so the configured group Owner identity is
@@ -396,6 +420,7 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         return _setup_argument_error()
 
     pending = getattr(adapter, "_pending_setup", None) if adapter is not None else None
+    claim = None
     if parsed["confirm"]:
         if (
             parsed["positionals"]
@@ -416,8 +441,17 @@ async def _setup(adapter, tokens: list[str], source) -> str:
     else:
         profile = adapter_module.profile_name()
         positionals = parsed["positionals"]
-        agent = positionals[0] if positionals else profile
-        kind = positionals[1] if len(positionals) == 2 else "corporate"
+        stored = read_settings()
+        configured = adapter_module.configuration_state() == "configured"
+        # A configured profile keeps its Agent name and Kind: the installer
+        # named the Agent after the Owner, and setup only adds the chat.
+        agent = positionals[0] if positionals else (
+            stored["agent"] if configured and stored.get("agent") else profile
+        )
+        kind = positionals[1] if len(positionals) == 2 else (
+            stored["kind"] if configured and not positionals and stored.get("kind")
+            else "corporate"
+        )
         if re.fullmatch(adapter_module.AGENT_NAME_PATTERN, agent) is None:
             return _setup_agent_error(agent)
         if kind not in adapter_module.KINDS:
@@ -490,9 +524,16 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             clear = ("AMESSENGER_OWNER_USER",)
 
         old_owner_chat = str(read_settings().get("owner_chat") or "").strip()
+        old_platform, old_chat_id = adapter_module.parse_owner_chat(old_owner_chat)
+        # Adding the chat id to a platform-only Owner Chat is the first setup,
+        # not a move; nothing was shown anywhere before.
+        claiming = bool(old_owner_chat) and not old_chat_id and old_platform == platform
+        if claiming:
+            claim = (platform, chat_id, user_id)
         if (
             old_owner_chat
             and old_owner_chat != owner_chat
+            and not claiming
             and adapter_module.configuration_state() == "configured"
         ):
             if adapter is None:
@@ -540,6 +581,11 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         os.environ[name] = value
     for name in clear:
         os.environ[name] = ""
+    if claim is not None:
+        logger.warning(
+            "[amessenger] Owner Chat claimed: platform=%s chat=%s user=%s",
+            *claim,
+        )
     adapter._pending_setup = None
     try:
         await adapter.reload_configuration()
@@ -1154,6 +1200,10 @@ def make_handler():
             # Owner-identity refusal would blame the wrong thing: name the
             # real fault, the same way setup does.
             return _setup_gateway_adapter_message()
+        if getattr(adapter, "_waiting_for_owner_chat", False):
+            # There is no Owner Chat to check against yet; only setup (or
+            # Hermes's /sethome) can create one.
+            return NO_OWNER_CHAT_YET
         if not owner_check(adapter, source):
             _log_refusal(source)
             if missing_group_owner_user(adapter, source):

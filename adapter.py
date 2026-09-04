@@ -95,6 +95,10 @@ RECEIVE_NOT_CONNECTED = (
 RECEIVE_LOOP_STOPPED = "the AMessenger receive loop stopped"
 RECEIVE_LOOP_NOT_RUNNING = "the AMessenger receive loop is not running"
 RECEIVE_WAITING_FOR_SETUP = "AMessenger is waiting for /amsg setup in the Owner Chat"
+# A platform-only AMESSENGER_OWNER_CHAT (what the installer writes) is not a
+# fault: the chat id arrives with the Owner's first /amsg setup, or with
+# Hermes's own /sethome, which the poll loop notices without a restart.
+OWNER_CHAT_WAITING = "waiting for /amsg setup or /sethome in the Owner Chat"
 _LIVE_ADAPTER = None
 _LAST_CONNECT_PROBLEM: str | None = None
 
@@ -555,6 +559,8 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._receive_fault: str | None = None
         self._relay_fault: str | None = None
         self._stop_reason: str | None = None
+        self._waiting_for_owner_chat = False
+        self._owner_chat_wait_log_written = False
 
     def _drop_forgotten_channel(self, channel_id: str) -> None:
         self.update_state(lambda document: state.drop_channel(document, channel_id))
@@ -574,6 +580,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         # "'NoneType' object has no attribute 'get'" and the gateway retried
         # for hours without ever naming the real fault.
         self._settings = settings
+        self._waiting_for_owner_chat = False
         profile_state = configuration_state()
         if profile_state == "unconfigured":
             self._owner_platform = ""
@@ -626,9 +633,12 @@ class AMessengerAdapter(BasePlatformAdapter):
                 )
                 owner_chat_id = None
             if not owner_chat_id:
+                self._owner_platform = owner_platform
+                self._owner_chat_id = ""
+                self._waiting_for_owner_chat = True
                 return (
-                    "set AMESSENGER_OWNER_CHAT=<platform>:<chat id> or configure "
-                    "a home channel"
+                    f"{OWNER_CHAT_WAITING} on {owner_platform}: AMESSENGER_OWNER_CHAT "
+                    "names only the platform and no home channel is set"
                 )
 
         self._settings = settings
@@ -864,10 +874,20 @@ class AMessengerAdapter(BasePlatformAdapter):
         waiting_for_setup = not str(settings.get("owner_chat") or "").strip() or not str(
             settings.get("agent") or ""
         ).strip()
-        if problem and not (fresh_install or disabled_owner_chat or waiting_for_setup):
+        waiting_for_owner_chat = bool(problem) and self._waiting_for_owner_chat
+        if problem and not (
+            fresh_install or disabled_owner_chat or waiting_for_setup or waiting_for_owner_chat
+        ):
             _LAST_CONNECT_PROBLEM = problem
             logger.error("[amessenger] not connecting: %s", problem)
             return False
+        if waiting_for_owner_chat:
+            self._log_waiting_for_owner_chat()
+        # Visible from the first second: a send before the loop's first check
+        # must already know that nothing can be received yet.
+        self._receive_fault = problem or (
+            RECEIVE_WAITING_FOR_SETUP if waiting_for_setup else None
+        )
         if disabled_owner_chat:
             logger.error(
                 "[amessenger] Owner Chat platform is disabled in config.yaml; "
@@ -902,6 +922,16 @@ class AMessengerAdapter(BasePlatformAdapter):
         )
         return True
 
+    def _log_waiting_for_owner_chat(self) -> None:
+        if self._owner_chat_wait_log_written:
+            return
+        logger.warning(
+            "[amessenger] Owner Chat on %s has no chat id yet; %s",
+            self._owner_platform,
+            OWNER_CHAT_WAITING,
+        )
+        self._owner_chat_wait_log_written = True
+
     def _log_waiting_for_setup(self) -> None:
         if self._waiting_log_written:
             return
@@ -935,6 +965,8 @@ class AMessengerAdapter(BasePlatformAdapter):
                         self._owner_platform,
                     )
                     self._disabled_owner_log_written = True
+            elif self._waiting_for_owner_chat:
+                self._log_waiting_for_owner_chat()
             else:
                 logger.error("[amessenger] not connecting: %s", problem)
             return False
@@ -1929,6 +1961,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         note_transcript: bool = True,
     ) -> bool:
         """Post one line, marking only the chat copy and logging it unmarked."""
+        if not self._owner_chat_id:
+            # No Owner Chat yet (waiting for /amsg setup or /sethome): the
+            # caller queues the line for the chat that will claim it.
+            return False
         owner = await self.wait_for_owner_adapter()
         if owner is None:
             return False
