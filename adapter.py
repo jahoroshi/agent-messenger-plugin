@@ -247,7 +247,9 @@ def receive_problem() -> str | None:
     the receive loop never started; the tools keep working from the
     environment alone, so without this question a send looks delivered while
     every reply waits in the relay. Only attributes are read here: tools run on
-    a worker loop and must not re-run the configuration checks.
+    a worker loop and must not re-run the configuration checks. The gateway
+    marker comes from the pre_gateway_dispatch hook, which Hermes fires for
+    every user-originated message before the turn that calls a tool.
     """
     adapter = live_adapter()
     if adapter is None:
@@ -567,9 +569,13 @@ class AMessengerAdapter(BasePlatformAdapter):
     def configuration_problem(self) -> str | None:
         """Return the first reason this Agent cannot use AMessenger mail."""
         settings = read_settings()
+        # Assigned before any return: connect() reads it whatever the answer.
+        # On 2026-09-04 a return path that skipped this crashed connect() with
+        # "'NoneType' object has no attribute 'get'" and the gateway retried
+        # for hours without ever naming the real fault.
+        self._settings = settings
         profile_state = configuration_state()
         if profile_state == "unconfigured":
-            self._settings = settings
             self._owner_platform = ""
             self._owner_chat_id = ""
             return None
@@ -834,14 +840,29 @@ class AMessengerAdapter(BasePlatformAdapter):
             return False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        global _LAST_CONNECT_PROBLEM
+        try:
+            return await self._connect_or_refuse()
+        except Exception as error:
+            # Hermes catches this and retries with backoff; without a record
+            # the Owner's tools would say only "not connected".
+            _LAST_CONNECT_PROBLEM = (
+                f"the gateway could not start AMessenger "
+                f"({type(error).__name__}: {error}); the gateway log has the traceback"
+            )
+            logger.exception("[amessenger] connect failed")
+            raise
+
+    async def _connect_or_refuse(self) -> bool:
         global _LIVE_ADAPTER, _LAST_CONNECT_PROBLEM
         _LIVE_ADAPTER = None
         self._running = False
         problem = self.configuration_problem()
+        settings = self._settings or read_settings()
         fresh_install = configuration_state() == "unconfigured"
         disabled_owner_chat = bool(problem and "disabled in config.yaml" in problem)
-        waiting_for_setup = not str(self._settings.get("owner_chat") or "").strip() or not str(
-            self._settings.get("agent") or ""
+        waiting_for_setup = not str(settings.get("owner_chat") or "").strip() or not str(
+            settings.get("agent") or ""
         ).strip()
         if problem and not (fresh_install or disabled_owner_chat or waiting_for_setup):
             _LAST_CONNECT_PROBLEM = problem
@@ -854,7 +875,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 self._owner_platform,
             )
             self._disabled_owner_log_written = True
-        if not str(self._settings.get("owner_user") or "").strip():
+        if not str(settings.get("owner_user") or "").strip():
             if not self._owner_user_warning_logged:
                 logger.warning(
                     "[amessenger] AMESSENGER_OWNER_USER is not set; if the Owner "
@@ -904,7 +925,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
             return False
         problem = self.configuration_problem()
-        self._receive_fault = problem or None
+        self._receive_fault = problem
         if problem:
             if "disabled in config.yaml" in problem:
                 if not self._disabled_owner_log_written:
@@ -1314,14 +1335,21 @@ class AMessengerAdapter(BasePlatformAdapter):
                         error,
                         wait,
                     )
+                    self._relay_fault = (
+                        f"the AMessenger receive loop is retrying after: {error}"
+                    )
                 self._card = None
                 index += 1
                 await sleep(wait)
-            except Exception:
+            except Exception as error:
                 wait = RECONNECT_BACKOFF[min(index, len(RECONNECT_BACKOFF) - 1)]
                 logger.exception(
                     "[amessenger] poll pass failed; continuing in %ss",
                     wait,
+                )
+                self._relay_fault = (
+                    f"the AMessenger receive loop is retrying after: "
+                    f"{type(error).__name__}: {error}"
                 )
                 self._card = None
                 index += 1

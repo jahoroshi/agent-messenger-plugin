@@ -149,6 +149,14 @@ def _setup_gateway_adapter_message() -> str:
             "Fix that value, then restart the gateway and type `/amsg setup` "
             "in this chat. Restarting alone will not help."
         )
+    problem = adapter_module.receive_problem()
+    if problem:
+        # The loop stopped after a successful connect (for example the Agent
+        # name now belongs to another Owner); the stop reason is the cause.
+        return (
+            f"AMessenger cannot receive mail in this gateway: {problem}.\n"
+            "Fix that cause, then restart the gateway."
+        )
     return (
         "AMessenger is running in the gateway, but its adapter is unavailable and "
         "reported no reason. Restart the gateway; if this repeats, the gateway log "

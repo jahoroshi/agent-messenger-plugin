@@ -204,6 +204,7 @@ def _send_result(
     result: dict,
     text: str,
     to: str | None,
+    *,
     owner_copy_queued: bool = False,
     receive_problem: str | None = None,
 ) -> str:
@@ -381,10 +382,18 @@ async def amessenger_send(args: dict, **_) -> str:
         )
         if unanswerable:
             # If a gateway ever drains this queue, the Owner also learns why
-            # the reply to this Message never came.
+            # the reply to this Message never came. Queued once while it is
+            # pending, so a broken gateway does not fill the queue with it.
             notice = mirror.receive_problem_notice(unanswerable)
             adapter_module.update_state_file(
-                lambda document: state.queue_mirror(document, notice)
+                lambda document: (
+                    document
+                    if any(
+                        state.mirror_entry_text(entry) == notice
+                        for entry in document.get("pending_mirrors", [])
+                    )
+                    else state.queue_mirror(document, notice)
+                )
             )
         if count_reply:
             adapter_module.update_state_file(
@@ -407,7 +416,13 @@ async def amessenger_send(args: dict, **_) -> str:
                 document, key, result_message["id"], state.now()
             ),
         )
-    return _send_result(result, text, to, owner_copy_queued, unanswerable)
+    return _send_result(
+        result,
+        text,
+        to,
+        owner_copy_queued=owner_copy_queued,
+        receive_problem=unanswerable,
+    )
 
 
 def _status_line(delivery: dict) -> str:
