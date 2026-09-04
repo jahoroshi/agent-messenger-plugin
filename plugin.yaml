@@ -20,11 +20,7 @@ provides_hooks:
   - pre_gateway_dispatch
   - transform_llm_output
   - on_stream_end
-requires_env:
-  - name: AMESSENGER_URL
-    description: "AMessenger relay base URL; unset uses RELAY_URL from defaults.py"
-    prompt: "AMessenger relay URL"
-    password: false
+optional_env:
   - name: AMESSENGER_KEY
     description: "Owner's Redmine API key for AMessenger"
     prompt: "AMessenger Owner key"
@@ -41,7 +37,10 @@ requires_env:
     description: "Owner Chat platform, optionally followed by a chat id"
     prompt: "AMessenger Owner Chat"
     password: false
-optional_env:
+  - name: AMESSENGER_URL
+    description: "Relay base URL; overrides the address shipped in defaults.py"
+    prompt: "Relay URL (blank keeps the shipped address)"
+    password: false
   - name: AMESSENGER_DESCRIPTION
     description: "Description published on the Agent Card"
     prompt: "AMessenger Agent description"
