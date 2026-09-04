@@ -139,10 +139,20 @@ def _setup_gateway_adapter_message() -> str:
             f"{', '.join(missing)}. Type {command} in this chat to write the "
             "missing values and connect AMessenger."
         )
+    problem = adapter_module.last_connect_problem()
+    if problem:
+        # Naming the fault is the whole point: "restart the gateway" sends an
+        # Owner into a loop a restart can never end.
+        return (
+            "AMessenger cannot start with this profile: "
+            f"{problem}.\n"
+            "Fix that value, then restart the gateway and type `/amsg setup` "
+            "in this chat. Restarting alone will not help."
+        )
     return (
-        "AMessenger is running in the gateway, but its adapter is unavailable even "
-        "though all five configuration variables are present. Restart the gateway, "
-        "then type `/amsg setup` in this chat."
+        "AMessenger is running in the gateway, but its adapter is unavailable and "
+        "reported no reason. Restart the gateway; if this repeats, the gateway log "
+        "line beginning `[amessenger] not connecting:` names the cause."
     )
 
 

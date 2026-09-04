@@ -21,7 +21,9 @@ RELAY_URL = "http://34.179.158.248:8010"
 # --repo nor AMESSENGER_REPOSITORY_URL. install.sh holds its own copy of this
 # value because it must run before Python does; tests/test_defaults.py keeps
 # the two in step.
-REPOSITORY_URL = "git@gitlab.azati.com:andrei.shelepen/agent-messenger.git"
+# The plugin is published on its own, at the root of this repository, so the
+# identifier needs no subdirectory fragment and no credentials.
+REPOSITORY_URL = "https://github.com/jahoroshi/agent-messenger-plugin.git"
 
 
 def relay_url() -> str:

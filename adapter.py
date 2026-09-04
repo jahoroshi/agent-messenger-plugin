@@ -86,6 +86,7 @@ GATEWAY_NOTICE_PREFIXES = (
 )
 INTERIM_SEND_KEY = "_interim_send"
 _LIVE_ADAPTER = None
+_LAST_CONNECT_PROBLEM: str | None = None
 
 
 def env_path_for_process() -> Path:
@@ -197,6 +198,16 @@ def update_profile_env(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(updated)
     return target
+
+
+def last_connect_problem() -> str | None:
+    """Why connect() last refused, so a command can tell the Owner.
+
+    Without this the Owner is told to restart the gateway, which can never
+    fix a configuration fault: they restart forever and the real reason
+    stays in a log they cannot read.
+    """
+    return _LAST_CONNECT_PROBLEM
 
 
 def live_adapter():
@@ -782,7 +793,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             return False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        global _LIVE_ADAPTER
+        global _LIVE_ADAPTER, _LAST_CONNECT_PROBLEM
         _LIVE_ADAPTER = None
         self._running = False
         problem = self.configuration_problem()
@@ -792,6 +803,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             self._settings.get("agent") or ""
         ).strip()
         if problem and not (fresh_install or disabled_owner_chat or waiting_for_setup):
+            _LAST_CONNECT_PROBLEM = problem
             logger.error("[amessenger] not connecting: %s", problem)
             return False
         if disabled_owner_chat:
@@ -810,6 +822,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 )
                 self._owner_user_warning_logged = True
         self._loop = asyncio.get_running_loop()
+        _LAST_CONNECT_PROBLEM = None
         self._running = True
         self._connected_via_connect = True
         self._poll_task = asyncio.create_task(self.run_poll_loop())
