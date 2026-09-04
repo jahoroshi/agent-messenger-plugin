@@ -9,7 +9,8 @@ die() {
 
 usage() {
     printf 'Usage: %s [-p profile] [--repo url] [--relay url]\n' "$0" >&2
-    printf '       %s --owner-chat <platform>:<chat id> [--agent name] [--kind corporate|personal] [--key key]\n' "$0" >&2
+    printf '       %s --owner-chat <platform>[:<chat id>] [--agent name] [--kind corporate|personal] [--key key]\n' "$0" >&2
+    printf '       <platform> alone (google_chat) uses this Hermes home channel; the Agent name defaults to the Owner.\n' >&2
     exit 2
 }
 
@@ -56,7 +57,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --owner-chat)
-            [[ $# -ge 2 && -n "$2" ]] || die "option --owner-chat needs a value; use --owner-chat <platform>:<chat id>"
+            [[ $# -ge 2 && -n "$2" ]] || die "option --owner-chat needs a value; use --owner-chat <platform> or --owner-chat <platform>:<chat id>"
             OWNER_CHAT=$2
             shift 2
             ;;
@@ -395,5 +396,5 @@ if [[ -n "$OWNER_CHAT" ]]; then
     printf 'AMessenger is installed and configured for %s. Restart the gateway and mail arrives in that chat.\n' "$PROFILE_DESCRIPTION"
 else
     printf 'Next step: type /amsg setup in the chat that should receive mail.\n'
-    printf 'If that chat cannot be used, rerun this installer with --owner-chat <platform>:<chat id>.\n'
+    printf 'If that chat cannot be used, rerun this installer with --owner-chat <platform> (for example google_chat).\n'
 fi
