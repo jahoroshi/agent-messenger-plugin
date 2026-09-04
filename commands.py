@@ -896,7 +896,10 @@ async def _rename(adapter, tokens: list[str]) -> str:
                     "pick a different name."
                 )
         return _relay_failure("rename the Channel", caught)
-    adapter.remember_channel(renamed)
+    # A TUI has no adapter; the state file is the shared record either way.
+    _update_state(adapter, lambda document: state.remember_channel(document, renamed))
+    if adapter is not None:
+        adapter.remember_channel(renamed)
     return (
         f"Renamed {old_label} to {mirror.label(renamed)}. "
         "Every Member was told; that is the name to type from now on."
