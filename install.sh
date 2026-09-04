@@ -385,8 +385,10 @@ if [[ -n "$OWNER_CHAT" ]]; then
     # Finish here. /amsg setup reads the Owner Chat off a gateway event, and some
     # gateways hand the plugin no chat id at all -- on those the chat command can
     # never work, and the Owner is left with no way forward.
-    AGENT_NAME=${AGENT_NAME:-$PROFILE}
-    provision_args=(--owner-chat "$OWNER_CHAT" --agent "$AGENT_NAME" --kind "$AGENT_KIND")
+    provision_args=(--owner-chat "$OWNER_CHAT" --kind "$AGENT_KIND")
+    # No --agent: provision.py names the Agent after the Owner the key belongs
+    # to, which is unique already. Thirty Owners run one identical command.
+    [[ -n "$AGENT_NAME" ]] && provision_args+=(--agent "$AGENT_NAME")
     [[ -n "$OWNER_KEY" ]] && provision_args+=(--key "$OWNER_KEY")
     HERMES_HOME="$PROFILE_HOME" python3 "$PLUGIN_PATH/provision.py" "${provision_args[@]}" \
         || die "AMessenger is installed but could not be configured; the message above names the cause."
