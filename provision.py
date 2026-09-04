@@ -109,7 +109,7 @@ def publish_card(relay: str, key: str, agent: str, kind: str) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="amessenger-provision")
     parser.add_argument("--owner-chat", required=True,
-                        help="platform or platform:chat_id, e.g. google_chat:spaces/AAA")
+                        help="platform, or platform:chat_id. `google_chat` alone uses this Hermes home channel, so no chat id is needed.")
     parser.add_argument("--agent", default="",
                         help="Agent name; default is the Owner's login, already unique")
     parser.add_argument("--kind", default="corporate", choices=KINDS)
