@@ -1200,9 +1200,12 @@ def make_handler():
             # Owner-identity refusal would blame the wrong thing: name the
             # real fault, the same way setup does.
             return _setup_gateway_adapter_message()
-        if getattr(adapter, "_waiting_for_owner_chat", False):
-            # There is no Owner Chat to check against yet; only setup (or
-            # Hermes's /sethome) can create one.
+        if getattr(adapter, "_waiting_for_owner_chat", False) and _may_claim_owner_chat(
+            adapter, source
+        ):
+            # There is no Owner Chat to check against yet. Only a chat that
+            # could claim it is told so; anyone else gets the plain refusal,
+            # because coaching a stranger on how to claim is worse.
             return NO_OWNER_CHAT_YET
         if not owner_check(adapter, source):
             _log_refusal(source)
