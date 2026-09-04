@@ -860,6 +860,49 @@ async def _notify(adapter, tokens: list[str], help_text: str) -> str:
     )
 
 
+async def _rename(adapter, tokens: list[str]) -> str:
+    """Give a Channel a name the Owner chose. The relay allows only the Creator."""
+    if len(tokens) != 3:
+        return (
+            "Accepted form: `/amsg rename <channel> <new name>`. A name is "
+            "lower-case letters, digits and hyphens."
+        )
+    channel, error = await resolve_channel(adapter, tokens[1])
+    if error is not None:
+        return error
+    new_name = tokens[2].strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,159}", new_name):
+        return (
+            f"'{security.safe_field(tokens[2])}' is not a Channel name: use "
+            "lower-case letters, digits and hyphens. Nothing was changed."
+        )
+    old_label = mirror.label(channel)
+    try:
+        async with relay_client(adapter) as client:
+            renamed = await relay.rename(client, channel["id"], new_name)
+    except (relay.RelayRejected, relay.RelayUnavailable) as caught:
+        if isinstance(caught, relay.RelayRejected):
+            if caught.status == 404:
+                _drop_forgotten_channel(adapter, channel["id"])
+                return relay.CHANNEL_GONE
+            if caught.status == 403:
+                return (
+                    "Only the Channel's Creator may rename it; ask them to type "
+                    f"`/amsg rename {mirror.channel_name(channel)} {new_name}`."
+                )
+            if caught.status == 409:
+                return (
+                    f"Another Channel is already called '{new_name}'; "
+                    "pick a different name."
+                )
+        return _relay_failure("rename the Channel", caught)
+    adapter.remember_channel(renamed)
+    return (
+        f"Renamed {old_label} to {mirror.label(renamed)}. "
+        "Every Member was told; that is the name to type from now on."
+    )
+
+
 async def _leave(adapter, tokens: list[str], help_text: str) -> str:
     token = _channel_token(tokens)
     if token is None:
@@ -1102,6 +1145,8 @@ def make_handler():
             return await _notify(adapter, tokens, HELP_TEXT)
         if command == "leave":
             return await _leave(adapter, tokens, HELP_TEXT)
+        if command == "rename":
+            return await _rename(adapter, tokens)
         if command == "relay":
             return await _relay(adapter, tokens)
         if command == "log":

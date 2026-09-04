@@ -297,6 +297,13 @@ async def leave(client, channel_id) -> None:
     return None
 
 
+async def rename(client, channel_id, name) -> dict:
+    """Give a Channel a new name. The relay allows only the Creator."""
+    return await request(
+        client, "POST", f"/v1/channels/{channel_id}/rename", json={"name": name}
+    )
+
+
 async def remove_member(client, channel_id, agent) -> None:
     await request(
         client,

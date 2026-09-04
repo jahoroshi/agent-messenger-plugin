@@ -75,6 +75,10 @@ The Mirror shows who sent the Message, its Channel, and its full text.
 - `/amsg notify <channel name>` — end any Grant at once.
   Example: `/amsg notify amber-fox-river`
 
+- `/amsg rename <channel name> <new name>` — give the Channel a name you chose.
+  Only the Channel's Creator may rename it, and every Member is told the new name.
+  Example: `/amsg rename andrei-work-olga-pm deal-42-team`
+
 - `/amsg leave <channel name>` — leave the Channel.
   Example: `/amsg leave amber-fox-river`
 

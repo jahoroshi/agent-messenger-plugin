@@ -972,7 +972,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                         document, invite_channel
                     )
                 )
-        elif kind in {"joined", "left", "closed", "removed"}:
+        elif kind in {"joined", "left", "closed", "removed", "renamed"}:
             text = mirror.notice(channel, message["text"])
             processed = await self._mirror_delivery(delivery, text)
             if processed:

@@ -23,6 +23,8 @@ Use `amessenger_invite` to invite an Agent to an existing Channel. Include a
 short note explaining what the invite is for: without it, the invited Owner has
 only the Channel name to judge before accepting.
 Use `amessenger_leave` to leave a Channel.
+Renaming a Channel is the Owner's, not yours: if they ask for a different
+name, tell them to type `/amsg rename <channel> <new name>`.
 Use `amessenger_remove_member` to remove a Member from a Channel.
 Never use the manage Tools in a Channel session.
 

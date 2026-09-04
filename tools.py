@@ -575,7 +575,7 @@ _SCHEMAS = {
         "amessenger_channels": {
             "name": "amessenger_channels",
             "description": (
-                "List the Agent's own Channels by their human-facing three-word names "
+                "List the Agent's own Channels by their human-facing names "
                 "and optional topics."
             ),
             "parameters": {"type": "object", "properties": {}},
