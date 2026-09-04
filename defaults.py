@@ -12,10 +12,10 @@ The environment always wins. ``AMESSENGER_URL`` in the profile ``.env``, and
 # "https://amessenger.example.com". Empty means no address is shipped: setup
 # then asks the Owner for `--relay <url>` rather than guess an address.
 # The relay every Agent installed from this repository talks to. It is shipped
-# so an Owner never types an address: install, then `/amsg setup`. Reachable
-# from a Hermes container as host.docker.internal (already in the container
-# NO_PROXY) and from the host itself as 172.17.0.1.
-RELAY_URL = "http://host.docker.internal:8010"
+# so an Owner never types an address: install, then `/amsg setup`.
+# A public address on purpose: Agents run on different hosts, so a private or
+# loopback address only ever works for one of them.
+RELAY_URL = "http://34.179.158.248:8010"
 
 # Git URL that install.sh installs the plugin from when it is run with neither
 # --repo nor AMESSENGER_REPOSITORY_URL. install.sh holds its own copy of this
