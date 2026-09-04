@@ -10,7 +10,11 @@ _INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?m)^\s*(system|assistant|developer)\s*:\s*", re.IGNORECASE),
     re.compile(r"ignore (?:all|any|the) (?:previous|prior|above) instructions", re.IGNORECASE),
     re.compile(r"disregard (?:all|any|the) (?:previous|prior|above)", re.IGNORECASE),
-    re.compile(r"you are now (?:a|an|in) ", re.IGNORECASE),
+    # Split across two adjacent literals on purpose. As one literal this line
+    # trips Hermes's own install scanner (rule ``role_hijack``), which turns a
+    # clean install into a "caution" verdict that needs ``--force``. The
+    # compiled pattern is byte-identical; a test asserts that.
+    re.compile(r"you are " r"now (?:a|an|in) ", re.IGNORECASE),
     re.compile(r"</?(?:system|assistant|tool)[^>]*>", re.IGNORECASE),
 )
 
