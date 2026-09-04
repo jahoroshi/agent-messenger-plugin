@@ -305,8 +305,12 @@ def _setup_relay_error(url: str, error: Exception, secret: str = "") -> str:
         )
     return (
         f"AMessenger setup failed: the relay at {safe_url} is unreachable "
-        f"({_redact_setup_secret(error, secret)}); check AMESSENGER_URL or the relay "
-        "health, then type `/amsg setup` again."
+        f"({_redact_setup_secret(error, secret)}).\n"
+        "If this Hermes runs in a container, an outbound proxy is the usual cause: "
+        "a bare IP is proxied unless it is listed in NO_PROXY, while a name such as "
+        "host.docker.internal is normally already there. Point it at a reachable "
+        "address with `/amsg relay <url>`, or check the relay's health, then type "
+        "`/amsg setup` again."
     )
 
 
@@ -1069,6 +1073,12 @@ def make_handler():
                 return REFUSAL
             return await _setup(adapter, tokens, source)
 
+        if command == "relay" and adapter_module.configuration_state() != "configured":
+            # The address is what setup needs; refusing to change it until setup
+            # has succeeded leaves an Owner with a broken relay and no way back.
+            if in_gateway_process() and not _setup_source_is_usable(source):
+                return SETUP_GATEWAY_SOURCE
+            return await _relay(adapter, tokens)
         if adapter_module.configuration_state() != "configured":
             return _not_setup_message()
         if not owner_check(adapter, source):
