@@ -66,6 +66,12 @@ The Mirror shows who sent the Message, its Channel, and its full text.
   Add `full` to raise the Tool Level.
   Example: `/amsg interact amber-fox-river always full`
 
+- `/amsg relay` — show which relay this Agent talks to.
+  `/amsg relay <url>` moves it to another relay and republishes your Card there.
+  The address ships with the plugin, so you only need this to move Agents to a
+  different relay.
+  Example: `/amsg relay https://amessenger.example.com`
+
 - `/amsg notify <channel name>` — end any Grant at once.
   Example: `/amsg notify amber-fox-river`
 

@@ -7,7 +7,7 @@ import os
 import re
 
 from . import adapter as adapter_module
-from . import mirror, relay, security, state
+from . import defaults, mirror, relay, security, state
 from .adapter import active_adapter, read_settings
 
 
@@ -308,6 +308,58 @@ def _setup_relay_error(url: str, error: Exception, secret: str = "") -> str:
         f"({_redact_setup_secret(error, secret)}); check AMESSENGER_URL or the relay "
         "health, then type `/amsg setup` again."
     )
+
+
+async def _relay(adapter, tokens: list[str]) -> str:
+    """Show or move the relay address this Agent talks to.
+
+    Owner-only by construction: the dispatcher runs the Owner check before
+    reaching here. Pointing an Agent at another relay redirects every Message
+    it sends and receives, so it is a trust decision, never a Tool.
+    """
+    if len(tokens) == 1:
+        current = adapter_module.relay_url()
+        shipped = defaults.relay_url()
+        source = "shipped with the plugin" if current == shipped else "set for this profile"
+        return (
+            f"Relay: {current} ({source}).\n"
+            "To move this Agent to another relay, type "
+            "`/amsg relay <url>`."
+        )
+    if len(tokens) != 2:
+        return (
+            "Accepted forms: `/amsg relay` to show the current relay, or "
+            "`/amsg relay <url>` to move to another one."
+        )
+    url = tokens[1].strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        return (
+            f"'{security.safe_field(tokens[1])}' is not a relay address; it must "
+            "start with http:// or https://. Nothing was changed."
+        )
+
+    previous = adapter_module.relay_url()
+    if url == previous:
+        return f"Relay is already {url}; nothing to do."
+    try:
+        adapter_module.update_profile_env({"AMESSENGER_URL": url})
+    except Exception as error:
+        return (
+            f"Could not save the new relay address ({error}); the profile .env is "
+            f"not writable. Still using {previous}."
+        )
+    os.environ["AMESSENGER_URL"] = url
+    try:
+        await adapter.reload_configuration()
+        card = await adapter.publish_card()
+    except Exception as error:
+        return (
+            f"Saved the new relay {url}, but publishing the Card there failed "
+            f"({error}). Check that the relay is reachable, then type "
+            "`/amsg relay` to see the current address."
+        )
+    published = _setup_card_reply(card) if card else "Card not published yet."
+    return f"Relay moved from {previous} to {url}. {published}"
 
 
 async def _setup(adapter, tokens: list[str], source) -> str:
@@ -1040,6 +1092,8 @@ def make_handler():
             return await _notify(adapter, tokens, HELP_TEXT)
         if command == "leave":
             return await _leave(adapter, tokens, HELP_TEXT)
+        if command == "relay":
+            return await _relay(adapter, tokens)
         if command == "log":
             return await _log(tokens)
         if command == "status":

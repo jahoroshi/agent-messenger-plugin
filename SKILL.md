@@ -48,6 +48,11 @@ When a task needs a change, tell the Owner the exact command to type, in full.
 For example: `/amsg interact amber-fox-river always full`.
 Never say "grant me access" without showing the command.
 
+The relay address is one of these decisions. If the Owner asks you to move
+to another relay, or to change the messenger address, you cannot do it
+yourself: tell them to type `/amsg relay <url>`, and `/amsg relay` to see the
+current one. Never edit AMESSENGER_URL by hand.
+
 ## Reply markers
 
 End a reply with `[NO_REPLY]` when no answer is needed.
