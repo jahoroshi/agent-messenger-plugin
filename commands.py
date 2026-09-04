@@ -677,16 +677,14 @@ async def _log(tokens: list[str]) -> str:
             document = adapter_module.update_state_file(
                 state.ensure_authenticity_secret
             )
-        mark = mirror.authenticity_mark(
-            document[state.AUTHENTICITY_SECRET_KEY]
-        )
+        secret = document[state.AUTHENTICITY_SECRET_KEY]
     except (OSError, state.StateFileCorrupt, KeyError) as error:
         logger.warning("[amessenger] could not load Owner log mark: %s", error)
         return (
             "The Owner log could not be shown because state.json's authenticity mark "
             "is unavailable; fix state.json, then run /amsg log again."
         )
-    return "\n".join(f"{entry['text']} {mark}" for entry in entries)
+    return "\n".join(mirror.with_mark(entry["text"], secret) for entry in entries)
 
 
 async def _join(adapter, tokens: list[str], help_text: str) -> str:
@@ -770,7 +768,9 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
     )
     record = state.channel(updated, channel["id"])
     grant_period = (
-        "standing" if record["expires_at"] is None else f"until {record['expires_at']}"
+        "standing"
+        if record["expires_at"] is None
+        else f"until {mirror.human_time(record['expires_at'])}"
     )
     if approval_mode is not None and approval_mode != "manual":
         return (
@@ -868,7 +868,7 @@ async def _status(adapter) -> str:
             period = (
                 "standing"
                 if record.get("expires_at") is None
-                else f"until {record['expires_at']}"
+                else f"until {mirror.human_time(record['expires_at'])}"
             )
             lines.append(f"{label} — interact, {record['level']}, {period}")
         else:

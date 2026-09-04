@@ -1,6 +1,8 @@
 """Owner-visible AMessenger messages."""
 
 import logging
+import os
+from datetime import datetime, timezone
 
 from . import security
 
@@ -30,11 +32,81 @@ MIRROR_HEADER_PREFIXES = (
     APPROVAL_HEADER_PREFIX,
 )
 AGENT_WRITTEN_PREFIX = "⚠ (agent wrote, not a Mirror) "
+SHOW_MARK_VARIABLE = "AMESSENGER_SHOW_MARK"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+# Durations offered in the hint.  The grammar accepts any <N>h/<N>m too; these
+# are the choices worth putting in front of an Owner who is deciding now.
+GRANT_CHOICES = "always | 1h | 5h"
+GRANT_DEFAULT = "always"
+
+
+def grant_hint(name: str) -> str:
+    """Offer the Owner the interact choices, with the full command spelled out."""
+    return (
+        "— notify mode. Let my agent answer on its own:\n"
+        f"   /amsg interact {name} {GRANT_DEFAULT}        — how long: {GRANT_CHOICES}\n"
+        f"   /amsg interact {name} {GRANT_DEFAULT} full   — the same, plus all tools"
+    )
 
 
 def authenticity_mark(secret: str) -> str:
     """Render the short mark that identifies a real Owner-Chat post."""
     return f"⟦{secret}⟧"
+
+
+def mark_is_visible() -> bool:
+    """Whether Owner-Chat lines carry the authenticity mark.
+
+    The mark proves a line came from AMessenger and not from the model
+    imitating a Mirror (§6.5a).  Operators who find it noisy can hide it, at
+    the cost of that proof, so it is opt-in and defaults to hidden.
+    """
+    return os.getenv(SHOW_MARK_VARIABLE, "").strip().lower() in _TRUE_VALUES
+
+
+def with_mark(text: str, secret: str) -> str:
+    """Append the authenticity mark to one Owner-Chat line when it is shown."""
+    if not mark_is_visible():
+        return text
+    return f"{text} {authenticity_mark(secret)}"
+
+
+def human_time(value: str | None, moment: datetime | None = None) -> str:
+    """Render a stored UTC timestamp in the reader's own clock.
+
+    Owners read these lines in a chat window, not in a log, so an ISO string
+    in UTC is the wrong unit.  An unparsable value falls back to itself so a
+    corrupt record is still shown rather than hidden.
+    """
+    if not value:
+        return ""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError):
+            return str(value)
+    parsed = parsed.replace(tzinfo=timezone.utc).astimezone()
+    now = (moment or datetime.now(timezone.utc)).astimezone()
+    stamp = parsed.strftime("%H:%M")
+    if parsed.date() == now.date():
+        when = f"today at {stamp}"
+    elif (parsed.date() - now.date()).days == 1:
+        when = f"tomorrow at {stamp}"
+    else:
+        when = parsed.strftime("%d %b at %H:%M")
+    remaining = int((parsed - now).total_seconds())
+    if remaining <= 0:
+        return when
+    hours, minutes = divmod(remaining // 60, 60)
+    if hours and minutes:
+        left = f"{hours}h {minutes}m"
+    elif hours:
+        left = f"{hours}h"
+    else:
+        left = f"{max(minutes, 1)}m"
+    return f"{when} ({left} left)"
 
 
 def _line_imitates_mirror(line: str) -> bool:
@@ -101,8 +173,8 @@ def _sender_details(sender_card: dict | None) -> tuple[str, str, str]:
 def _incoming_header(sender_card, channel) -> str:
     sender_name, owner_name, kind = _sender_details(sender_card)
     return (
-        f"{INCOMING_HEADER_PREFIX}{sender_name} ({owner_name}, {kind}) · "
-        f"channel {label(channel)}"
+        f"{INCOMING_HEADER_PREFIX}agent {sender_name} "
+        f"(Owner: {owner_name}, {kind}) · channel {label(channel)}"
     )
 
 
@@ -111,10 +183,7 @@ def incoming(sender_card, channel, text, policy) -> str:
     header = _incoming_header(sender_card, channel)
     rendered = f"{header}\n{quote_body(text)}"
     if policy == "notify":
-        rendered += (
-            f"\n— notify mode. To let me answer on my own: /amsg interact "
-            f"{channel_name(channel)} 1h   (add \"full\" for all tools)"
-        )
+        rendered += "\n" + grant_hint(channel_name(channel))
     return rendered
 
 

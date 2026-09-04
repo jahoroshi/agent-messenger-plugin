@@ -1323,12 +1323,11 @@ class AMessengerAdapter(BasePlatformAdapter):
         # explanatory sentence here makes that seam turn it into the one
         # concrete mark the Owner should remember, without putting the mark in
         # the log or any model-visible transcript.
-        text = (
-            self._help_text
-            + "\n\n"
-            + format_card(self._card)
-            + "\n\nReal AMessenger lines end with"
-        )
+        text = self._help_text + "\n\n" + format_card(self._card)
+        # The sentence only makes sense when the seam will actually append a
+        # mark; with the mark hidden it would trail off mid-phrase.
+        if mirror.mark_is_visible():
+            text += "\n\nReal AMessenger lines end with"
         # A welcome is retried by the startup loop, not persisted as a second
         # pending copy; otherwise the failed attempt and the retry can both
         # appear when the Owner adapter comes back.
@@ -1834,7 +1833,9 @@ class AMessengerAdapter(BasePlatformAdapter):
         owner = await self.wait_for_owner_adapter()
         if owner is None:
             return False
-        marked_text = f"{text} {mirror.authenticity_mark(self.state()[state.AUTHENTICITY_SECRET_KEY])}"
+        marked_text = mirror.with_mark(
+            text, self.state()[state.AUTHENTICITY_SECRET_KEY]
+        )
         posted = await mirror.mirror(
             owner,
             self._owner_platform,

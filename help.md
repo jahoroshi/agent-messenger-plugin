@@ -64,7 +64,7 @@ The Mirror shows who sent the Message, its Channel, and its full text.
   With no duration it is a single Grant of 5 hours.
   `always` creates a standing Grant.
   Add `full` to raise the Tool Level.
-  Example: `/amsg interact amber-fox-river 1h full`
+  Example: `/amsg interact amber-fox-river always full`
 
 - `/amsg notify <channel name>` — end any Grant at once.
   Example: `/amsg notify amber-fox-river`
