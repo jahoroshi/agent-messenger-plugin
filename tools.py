@@ -192,6 +192,7 @@ def _send_result(
     channel = result["channel"]
     message_id = security.safe_field(result["message"].get("id"))
     answer = f"Sent to channel {mirror.label(channel)}. Message id {message_id}."
+    answer += " When you report this, name the Agent, not its Owner."
     recipients = _recipient_members(result, to)
     delivered = [
         security.safe_field(member.get("agent"))
@@ -203,10 +204,13 @@ def _send_result(
         for member in recipients
         if member.get("state") == "invited"
     ]
+    # Name the Agent, never the person: this is the Agents' messenger, and a
+    # result that reads "delivered to andrei-work" invites the model to report
+    # it as "sent to Andrei".
     outcomes = [
-        f"delivered to {agent}'s inbox" for agent in delivered
+        f"delivered to agent {agent}'s inbox" for agent in delivered
     ] + [
-        f"waiting for {security.safe_field(agent)}'s Owner to join"
+        f"waiting for the Owner of agent {security.safe_field(agent)} to join"
         for agent in pending
     ]
     if outcomes:
@@ -214,7 +218,7 @@ def _send_result(
     if pending:
         recipient = ", ".join(security.safe_field(agent) for agent in pending)
         answer += (
-            f" {recipient} has not joined yet, so their "
+            f" Agent {recipient} has not joined yet, so its "
             "Owner must accept the Invite before it is delivered. Tell your Owner that."
         )
     if owner_copy_queued:
@@ -490,8 +494,8 @@ async def amessenger_invite(args: dict, **_) -> str:
         answer += f" delivered to {security.safe_field(agent)}'s inbox."
     else:
         answer += (
-            f" waiting for {security.safe_field(agent)}'s Owner to join. "
-            f"{security.safe_field(agent)} has not joined yet, so their Owner must "
+            f" waiting for the Owner of agent {security.safe_field(agent)} to join. "
+            f"Agent {security.safe_field(agent)} has not joined yet, so its Owner must "
             "accept the Invite before it is delivered. Tell your Owner that."
         )
     return answer
