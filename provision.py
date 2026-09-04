@@ -76,6 +76,21 @@ def write_env(path: Path, updates: dict) -> None:
     os.replace(handle.name, path)
 
 
+def owner_login(relay: str, key: str) -> str:
+    """Ask the relay who this key belongs to, before any Agent exists."""
+    request = urllib.request.Request(
+        f"{relay}/v1/whoami", headers={"Authorization": f"Bearer {key}"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return (json.loads(response.read().decode("utf-8")) or {}).get("login") or ""
+
+
+def agent_name_from_login(login: str) -> str:
+    """Turn a Redmine login into a valid, and already unique, Agent name."""
+    name = re.sub(r"[^a-z0-9-]+", "-", login.strip().lower()).strip("-")
+    return name[:32].rstrip("-")
+
+
 def publish_card(relay: str, key: str, agent: str, kind: str) -> dict:
     request = urllib.request.Request(
         f"{relay}/v1/agents/me",
@@ -95,16 +110,18 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="amessenger-provision")
     parser.add_argument("--owner-chat", required=True,
                         help="platform or platform:chat_id, e.g. google_chat:spaces/AAA")
-    parser.add_argument("--agent", required=True, help="globally unique Agent name")
+    parser.add_argument("--agent", default="",
+                        help="Agent name; default is the Owner's login, already unique")
     parser.add_argument("--kind", default="corporate", choices=KINDS)
     parser.add_argument("--key", default="", help="Owner key; default REDMINE_API_KEY")
     parser.add_argument("--relay", default="", help="relay URL; default the shipped one")
     parser.add_argument("--owner-user", default="", help="Owner id when the chat is a group")
     args = parser.parse_args(argv)
 
-    if AGENT_NAME.fullmatch(args.agent) is None:
+    agent = args.agent.strip()
+    if AGENT_NAME.fullmatch(agent) is None and agent:
         print(
-            f"'{args.agent}' is not a valid Agent name: 2-32 characters, lowercase "
+            f"'{agent}' is not a valid Agent name: 2-32 characters, lowercase "
             "letters, digits and hyphens, starting with a letter or digit.",
             file=sys.stderr,
         )
@@ -127,8 +144,24 @@ def main(argv=None) -> int:
         print("No relay address is configured; pass --relay <url>.", file=sys.stderr)
         return 2
 
+    if not agent:
+        # Nobody should have to invent a name for each of thirty Owners: the
+        # Redmine login is unique already and the key proves who it belongs to.
+        try:
+            agent = agent_name_from_login(owner_login(relay, key))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
+            print(f"Could not ask {relay} who this key belongs to: {error}", file=sys.stderr)
+            return 1
+        if AGENT_NAME.fullmatch(agent) is None:
+            print(
+                "Could not derive an Agent name from the Owner's login; "
+                "pass --agent <name>.",
+                file=sys.stderr,
+            )
+            return 2
+
     try:
-        card = publish_card(relay, key, args.agent, args.kind)
+        card = publish_card(relay, key, agent, args.kind)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:200]
         print(f"The relay at {relay} refused the Card ({error.code}): {detail}", file=sys.stderr)
@@ -140,7 +173,7 @@ def main(argv=None) -> int:
     updates = {
         "AMESSENGER_URL": relay,
         "AMESSENGER_KEY": key,
-        "AMESSENGER_AGENT": args.agent,
+        "AMESSENGER_AGENT": agent,
         "AMESSENGER_KIND": args.kind,
         "AMESSENGER_OWNER_CHAT": args.owner_chat.strip(),
     }
@@ -150,7 +183,7 @@ def main(argv=None) -> int:
 
     owner = (card.get("owner") or {}) if isinstance(card, dict) else {}
     print(
-        f"AMessenger is configured. Agent {args.agent} ({args.kind}); "
+        f"AMessenger is configured. Agent {agent} ({args.kind}); "
         f"Owner {owner.get('name') or owner.get('login') or 'unknown'}; "
         f"Owner Chat {args.owner_chat}. Restart the gateway and mail will arrive there."
     )
