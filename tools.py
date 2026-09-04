@@ -186,8 +186,26 @@ def _usable_send_result(result) -> bool:
     )
 
 
+def _receive_warning(problem: str | None, *, no_owner_copy: bool = False) -> str:
+    """The sentence that stops a send from looking answered when it cannot be."""
+    if not problem:
+        return ""
+    lead = (
+        "Your Owner Chat received no copy, and replies cannot arrive here"
+        if no_owner_copy
+        else "WARNING: replies cannot arrive here"
+    )
+    return (
+        f" {lead}: {problem}. Tell your Owner that; do not try to fix it yourself."
+    )
+
+
 def _send_result(
-    result: dict, text: str, to: str | None, owner_copy_queued: bool = False
+    result: dict,
+    text: str,
+    to: str | None,
+    owner_copy_queued: bool = False,
+    receive_problem: str | None = None,
 ) -> str:
     channel = result["channel"]
     message_id = security.safe_field(result["message"].get("id"))
@@ -221,7 +239,11 @@ def _send_result(
             f" Agent {recipient} has not joined yet, so its "
             "Owner must accept the Invite before it is delivered. Tell your Owner that."
         )
-    if owner_copy_queued:
+    if receive_problem:
+        # In a gateway with no receive loop the queued copy is never drained,
+        # so it must not be reported as on its way.
+        answer += _receive_warning(receive_problem, no_owner_copy=owner_copy_queued)
+    elif owner_copy_queued:
         answer += " Your Owner Chat copy is queued for the gateway to post."
     return answer
 
@@ -293,6 +315,9 @@ async def amessenger_send(args: dict, **_) -> str:
         if previous is not None:
             return _already_sent_answer(channel, previous)
 
+    # Asked once, before the send, so both the result and the queued Owner
+    # copy describe the same state.
+    unanswerable = adapter_module.receive_problem()
     count_reply = False
     reply_moment = None
     if adapter is not None and channel_id is not None:
@@ -354,6 +379,13 @@ async def amessenger_send(args: dict, **_) -> str:
         adapter_module.update_state_file(
             lambda document: state.queue_mirror(document, owner_line)
         )
+        if unanswerable:
+            # If a gateway ever drains this queue, the Owner also learns why
+            # the reply to this Message never came.
+            notice = mirror.receive_problem_notice(unanswerable)
+            adapter_module.update_state_file(
+                lambda document: state.queue_mirror(document, notice)
+            )
         if count_reply:
             adapter_module.update_state_file(
                 lambda document: state.note_reply(
@@ -375,7 +407,7 @@ async def amessenger_send(args: dict, **_) -> str:
                 document, key, result_message["id"], state.now()
             ),
         )
-    return _send_result(result, text, to, owner_copy_queued)
+    return _send_result(result, text, to, owner_copy_queued, unanswerable)
 
 
 def _status_line(delivery: dict) -> str:
@@ -456,6 +488,7 @@ async def amessenger_create_channel(args: dict, **_) -> str:
         f"Created channel {mirror.label(channel)}.\n"
         f"Invited: {', '.join(invited) if invited else 'none'}.\n"
         f"Joined immediately: {', '.join(joined) if joined else 'none'}."
+        + _receive_warning(adapter_module.receive_problem())
     )
 
 
@@ -498,7 +531,7 @@ async def amessenger_invite(args: dict, **_) -> str:
             f"Agent {security.safe_field(agent)} has not joined yet, so its Owner must "
             "accept the Invite before it is delivered. Tell your Owner that."
         )
-    return answer
+    return answer + _receive_warning(adapter_module.receive_problem())
 
 
 async def amessenger_leave(args: dict, **_) -> str:

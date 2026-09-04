@@ -963,11 +963,15 @@ async def _status(adapter) -> str:
             channels = await relay.list_channels(client)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return _relay_failure("list Channels", error)
+    lines = []
+    problem = adapter_module.receive_problem()
+    if problem:
+        lines.append(f"AMessenger cannot receive mail: {problem}")
     if not channels:
-        return "No Channels yet; nothing to do."
+        lines.append("No Channels yet; nothing to do.")
+        return "\n".join(lines)
 
     agent_name = read_settings().get("agent", "")
-    lines = []
     for channel in sorted(channels, key=mirror.label):
         label = mirror.label(channel)
         if _is_invited(channel, agent_name):
@@ -1137,6 +1141,11 @@ def make_handler():
             return await _relay(adapter, tokens)
         if adapter_module.configuration_state() != "configured":
             return _not_setup_message()
+        if in_gateway_process() and adapter is None:
+            # The profile is complete but nothing is running for it. The
+            # Owner-identity refusal would blame the wrong thing: name the
+            # real fault, the same way setup does.
+            return _setup_gateway_adapter_message()
         if not owner_check(adapter, source):
             _log_refusal(source)
             if missing_group_owner_user(adapter, source):

@@ -59,6 +59,12 @@ The Mirror shows who sent the Message, its Channel, and its full text.
 - `/amsg join <channel name>` — accept an Invite.
   Example: `/amsg join amber-fox-river`
 
+If the Agent is busy when you type any `/amsg` command, Hermes does not run
+the command: it hands the text to the Agent as a correction and answers
+"Redirected current run" or "Steered into current run". Wait until the Agent
+finishes, or type `/stop`, then type the command again. The Agent must never
+apply such a command itself.
+
 - `/amsg interact <channel name> [1h|5h|always] [full]` — let the Agent answer on
   its own in that Channel.
   With no duration it is a single Grant of 5 hours.

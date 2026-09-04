@@ -85,6 +85,16 @@ GATEWAY_NOTICE_PREFIXES = (
     "📬 No home channel",
 )
 INTERIM_SEND_KEY = "_interim_send"
+# Why this process cannot receive mail. A send that cannot be answered must say
+# so: on 2026-09-04 a gateway sent for 20 minutes while every reply waited in
+# the relay, because its receive loop had never started and nothing said so.
+RECEIVE_NOT_CONNECTED = (
+    "the AMessenger platform is not connected in this gateway; the gateway log "
+    "line beginning `[amessenger] not connecting:` names the cause"
+)
+RECEIVE_LOOP_STOPPED = "the AMessenger receive loop stopped"
+RECEIVE_LOOP_NOT_RUNNING = "the AMessenger receive loop is not running"
+RECEIVE_WAITING_FOR_SETUP = "AMessenger is waiting for /amsg setup in the Owner Chat"
 _LIVE_ADAPTER = None
 _LAST_CONNECT_PROBLEM: str | None = None
 
@@ -227,6 +237,33 @@ def active_adapter():
     if adapter is None or getattr(adapter, "_running", False) is not True:
         return None
     return adapter
+
+
+def receive_problem() -> str | None:
+    """Why mail cannot arrive in this process, or ``None`` when it can.
+
+    ``None`` is also the answer in a CLI or TUI process: no adapter runs there,
+    and a gateway elsewhere receives. Inside a gateway, no live adapter means
+    the receive loop never started; the tools keep working from the
+    environment alone, so without this question a send looks delivered while
+    every reply waits in the relay. Only attributes are read here: tools run on
+    a worker loop and must not re-run the configuration checks.
+    """
+    adapter = live_adapter()
+    if adapter is None:
+        if _LAST_CONNECT_PROBLEM:
+            return f"AMessenger cannot start with this profile: {_LAST_CONNECT_PROBLEM}"
+        from . import commands  # commands imports this module at load time
+
+        if commands.in_gateway_process():
+            return RECEIVE_NOT_CONNECTED
+        return None
+    if getattr(adapter, "_running", False) is not True:
+        return getattr(adapter, "_stop_reason", None) or RECEIVE_LOOP_STOPPED
+    task = getattr(adapter, "_poll_task", None)
+    if task is not None and task.done():
+        return RECEIVE_LOOP_NOT_RUNNING
+    return getattr(adapter, "_receive_fault", None) or getattr(adapter, "_relay_fault", None)
 
 
 def _invite_channel_with_topic(channel: dict, message: dict) -> dict:
@@ -512,6 +549,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._disabled_owner_log_written = False
         self._pending_setup = None
         self._connected_via_connect = False
+        # Recorded where they are found, read by receive_problem().
+        self._receive_fault: str | None = None
+        self._relay_fault: str | None = None
+        self._stop_reason: str | None = None
 
     def _drop_forgotten_channel(self, channel_id: str) -> None:
         self.update_state(lambda document: state.drop_channel(document, channel_id))
@@ -849,10 +890,21 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._waiting_log_written = True
 
     def _configuration_ready(self) -> bool:
-        """Refresh settings and report whether mail tasks may run."""
-        if configuration_state() != "configured":
+        """Refresh settings and report whether mail tasks may run.
+
+        The reason it cannot is kept in ``_receive_fault`` for the tools.
+        """
+        profile_state = configuration_state()
+        if profile_state != "configured":
+            self._receive_fault = (
+                RECEIVE_WAITING_FOR_SETUP
+                if profile_state == "unconfigured"
+                else "the profile is incomplete: missing "
+                + ", ".join(missing_requirements())
+            )
             return False
         problem = self.configuration_problem()
+        self._receive_fault = problem or None
         if problem:
             if "disabled in config.yaml" in problem:
                 if not self._disabled_owner_log_written:
@@ -1221,6 +1273,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 started = monotonic()
                 deliveries = await self.poll_once()
                 finished = monotonic()
+                self._relay_fault = None
                 if not deliveries and finished - started < MIN_POLL_CYCLE_SECONDS:
                     await sleep(MIN_POLL_CYCLE_SECONDS)
                 if (
@@ -1235,6 +1288,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 raise
             except CardConflict as error:
                 logger.error("[amessenger] stopping: %s", error)
+                self._stop_reason = f"{RECEIVE_LOOP_STOPPED}: {error}"
                 self._running = False
                 self._mark_disconnected()
                 return
@@ -1249,6 +1303,10 @@ class AMessengerAdapter(BasePlatformAdapter):
                         "[amessenger] another gateway is publishing Agent %s; "
                         "this one will retry",
                         settings["agent"],
+                    )
+                    self._relay_fault = (
+                        f"another gateway is publishing Agent {settings['agent']}; "
+                        "this one is waiting and receives nothing"
                     )
                 else:
                     logger.warning(

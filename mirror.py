@@ -223,6 +223,11 @@ def outgoing(channel, text) -> str:
     return f"{OUTGOING_HEADER_PREFIX}channel {label(channel)}\n{quote_body(text)}"
 
 
+def receive_problem_notice(problem: str) -> str:
+    """The Owner-facing line that says replies cannot arrive in this gateway."""
+    return f"{NOTICE_HEADER_PREFIX}Replies cannot arrive in this gateway: {problem}"
+
+
 def grant_ended(channel: dict) -> str:
     """Format the notice for a single Grant ended by the Agent."""
     return f"{GRANT_NOTICE_HEADER_PREFIX}Grant for {label(channel)} ended, back to notify."
