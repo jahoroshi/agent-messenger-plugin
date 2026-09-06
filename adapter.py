@@ -589,8 +589,27 @@ def validate_config(config) -> bool:
             "[amessenger] missing required environment variables: %s",
             ", ".join(missing),
         )
+        # The one place that runs for this case. Hermes drops the platform
+        # here, so connect() never runs and nothing else ever writes a record:
+        # a gateway is up, AMessenger inside it is not, and every surface said
+        # "no gateway has written a health record", which is what a genuinely
+        # stopped gateway says too. The remedy is these names.
+        _record_configuration_gap(missing)
         return False
     return True
+
+
+def _record_configuration_gap(missing: list[str]) -> None:
+    try:
+        health.write_configuration_gap(
+            health_path_for_process(),
+            missing,
+            moment=state.now(),
+            pid=os.getpid(),
+        )
+    except Exception as error:
+        # Reporting the fault must not become a second fault.
+        logger.warning("[amessenger] health record not written: %s", error)
 
 
 def is_connected(config) -> bool:

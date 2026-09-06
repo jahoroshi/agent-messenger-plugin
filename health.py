@@ -212,6 +212,51 @@ def _git_revision(module_dir: Path) -> str:
     return ""
 
 
+HALF_CONFIGURED = (
+    "AMessenger cannot start: the profile is missing {missing}.\n"
+    "Hermes drops the platform before it runs, so no gateway can report."
+)
+
+
+def no_record_reason(missing) -> str:
+    """Say why no gateway could have written a record, when that is knowable.
+
+    "No record" and "no gateway" look identical to a reader, and they are not
+    the same thing: a profile with some AMessenger settings and not others is
+    refused by Hermes at registration, so a gateway can be running perfectly
+    while AMessenger inside it never starts. The missing names are the whole
+    remedy, and they are in the profile, where anything reading this can see
+    them.
+    """
+    names = [str(name) for name in (missing or []) if str(name).strip()]
+    if not names:
+        return NO_RECORD
+    return HALF_CONFIGURED.format(missing=", ".join(names))
+
+
+def write_configuration_gap(path: Path, missing, *, moment: datetime, pid: int) -> None:
+    """Record a profile Hermes will not start, without overwriting a live report.
+
+    Called from the one place that runs for this case. A process whose own
+    environment is incomplete must not replace a healthy record written by a
+    gateway whose environment is fine, so a fresh record wins.
+    """
+    existing = read_snapshot(path, moment=moment)
+    if existing.fault_code not in {"no_record", "unreadable_record", "stale_record"}:
+        return
+    write_snapshot(
+        path,
+        replace(
+            Report(),
+            summary=STOPPED,
+            fault_code="half_configured",
+            fault=no_record_reason(missing),
+        ),
+        moment=moment,
+        pid=pid,
+    )
+
+
 def snapshot_path(home: Path) -> Path:
     return Path(home) / SNAPSHOT_FILENAME
 

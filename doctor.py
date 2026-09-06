@@ -29,6 +29,7 @@ import importlib.util
 import os
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 READY, FAULT, CANNOT_RUN, ACTION_REQUIRED = 0, 1, 2, 3
@@ -42,6 +43,15 @@ SETTINGS = (
     "AMESSENGER_OWNER_CHAT",
     "AMESSENGER_OWNER_USER",
     "AMESSENGER_CA_FILE",
+)
+# Without every one of these Hermes refuses to register the platform at all, so
+# a gateway can be running while AMessenger inside it never starts.
+REQUIRED_SETTINGS = (
+    "AMESSENGER_URL",
+    "AMESSENGER_KEY",
+    "AMESSENGER_AGENT",
+    "AMESSENGER_KIND",
+    "AMESSENGER_OWNER_CHAT",
 )
 # Values that identify rather than authenticate. Everything else is reported as
 # present or missing and never shown.
@@ -190,6 +200,22 @@ def report(module_dir: Path, home: Path | None) -> tuple[list[str], int]:
         return lines, FAULT
 
     record = health.read_snapshot(home / "amessenger" / health.SNAPSHOT_FILENAME)
+    if record.fault_code == "no_record":
+        # "No record" and "no gateway" read the same and are not the same. A
+        # profile with some AMessenger settings and not others is refused by
+        # Hermes at registration, so the gateway runs and AMessenger in it never
+        # starts. The profile is right here, so say which values are missing.
+        missing = [
+            name
+            for name in REQUIRED_SETTINGS
+            if not str(values.get(name, "")).strip()
+        ]
+        if missing and len(missing) < len(REQUIRED_SETTINGS):
+            record = replace(
+                record,
+                fault_code="half_configured",
+                fault=health.no_record_reason(missing),
+            )
     lines.append(health.render(record))
     if status == "failed":
         return lines, FAULT

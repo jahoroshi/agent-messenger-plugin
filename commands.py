@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+import dataclasses
 import logging
 import os
 import re
@@ -146,11 +147,17 @@ def _setup_gateway_adapter_message() -> str:
     missing = adapter_module.missing_requirements()
     if missing:
         safe_missing = security.safe_field(", ".join(missing))
+        # Not "/amsg setup". Hermes refuses to register the platform for a
+        # profile in this state, so there is no adapter for setup to write
+        # through, and telling the Owner to type it is a loop they cannot leave.
+        # The remedy is a shell one, and an interrupted install lands here.
         return (
-            "AMessenger is running, but its adapter is unavailable.\n"
-            f"Reason: the profile is missing {safe_missing}.\n\n"
-            "Complete setup in this Owner Chat:\n"
-            "/amsg setup [--relay <url>]"
+            "AMessenger is not running in this gateway.\n"
+            f"Reason: the profile is missing {safe_missing}.\n"
+            "Hermes drops the AMessenger platform for a profile in this state, "
+            "so no chat command can repair it.\n\n"
+            "Ask the operator to finish the installation on this host:\n"
+            "bash install.sh -p <profile> --relay <url> --owner-chat <platform>"
         )
     problem = adapter_module.last_connect_problem()
     if problem:
@@ -1216,6 +1223,26 @@ def _argument_error(command: str) -> str:
     return result
 
 
+def _explained(report):
+    """Say why no gateway could have written a record, when the profile says so.
+
+    A profile with some AMessenger settings and not others is refused by Hermes
+    at registration, so the gateway runs and AMessenger in it never starts.
+    "No record" then reads exactly like a stopped gateway, and the remedy --
+    which values are missing -- is one call away.
+    """
+    if report.fault_code != "no_record":
+        return report
+    missing = adapter_module.missing_requirements()
+    if not missing or len(missing) == len(adapter_module.REQUIRED_ENV):
+        return report
+    return dataclasses.replace(
+        report,
+        fault_code="half_configured",
+        fault=health.no_record_reason(missing),
+    )
+
+
 def local_health_block() -> str:
     """What this installation knows about itself, before anything is asked.
 
@@ -1227,7 +1254,7 @@ def local_health_block() -> str:
     adapter = active_adapter()
     if adapter is not None:
         return "AMessenger status\n" + health.render(adapter.health_report())
-    report = health.read_snapshot(adapter_module.health_path_for_process())
+    report = _explained(health.read_snapshot(adapter_module.health_path_for_process()))
     if in_gateway_process():
         # A gateway with no live adapter: the record is this profile's own, and
         # its absence is the answer.
