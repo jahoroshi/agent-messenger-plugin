@@ -12,7 +12,7 @@ import time
 
 import httpx
 
-from . import defaults, security, state
+from . import defaults, health, security, state
 from . import mirror, relay
 from .mirror import format_card
 from .relay import (
@@ -38,6 +38,26 @@ MAX_MESSAGE_LENGTH = 65536              # SYSTEM_DESIGN §5: text ≤ 64 KB
 STATE_DIRNAME = "amessenger"           # $HERMES_HOME/amessenger/state.json, §6.6
 STATE_FILENAME = "state.json"
 OWNER_LOG_FILENAME = "owner_log.jsonl"
+HEALTH_FILENAME = health.SNAPSHOT_FILENAME
+
+# How long a receive fault may last before the Owner is told. A relay restart or
+# a lost second of network recovers well inside this; anything longer is an
+# outage the Owner will otherwise discover by waiting for a reply that cannot come.
+FAULT_NOTICE_SECONDS = 60
+# Faults no amount of waiting repairs. The Owner is told at once, because the
+# next step is theirs: a key or a name.
+#
+# `agent_connected_elsewhere` is deliberately absent. It is raised whenever
+# another waiter holds the inbox, which a second gateway finishing its own wait
+# produces for a moment; a real duplicate installation outlasts the grace period
+# and is announced then. Announcing every momentary one would teach an Owner
+# that these notices mean nothing.
+PERMANENT_FAULT_CODES = frozenset(
+    {"invalid_key", "missing_credentials", "agent_name_taken", "card_conflict"}
+)
+# A welcome that could not be posted is retried on the poll loop, not on every
+# pass: the Owner Chat that refused it is usually still refusing.
+WELCOME_RETRY_SECONDS = 60
 # Complete-configuration question: are all five values needed to run an Agent present?
 # Read them through missing_requirements(), never with a bare getenv:
 # AMESSENGER_URL also has a shipped default in defaults.py.
@@ -269,7 +289,21 @@ def receive_problem() -> str | None:
     task = getattr(adapter, "_poll_task", None)
     if task is not None and task.done():
         return RECEIVE_LOOP_NOT_RUNNING
-    return getattr(adapter, "_receive_fault", None) or getattr(adapter, "_relay_fault", None)
+    # The Owner Chat is part of receiving. A Delivery this gateway pulls but
+    # cannot show its Owner has not arrived anywhere a human will ever look, so
+    # a healthy relay must not answer for a chat that refuses every line.
+    return (
+        getattr(adapter, "_receive_fault", None)
+        or getattr(adapter, "_relay_fault", None)
+        or getattr(adapter, "_post_fault", None)
+    )
+
+
+def _health_text(value) -> str:
+    """Make a fault safe to write into a file an operator and a script read."""
+    if not value:
+        return ""
+    return security.safe_field(value, "", limit=200)
 
 
 def _invite_channel_with_topic(channel: dict, message: dict) -> dict:
@@ -367,6 +401,11 @@ def state_path_for_process() -> Path:
 def owner_log_path_for_process() -> Path:
     """Return the shared Owner-Chat log path used by gateways and TUI/CLI."""
     return hermes_home() / STATE_DIRNAME / OWNER_LOG_FILENAME
+
+
+def health_path_for_process() -> Path:
+    """Return the profile's health record, which any process may read."""
+    return hermes_home() / STATE_DIRNAME / HEALTH_FILENAME
 
 
 def pending_decisions_path_for_process() -> Path:
@@ -560,6 +599,22 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._stop_reason: str | None = None
         self._waiting_for_owner_chat = False
         self._owner_chat_wait_log_written = False
+        # Component facts, each cleared only by its own component succeeding.
+        # Sharing one flag is what let a healthy relay hide a dead Owner Chat.
+        self._last_poll_at: str = ""
+        self._last_post_at: str = ""
+        self._post_fault: str | None = None
+        self._housekeeping_fault: str | None = None
+        self._last_housekeeping_at: str = ""
+        self._mirrors_lost = 0
+        self._poll_succeeded = False
+        # What the Owner has already been told, so a backoff loop does not send
+        # one notice per attempt.
+        self._notified_fault_code: str | None = None
+        self._pending_fault_code: str | None = None
+        self._fault_since = None
+        self._fault_since_ts: str = ""
+        self._last_welcome_attempt = None
 
     def _drop_forgotten_channel(self, channel_id: str) -> None:
         self.update_state(lambda document: state.drop_channel(document, channel_id))
@@ -913,6 +968,10 @@ class AMessengerAdapter(BasePlatformAdapter):
             self._log_waiting_for_setup()
         self._mark_connected()
         _LIVE_ADAPTER = self
+        # Connected is not ready, and the record has to say so from the first
+        # second: an installer that waits for evidence must be able to see
+        # "starting" and "waiting_for_setup", not an empty directory.
+        self.write_health_snapshot()
         logger.info(
             "[amessenger] connected Agent %s with Owner Chat %s:%s",
             self._settings["agent"],
@@ -1321,11 +1380,18 @@ class AMessengerAdapter(BasePlatformAdapter):
                     flush_at_start = False
                 if self._card is None:
                     self._card = await self.publish_card()
-                    await self.after_publish()
+                    await self.deliver_welcome(fresh_card=True)
                 started = monotonic()
                 deliveries = await self.poll_once()
                 finished = monotonic()
                 self._relay_fault = None
+                # Receive readiness is earned here and nowhere earlier: the
+                # inbox answered this Agent, with this key, through this network.
+                self._last_poll_at = state.ts(state.now())
+                self._poll_succeeded = True
+                await self.announce_recovery()
+                await self.deliver_welcome()
+                self.write_health_snapshot()
                 if not deliveries and finished - started < MIN_POLL_CYCLE_SECONDS:
                     await sleep(MIN_POLL_CYCLE_SECONDS)
                 if (
@@ -1344,6 +1410,13 @@ class AMessengerAdapter(BasePlatformAdapter):
                     f"{RECEIVE_LOOP_STOPPED}: {security.safe_field(str(error))}"
                 )
                 self._running = False
+                # No retry will fix a name that belongs to someone else, so
+                # the Owner is told now rather than after a grace period the
+                # loop will not survive.
+                await self.announce_fault(
+                    "card_conflict", self._stop_reason, permanent=True
+                )
+                self.write_health_snapshot()
                 self._mark_disconnected()
                 return
             except (RelayRejected, RelayUnavailable) as error:
@@ -1363,6 +1436,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                         f"{security.safe_field(settings['agent'])}; "
                         "this gateway receives nothing"
                     )
+                    fault_code = "agent_connected_elsewhere"
                 else:
                     logger.warning(
                         "[amessenger] relay unavailable (%s); retrying in %ss",
@@ -1373,8 +1447,11 @@ class AMessengerAdapter(BasePlatformAdapter):
                         "the AMessenger receive loop is retrying\n"
                         f"Cause: {security.safe_field(str(error))}"
                     )
+                    fault_code = getattr(error, "code", "") or type(error).__name__
                 self._card = None
                 index += 1
+                await self.announce_fault(fault_code, self._relay_fault)
+                self.write_health_snapshot()
                 await sleep(wait)
             except Exception as error:
                 wait = RECONNECT_BACKOFF[min(index, len(RECONNECT_BACKOFF) - 1)]
@@ -1389,7 +1466,149 @@ class AMessengerAdapter(BasePlatformAdapter):
                 )
                 self._card = None
                 index += 1
+                await self.announce_fault(type(error).__name__, self._relay_fault)
+                self.write_health_snapshot()
                 await sleep(wait)
+
+    def health_report(self) -> health.Report:
+        """What this process knows about its own ability to carry mail.
+
+        Attributes only. This is called from a tool handler on a worker loop and
+        from `/amsg status`; re-running the configuration checks here would make
+        a status request able to change what it reports.
+        """
+        settings = self._settings or {}
+        if self._running is not True:
+            receiver = health.STOPPED
+        elif self._poll_task is not None and self._poll_task.done():
+            receiver = health.STOPPED
+        elif self._poll_succeeded:
+            # One completed inbox poll, and nothing less. A published Card
+            # proves the relay accepted a write; only a poll proves this Agent's
+            # own mail can reach it.
+            receiver = health.POLLING
+        else:
+            receiver = health.STARTING
+        receive_fault = (
+            self._stop_reason if receiver == health.STOPPED else None
+        ) or self._receive_fault or self._relay_fault or ""
+        return health.summarize(
+            health.Report(
+                agent=str(settings.get("agent") or ""),
+                profile=profile_name(),
+                revision=health.installed_revision(),
+                owner_chat=health.RESOLVED if self._owner_chat_id else health.WAITING,
+                receiver=receiver,
+                last_poll_at=self._last_poll_at,
+                receive_fault=_health_text(receive_fault),
+                posting=(
+                    health.FAILING
+                    if self._post_fault
+                    else health.OK if self._last_post_at else health.UNKNOWN
+                ),
+                last_post_at=self._last_post_at,
+                post_fault=_health_text(self._post_fault),
+                pending_mirrors=len(self.state().get("pending_mirrors", [])),
+                mirrors_lost=self._mirrors_lost,
+                housekeeping=(
+                    health.FAILING
+                    if self._housekeeping_fault
+                    else health.OK if self._last_housekeeping_at else health.UNKNOWN
+                ),
+                last_housekeeping_at=self._last_housekeeping_at,
+                housekeeping_fault=_health_text(self._housekeeping_fault),
+                fault_since=self._fault_since_ts,
+            )
+        )
+
+    def write_health_snapshot(self) -> None:
+        """Publish the report for the processes that cannot ask this one.
+
+        A CLI or a TUI has no adapter, and the installer is a different process
+        entirely. Without this file they can only say they do not know, which is
+        how an installation was able to report success while it received nothing.
+        """
+        try:
+            health.write_snapshot(
+                health_path_for_process(),
+                self.health_report(),
+                moment=state.now(),
+                pid=os.getpid(),
+            )
+        except Exception as error:
+            # A health record that cannot be written must not stop mail.
+            logger.warning("[amessenger] health record not written: %s", error)
+
+    async def deliver_welcome(self, *, fresh_card: bool = False) -> None:
+        """Post the welcome, retrying one an Owner Chat refused earlier.
+
+        after_publish() used to run only when the Card was published, and a
+        healthy poll keeps the Card cached for the life of the process. So an
+        Owner Chat that came back after refusing the first welcome was never
+        sent one: the only thing that retried it was a relay failure, which is
+        the wrong trigger entirely. A retry belongs on the ordinary poll cycle.
+
+        Bounded, because the chat that refused it is usually still refusing. A
+        Card that was just published skips the bound: that is the first attempt,
+        not a retry.
+        """
+        if self._card is None or self.state()["welcomed"]:
+            return
+        moment = state.now()
+        if (
+            not fresh_card
+            and self._last_welcome_attempt is not None
+            and (moment - self._last_welcome_attempt).total_seconds()
+            < WELCOME_RETRY_SECONDS
+        ):
+            return
+        self._last_welcome_attempt = moment
+        await self.after_publish()
+
+    async def announce_fault(self, code: str, text: str, *, permanent: bool = False) -> None:
+        """Tell the Owner once that mail has stopped -- not once per retry.
+
+        An idle Owner waiting for a reply is the case this exists for: every
+        other surface only speaks when it is asked something.
+        """
+        moment = state.now()
+        if self._fault_since is None or code != self._pending_fault_code:
+            self._fault_since = moment
+            self._fault_since_ts = state.ts(moment)
+            self._pending_fault_code = code
+        if self._notified_fault_code == code:
+            return
+        permanent = permanent or code in PERMANENT_FAULT_CODES
+        if (
+            not permanent
+            and (moment - self._fault_since).total_seconds() < FAULT_NOTICE_SECONDS
+        ):
+            # A relay restart recovers well inside this. Announcing it would
+            # teach the Owner that these notices are noise.
+            return
+        self._notified_fault_code = code
+        await self.mirror_or_queue(
+            "AMessenger cannot receive Messages.\n"
+            f"Reason: {text}\n\n"
+            "Nothing sent to you is lost: the relay holds a Message for two "
+            "days.\n"
+            "You will be told when Messages arrive again.",
+            note_transcript=False,
+        )
+
+    async def announce_recovery(self) -> None:
+        """Say it works again, but only to an Owner who was told it did not."""
+        self._fault_since = None
+        self._fault_since_ts = ""
+        self._pending_fault_code = None
+        if self._notified_fault_code is None:
+            return
+        self._notified_fault_code = None
+        await self.mirror_or_queue(
+            "AMessenger receives Messages again.\n"
+            "Anything sent while it was down is arriving now.",
+            note_transcript=False,
+        )
 
     async def poll_pending_decisions(self) -> None:
         """Apply gateway-less approval decisions and consume their snapshot."""
@@ -1502,8 +1721,18 @@ class AMessengerAdapter(BasePlatformAdapter):
                 await self.housekeeping_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                # Reported as its own component. Housekeeping is what ends an
+                # expired Grant, so a loop that only logs its failures leaves an
+                # Agent acting on the Owner's behalf after the permission ran out.
+                self._housekeeping_fault = (
+                    "background maintenance is failing\n"
+                    f"Cause: {security.safe_field(type(error).__name__)}"
+                )
                 logger.exception("[amessenger] housekeeping pass failed; continuing")
+            else:
+                self._last_housekeeping_at = state.ts(state.now())
+                self._housekeeping_fault = None
 
     async def housekeeping_once(self) -> None:
         """Expire Grants and reconcile state with the relay (§6.6)."""
@@ -1640,6 +1869,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         if client is not None:
             await client.aclose()
         self._loop = None
+        # A clean shutdown must leave a record that says stopped. Leaving the
+        # last healthy record behind would let an operator check call a gateway
+        # that was deliberately stopped "ready" until the record went stale.
+        self.write_health_snapshot()
         self._mark_disconnected()
 
     async def _forward_exec_approval(
@@ -1985,10 +2218,12 @@ class AMessengerAdapter(BasePlatformAdapter):
         """Post one line, marking only the chat copy and logging it unmarked."""
         if not self._owner_chat_id:
             # No Owner Chat yet (waiting for /amsg setup or /sethome): the
-            # caller queues the line for the chat that will claim it.
+            # caller queues the line for the chat that will claim it. Not a
+            # posting fault -- nothing has been asked of a chat yet.
             return False
         owner = await self.wait_for_owner_adapter()
         if owner is None:
+            self.record_post_failure("the Owner Chat platform did not start")
             return False
         marked_text = mirror.with_mark(
             text, self.state()[state.AUTHENTICITY_SECRET_KEY]
@@ -2004,7 +2239,27 @@ class AMessengerAdapter(BasePlatformAdapter):
         )
         if posted:
             self._record_owner_log(text)
+            self.record_post_success()
+        else:
+            self.record_post_failure("the Owner Chat refused the line")
         return posted
+
+    def record_post_success(self) -> None:
+        """One Owner line arrived; only this clears an Owner-posting fault."""
+        self._last_post_at = state.ts(state.now())
+        self._post_fault = None
+
+    def record_post_failure(self, reason: str) -> None:
+        """The Owner Chat could not be written to.
+
+        Kept apart from the relay fault on purpose. A relay poll that succeeds
+        says nothing about whether a human can see anything, and clearing this
+        on an unrelated success is exactly how a dead Owner Chat looked healthy.
+        """
+        self._post_fault = (
+            "the Owner Chat cannot be written to\n"
+            f"Cause: {security.safe_field(reason)}"
+        )
 
     async def mirror_or_queue(
         self,
@@ -2041,6 +2296,9 @@ class AMessengerAdapter(BasePlatformAdapter):
         self.update_state(queue)
         logger.warning("[amessenger] Owner-facing line queued for retry")
         if dropped:
+            # Counted, not only logged: a queue that overflows silently is a
+            # Message the Owner will never see and never be told about.
+            self._mirrors_lost += 1
             logger.warning(
                 "[amessenger] dropped 1 oldest queued Owner-facing line; "
                 "1 line lost"

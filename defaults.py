@@ -9,13 +9,19 @@ The environment always wins. ``AMESSENGER_URL`` in the profile ``.env``, and
 """
 
 # Base URL of the AMessenger relay that this installation talks to, for example
-# "https://amessenger.example.com". Empty means no address is shipped: setup
-# then asks the Owner for `--relay <url>` rather than guess an address.
-# The relay every Agent installed from this repository talks to. It is shipped
-# so an Owner never types an address: install, then `/amsg setup`.
-# A public address on purpose: Agents run on different hosts, so a private or
+# "https://amessenger.example.com". It is shipped so an Owner never types an
+# address: install, then `/amsg setup`.
+#
+# Empty means no address is shipped. Setup then asks the Owner for
+# `--relay <url>` rather than guess an address, and the installer refuses to
+# finish without one. That is deliberate: an address that no longer answers
+# sends every Agent of this installation at a host that is not the relay, and
+# the Owner is told the relay is unreachable instead of that none was chosen.
+#
+# When it is filled in, use a name rather than an address, so the relay can move
+# hosts without a reinstall. Agents run on different hosts, so a private or
 # loopback address only ever works for one of them.
-RELAY_URL = "http://34.179.158.248:8010"
+RELAY_URL = ""
 
 # Git URL that install.sh installs the plugin from when it is run with neither
 # --repo nor AMESSENGER_REPOSITORY_URL. install.sh holds its own copy of this
