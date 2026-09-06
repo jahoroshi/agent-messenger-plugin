@@ -1519,6 +1519,17 @@ class AMessengerAdapter(BasePlatformAdapter):
         receive_fault = (
             self._stop_reason if receiver == health.STOPPED else None
         ) or self._receive_fault or self._relay_fault or ""
+        try:
+            pending_mirrors = len(self.state().get("pending_mirrors", []))
+        except Exception as error:
+            # Asking whether mail works must not itself fail. A state file that
+            # cannot be read is a real fault and belongs in the answer, not in a
+            # traceback that leaves /amsg status with nothing to say.
+            pending_mirrors = 0
+            receive_fault = receive_fault or (
+                "the AMessenger state file cannot be read\n"
+                f"Cause: {security.safe_field(type(error).__name__)}"
+            )
         return health.summarize(
             health.Report(
                 agent=str(settings.get("agent") or ""),
@@ -1535,7 +1546,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 ),
                 last_post_at=self._last_post_at,
                 post_fault=_health_text(self._post_fault),
-                pending_mirrors=len(self.state().get("pending_mirrors", [])),
+                pending_mirrors=pending_mirrors,
                 mirrors_lost=self._mirrors_lost,
                 housekeeping=(
                     health.FAILING
