@@ -114,11 +114,16 @@ def settings_lines(values: dict) -> list[str]:
     return out
 
 
-def import_fault(module_dir: Path) -> str:
+def import_check(module_dir: Path) -> tuple[str, str]:
     """Try the import last, and report its failure instead of dying of it.
 
-    A scanner rejection, a missing dependency and a syntax error all end here,
-    and each of them makes every other AMessenger surface silent.
+    A scanner rejection, a mangled file and a syntax error all end here, and
+    each makes every other AMessenger surface silent at once.
+
+    A missing module that is not AMessenger's own is a different thing: this
+    diagnostic runs under whatever python3 is on PATH, which is usually not the
+    one Hermes runs in, and Hermes's own packages are not importable there. That
+    is not a fault in the installation and must not be reported as one.
     """
     parent = str(module_dir.parent)
     inserted = parent not in sys.path
@@ -126,12 +131,17 @@ def import_fault(module_dir: Path) -> str:
         sys.path.insert(0, parent)
     try:
         importlib.import_module(module_dir.name)
+    except ModuleNotFoundError as error:
+        missing = str(getattr(error, "name", "") or "")
+        if missing != module_dir.name and not missing.startswith(f"{module_dir.name}."):
+            return "not_checked", missing or "a module this python does not have"
+        return "failed", f"{type(error).__name__}: {error}"
     except BaseException as error:  # noqa: BLE001 - the report is the product
-        return f"{type(error).__name__}: {error}"
+        return "failed", f"{type(error).__name__}: {error}"
     finally:
         if inserted and sys.path and sys.path[0] == parent:
             sys.path.pop(0)
-    return ""
+    return "ok", ""
 
 
 def report(module_dir: Path, home: Path | None) -> tuple[list[str], int]:
@@ -158,13 +168,20 @@ def report(module_dir: Path, home: Path | None) -> tuple[list[str], int]:
     values = read_env(home / ".env")
     lines.extend(settings_lines(values))
 
-    fault = import_fault(module_dir)
-    if fault:
+    status, detail = import_check(module_dir)
+    if status == "failed":
         lines.append(
             "Import: failed\n"
-            f"Reason: {fault}\n"
+            f"Reason: {detail}\n"
             "Nothing in AMessenger runs while this fails: no /amsg, no tools, "
             "and no receiving."
+        )
+    elif status == "not_checked":
+        lines.append(
+            "Import: not checked here\n"
+            f"Reason: this python has no {detail}, so it is not the one Hermes "
+            "runs in.\n"
+            "The gateway's own health record below is the evidence that it loads."
         )
     else:
         lines.append("Import: ok")
@@ -174,12 +191,15 @@ def report(module_dir: Path, home: Path | None) -> tuple[list[str], int]:
 
     record = health.read_snapshot(home / "amessenger" / health.SNAPSHOT_FILENAME)
     lines.append(health.render(record))
-    if fault:
+    if status == "failed":
         return lines, FAULT
     if record.summary == health.READY:
         return lines, READY
-    if record.summary in {health.DEGRADED, health.STOPPED}:
+    if record.summary == health.DEGRADED:
         return lines, FAULT
+    # `stopped` is written by a clean shutdown, so it means stopped on purpose;
+    # a gateway that died leaves its previous record behind to go stale instead.
+    # Either way the next step is a person's, which is what 3 says.
     return lines, ACTION_REQUIRED
 
 

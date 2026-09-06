@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import ssl
 import sys
 import tempfile
 import urllib.error
@@ -76,12 +77,26 @@ def write_env(path: Path, updates: dict) -> None:
     os.replace(handle.name, path)
 
 
-def owner_login(relay: str, key: str) -> str:
+def certificate_context(ca_file: str):
+    """Trust the authority that signed the relay's certificate, when named.
+
+    A relay on an internal network is behind a private CA, and nothing on this
+    host trusts it yet. Returning None keeps urllib's own default, which is the
+    public authorities.
+    """
+    if not str(ca_file or "").strip():
+        return None
+    return ssl.create_default_context(cafile=str(ca_file).strip())
+
+
+def owner_login(relay: str, key: str, ca_file: str = "") -> str:
     """Ask the relay who this key belongs to, before any Agent exists."""
     request = urllib.request.Request(
         f"{relay}/v1/whoami", headers={"Authorization": f"Bearer {key}"}
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(
+        request, timeout=30, context=certificate_context(ca_file)
+    ) as response:
         return (json.loads(response.read().decode("utf-8")) or {}).get("login") or ""
 
 
@@ -91,7 +106,7 @@ def agent_name_from_login(login: str) -> str:
     return name[:32].rstrip("-")
 
 
-def publish_card(relay: str, key: str, agent: str, kind: str) -> dict:
+def publish_card(relay: str, key: str, agent: str, kind: str, ca_file: str = "") -> dict:
     request = urllib.request.Request(
         f"{relay}/v1/agents/me",
         method="PUT",
@@ -102,7 +117,9 @@ def publish_card(relay: str, key: str, agent: str, kind: str) -> dict:
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(
+        request, timeout=30, context=certificate_context(ca_file)
+    ) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -116,6 +133,8 @@ def main(argv=None) -> int:
     parser.add_argument("--key", default="", help="Owner key; default REDMINE_API_KEY")
     parser.add_argument("--relay", default="", help="relay URL; default the shipped one")
     parser.add_argument("--owner-user", default="", help="Owner id when the chat is a group")
+    parser.add_argument("--ca-file", default="",
+                        help="PEM file of the authority that signed the relay certificate")
     args = parser.parse_args(argv)
 
     agent = args.agent.strip()
@@ -152,6 +171,17 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
+    ca_file = (args.ca_file or existing.get("AMESSENGER_CA_FILE") or "").strip()
+    if ca_file:
+        try:
+            certificate_context(ca_file)
+        except (OSError, ssl.SSLError) as error:
+            print(
+                "AMessenger provisioning failed.\n"
+                f"Reason: the relay CA file could not be used: {error}",
+                file=sys.stderr,
+            )
+            return 2
     relay = (args.relay or existing.get("AMESSENGER_URL") or shipped_relay_url()).rstrip("/")
     if not relay:
         print(
@@ -167,7 +197,7 @@ def main(argv=None) -> int:
         # Nobody should have to invent a name for each of thirty Owners: the
         # Redmine login is unique already and the key proves who it belongs to.
         try:
-            agent = agent_name_from_login(owner_login(relay, key))
+            agent = agent_name_from_login(owner_login(relay, key, ca_file))
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
             print(
                 "AMessenger provisioning failed.\n"
@@ -188,7 +218,7 @@ def main(argv=None) -> int:
             return 2
 
     try:
-        card = publish_card(relay, key, agent, args.kind)
+        card = publish_card(relay, key, agent, args.kind, ca_file)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:200]
         print(
@@ -216,6 +246,8 @@ def main(argv=None) -> int:
     }
     if args.owner_user.strip():
         updates["AMESSENGER_OWNER_USER"] = args.owner_user.strip()
+    if ca_file:
+        updates["AMESSENGER_CA_FILE"] = ca_file
     write_env(env_path, updates)
 
     owner = (card.get("owner") or {}) if isinstance(card, dict) else {}
@@ -225,7 +257,7 @@ def main(argv=None) -> int:
         f"Kind: {args.kind}\n"
         f"Owner: {owner.get('name') or owner.get('login') or 'unknown'}\n"
         f"Owner Chat: {args.owner_chat}\n\n"
-        "Restart the gateway to receive Messages there."
+        "The gateway restarts next and reports whether Messages arrive."
     )
     return 0
 

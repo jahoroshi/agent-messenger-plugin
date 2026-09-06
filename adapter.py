@@ -1599,10 +1599,14 @@ class AMessengerAdapter(BasePlatformAdapter):
         other surface only speaks when it is asked something.
         """
         moment = state.now()
-        if self._fault_since is None or code != self._pending_fault_code:
+        if self._fault_since is None:
+            # The clock measures the outage, not this exception. A relay that
+            # flaps between two exception types produces a different code each
+            # pass, and restarting the clock on each one means the grace period
+            # never ends and the Owner is never told.
             self._fault_since = moment
             self._fault_since_ts = state.ts(moment)
-            self._pending_fault_code = code
+        self._pending_fault_code = code
         if self._notified_fault_code == code:
             return
         permanent = permanent or code in PERMANENT_FAULT_CODES
