@@ -61,6 +61,11 @@ PERMANENT_FAULT_CODES = frozenset(
 # A welcome that could not be posted is retried on the poll loop, not on every
 # pass: the Owner Chat that refused it is usually still refusing.
 WELCOME_RETRY_SECONDS = 60
+# How often the health record may be rewritten while nothing about it changes.
+# A busy Channel makes the poll loop turn over quickly, and a file write per
+# turn buys nothing: a reader only needs the record recent enough to believe,
+# and a change is always written at once.
+HEALTH_WRITE_SECONDS = 5
 # Complete-configuration question: are all five values needed to run an Agent present?
 # Read them through missing_requirements(), never with a bare getenv:
 # AMESSENGER_URL also has a shipped default in defaults.py.
@@ -652,6 +657,8 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._fault_since = None
         self._fault_since_ts: str = ""
         self._last_welcome_attempt = None
+        self._health_written_at = None
+        self._health_written_state = None
 
     def _drop_forgotten_channel(self, channel_id: str) -> None:
         self.update_state(lambda document: state.drop_channel(document, channel_id))
@@ -1016,7 +1023,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         # Connected is not ready, and the record has to say so from the first
         # second: an installer that waits for evidence must be able to see
         # "starting" and "waiting_for_setup", not an empty directory.
-        self.write_health_snapshot()
+        self.write_health_snapshot(always=True)
         logger.info(
             "[amessenger] connected Agent %s with Owner Chat %s:%s",
             self._settings["agent"],
@@ -1577,23 +1584,40 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
         )
 
-    def write_health_snapshot(self) -> None:
+    def write_health_snapshot(self, *, always: bool = False) -> None:
         """Publish the report for the processes that cannot ask this one.
 
         A CLI or a TUI has no adapter, and the installer is a different process
         entirely. Without this file they can only say they do not know, which is
         how an installation was able to report success while it received nothing.
+
+        A change is written at once. An unchanged record is rewritten only every
+        few seconds: a busy Channel turns the poll loop over quickly, and a
+        reader gains nothing from a fresher copy of the same facts.
         """
+        report = self.health_report()
+        moment = state.now()
+        current = (report.summary, report.fault_code, report.fault)
+        if not (always or current != self._health_written_state):
+            written_at = self._health_written_at
+            if (
+                written_at is not None
+                and (moment - written_at).total_seconds() < HEALTH_WRITE_SECONDS
+            ):
+                return
         try:
             health.write_snapshot(
                 health_path_for_process(),
-                self.health_report(),
-                moment=state.now(),
+                report,
+                moment=moment,
                 pid=os.getpid(),
             )
         except Exception as error:
             # A health record that cannot be written must not stop mail.
             logger.warning("[amessenger] health record not written: %s", error)
+            return
+        self._health_written_at = moment
+        self._health_written_state = current
 
     async def deliver_welcome(self, *, fresh_card: bool = False) -> None:
         """Post the welcome, retrying one an Owner Chat refused earlier.
@@ -1955,7 +1979,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         # A clean shutdown must leave a record that says stopped. Leaving the
         # last healthy record behind would let an operator check call a gateway
         # that was deliberately stopped "ready" until the record went stale.
-        self.write_health_snapshot()
+        self.write_health_snapshot(always=True)
         self._mark_disconnected()
 
     async def _forward_exec_approval(
