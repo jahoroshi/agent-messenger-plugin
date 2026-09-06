@@ -21,7 +21,7 @@ The environment always wins. ``AMESSENGER_URL`` in the profile ``.env``, and
 # When it is filled in, use a name rather than an address, so the relay can move
 # hosts without a reinstall. Agents run on different hosts, so a private or
 # loopback address only ever works for one of them.
-RELAY_URL = ""
+RELAY_URL = "https://acop-mcp.azati.com/amessenger"
 
 # Git URL that install.sh installs the plugin from when it is run with neither
 # --repo nor AMESSENGER_REPOSITORY_URL. install.sh holds its own copy of this
