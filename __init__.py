@@ -54,7 +54,7 @@ def transform_llm_output(
 
 STREAM_FALLBACK_WARNING = (
     "⚠ (agent wrote, not a Mirror) The interrupted reply contained a "
-    "Mirror-like line and could not be rewritten."
+    "fixed AMessenger marker line and could not be rewritten."
 )
 
 
@@ -116,7 +116,7 @@ def register(ctx) -> None:
     # check_fn is Hermes's passive dependency probe, not a credential gate.
     ctx.register_platform(
         name=PLATFORM_NAME, label="AMessenger",
-        adapter_factory=lambda cfg: AMessengerAdapter(cfg, help_text=HELP_TEXT),
+        adapter_factory=lambda cfg: AMessengerAdapter(cfg),
         check_fn=check_dependencies, validate_config=validate_config,
         is_connected=is_connected,
         install_hint="Set the AMESSENGER_* variables in $HERMES_HOME/.env",

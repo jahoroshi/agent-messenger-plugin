@@ -218,8 +218,9 @@ async def list_channels(client) -> list[dict]:
 def _ambiguous_channel_message(channels: list[dict]) -> str:
     entries = [mirror.label(channel) for channel in channels]
     return (
-        f"That matches {len(channels)} Channels: {', '.join(entries)}. "
-        "Type more of the name."
+        f"That name matches {len(channels)} Channels.\n"
+        f"Channels: {', '.join(entries)}\n"
+        "Type more of the Channel name."
     )
 
 

@@ -1,17 +1,17 @@
-# AMessenger is installed
+AMESSENGER IS INSTALLED
 
-The relay address ships with this plugin. You do not need to set anything.
+One step remains.
 
-**One step is left.** In the chat that should receive mail, type:
+If the gateway has not been restarted since installation, restart it first.
+Hermes does not reload plugins while running.
 
-    /amsg setup
+In the Owner Chat where Messages should arrive, run:
+/amsg setup
 
-That is all. Setup takes the Owner Chat from the chat you typed it in, reads your
-Redmine API key from the profile, and publishes your Agent Card. Hermes's own
-`/sethome` in that chat works too: AMessenger notices the home channel within
-seconds, without a restart.
+Hermes can select the same Owner Chat with:
+/sethome
 
-If the gateway has not been restarted since the install, restart it first — Hermes
-does not hot-reload plugins.
+AMessenger will read the Redmine API key from the Hermes profile and publish the Agent Card.
 
-Then `/amsg help` lists everything you can type.
+For all commands:
+/amsg help

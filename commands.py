@@ -14,32 +14,44 @@ from .adapter import active_adapter, read_settings
 logger = logging.getLogger("amessenger")
 REFUSAL = "AMessenger commands are accepted only from the Owner in the Owner Chat."
 MISSING_GROUP_OWNER_USER_HINT = (
-    "This Owner Chat is a group and AMESSENGER_OWNER_USER is not set; set it to "
-    "your platform user id and restart the gateway."
+    "AMessenger cannot identify the Owner in this group Owner Chat.\n"
+    "Reason: AMESSENGER_OWNER_USER is not set.\n"
+    "Set it to the Owner's platform id, then restart the gateway."
 )
 SETUP_TUI = (
-    "You are the Owner, and this window is a console that cannot receive mail. "
-    "Type /amsg setup in the chat where you want to see mail: Telegram, Google "
-    "Chat, or your IRC channel. Nothing was written."
+    "AMessenger setup did not run.\n"
+    "This console cannot receive Messages.\n"
+    "Nothing was written.\n\n"
+    "Use the Telegram, Google Chat, or IRC Owner Chat where Messages should arrive:\n"
+    "/amsg setup"
 )
 SETUP_KIND_FORMS = "corporate or personal"
 NO_OWNER_CHAT_YET = (
-    f"AMessenger cannot receive mail: {adapter_module.OWNER_CHAT_WAITING}. Type "
-    "/amsg setup in the chat that should receive mail, or /sethome there; no other "
-    "command works until then."
+    "AMessenger cannot receive Messages.\n"
+    "Reason: the Owner Chat has not been selected.\n"
+    "No other AMessenger command works until then.\n\n"
+    "In the Owner Chat, use one of:\n"
+    "/amsg setup\n"
+    "/sethome"
 )
 SETUP_NO_RELAY = (
-    "No relay address is configured. Ask your administrator for it and type "
-    "/amsg setup … --relay <url>."
+    "AMessenger setup did not run.\n"
+    "Reason: no relay address is configured.\n"
+    "Ask your administrator for the relay URL.\n\n"
+    "Then run:\n"
+    "/amsg setup … --relay <url>"
 )
 SETUP_GATEWAY_SOURCE = (
-    "AMessenger setup reached the gateway, but this event has no usable platform "
-    "or chat id, so the Owner Chat cannot be identified. Type `/amsg setup` from "
-    "a real chat message; nothing was written."
+    "AMessenger setup did not run.\n"
+    "Reason: this event has no usable platform or chat id.\n"
+    "The Owner Chat could not be identified.\n"
+    "Nothing was written.\n\n"
+    "Send a real chat message containing:\n"
+    "/amsg setup"
 )
 SETUP_KEY_GROUP_WARNING = (
-    "Warning: a key typed into a group chat is visible to everyone in this group; "
-    "use `--key` only in a private chat with this Agent."
+    "Security warning: everyone in this group can see the key you typed.\n"
+    "Use --key only in a private Owner Chat with this Agent."
 )
 _DURATION = re.compile(r"^(\d+)([hm])$")
 
@@ -133,39 +145,40 @@ def _setup_source_is_usable(source) -> bool:
 def _setup_gateway_adapter_message() -> str:
     missing = adapter_module.missing_requirements()
     if missing:
-        command = (
-            "`/amsg setup --relay <url>`"
-            if "AMESSENGER_URL" in missing
-            else "`/amsg setup`"
-        )
+        safe_missing = security.safe_field(", ".join(missing))
         return (
-            "AMessenger is running in the gateway, but its adapter is unavailable "
-            "because the profile is incomplete: missing "
-            f"{', '.join(missing)}. Type {command} in this chat to write the "
-            "missing values and connect AMessenger."
+            "AMessenger is running, but its adapter is unavailable.\n"
+            f"Reason: the profile is missing {safe_missing}.\n\n"
+            "Complete setup in this Owner Chat:\n"
+            "/amsg setup [--relay <url>]"
         )
     problem = adapter_module.last_connect_problem()
     if problem:
         # Naming the fault is the whole point: "restart the gateway" sends an
         # Owner into a loop a restart can never end.
         return (
-            "AMessenger cannot start with this profile: "
-            f"{problem}.\n"
-            "Fix that value, then restart the gateway and type `/amsg setup` "
-            "in this chat. Restarting alone will not help."
+            "AMessenger cannot start with this Hermes profile.\n"
+            f"Reason: {security.safe_field(problem)}\n"
+            "Fix that value, then restart the gateway.\n"
+            "Restarting without the fix will not help.\n\n"
+            "Then run:\n"
+            "/amsg setup"
         )
     problem = adapter_module.receive_problem()
     if problem:
         # The loop stopped after a successful connect (for example the Agent
         # name now belongs to another Owner); the stop reason is the cause.
         return (
-            f"AMessenger cannot receive mail in this gateway: {problem}.\n"
+            "AMessenger cannot receive Messages in this gateway.\n"
+            f"Reason: {security.safe_field(problem)}\n"
             "Fix that cause, then restart the gateway."
         )
     return (
-        "AMessenger is running in the gateway, but its adapter is unavailable and "
-        "reported no reason. Restart the gateway; if this repeats, the gateway log "
-        "line beginning `[amessenger] not connecting:` names the cause."
+        "AMessenger is running, but its adapter is unavailable.\n"
+        "No reason was reported.\n"
+        "Restart the gateway.\n"
+        "If this repeats, ask the operator to inspect the line beginning:\n"
+        "[amessenger] not connecting:"
     )
 
 
@@ -218,31 +231,41 @@ def _not_setup_message() -> str:
         else "the Owner Chat and Agent are not configured"
     )
     return (
-        f"AMessenger is not set up yet: {cause}; type `/amsg setup` in the chat "
-        "where the Owner wants to see mail."
+        "AMessenger is not set up.\n"
+        f"Reason: {security.safe_field(cause)}\n\n"
+        "In the intended Owner Chat, run:\n"
+        "/amsg setup"
     )
 
 
 def _setup_agent_error(agent: str) -> str:
     return (
-        f"Agent name `{security.safe_field(agent, fallback='')}` is invalid: it must "
-        "match `[a-z0-9][a-z0-9-]{1,31}`. Pass a valid name as the first argument, "
-        "for example `/amsg setup my-agent`."
+        "AMessenger setup did not run.\n"
+        f"Agent: {security.safe_field(agent, fallback='')}\n"
+        "Reason: the Agent name must match [a-z0-9][a-z0-9-]{1,31}.\n\n"
+        "For example:\n"
+        "/amsg setup my-agent"
     )
 
 
 def _setup_argument_error() -> str:
     return (
-        "Accepted forms for setup: `/amsg setup [name] [corporate|personal] "
-        "[--key <key>] [--relay <url>] [--confirm]`; to confirm a requested "
-        "Owner Chat move, type `/amsg setup --confirm`."
+        "That setup command is not valid.\n\n"
+        "Use:\n"
+        "/amsg setup [name] [corporate|personal] [--key <key>] [--relay <url>]\n\n"
+        "To confirm an Owner Chat move:\n"
+        "/amsg setup --confirm"
     )
 
 
 def _setup_card_reply(card: dict) -> str:
-    card_lines = [line.strip() for line in mirror.format_card(card).splitlines()]
-    published = card_lines[0] + " " + "; ".join(card_lines[1:])
-    return f"{published}; this chat is your Owner Chat; type /amsg help."
+    return (
+        "AMessenger setup is complete.\n"
+        "Owner Chat: this chat\n\n"
+        f"{mirror.format_card(card)}\n\n"
+        "For help:\n"
+        "/amsg help"
+    )
 
 
 def _redact_setup_secret(text, secret: str = "") -> str:
@@ -266,16 +289,18 @@ def _setup_reply(
         except (AttributeError, TypeError):
             chat_type = ""
         if chat_type in {"group", "forum", "channel"}:
-            reply = f"{reply} {SETUP_KEY_GROUP_WARNING}"
+            reply = f"{reply}\n\n{SETUP_KEY_GROUP_WARNING}"
     return _redact_setup_secret(reply, secret)
 
 
 def _setup_move_message(old_owner_chat: str, owner_chat: str) -> str:
     return (
-        f"Moving the Owner Chat from {old_owner_chat} to {owner_chat} will "
-        "change where AMessenger mail is shown. Nothing moved yet; type "
-        "/amsg setup --confirm to confirm, or type another setup command "
-        "to leave it unchanged."
+        "The Owner Chat has not moved.\n"
+        f"Current Owner Chat: {security.safe_field(old_owner_chat)}\n"
+        f"Requested Owner Chat: {security.safe_field(owner_chat)}\n\n"
+        "To confirm the move:\n"
+        "/amsg setup --confirm\n"
+        "Do not confirm to leave the Owner Chat unchanged."
     )
 
 
@@ -323,36 +348,54 @@ def _stored_setup_value(profile_values: dict[str, str], *names: str) -> str:
     return ""
 
 
-def _setup_relay_error(url: str, error: Exception, secret: str = "") -> str:
-    safe_url = _redact_setup_secret(url, secret)
+def _setup_relay_error(
+    agent: str, url: str, error: Exception, secret: str = ""
+) -> str:
+    safe_agent = security.safe_field(agent, fallback="")
+    safe_url = security.safe_field(_redact_setup_secret(url, secret))
     if isinstance(error, relay.CardConflict) or (
         isinstance(error, relay.RelayRejected) and error.status == 409
     ):
         return (
-            f"AMessenger setup failed: Agent name is already taken by another Owner "
-            f"at {safe_url}; choose another name as the first argument and type "
-            "`/amsg setup <agent-name> [corporate|personal]`."
+            "AMessenger setup did not finish.\n"
+            f"Agent: {safe_agent}\n"
+            f"Relay: {safe_url}\n"
+            "Reason: another Owner already uses this Agent name.\n\n"
+            "Choose another Agent name:\n"
+            "/amsg setup <agent-name> [corporate|personal]"
         )
     if isinstance(error, relay.RelayRejected):
         if error.status in {401, 403}:
             return (
-                f"AMessenger setup failed: the relay at {safe_url} rejected the key; put "
-                "a valid Redmine API key in REDMINE_API_KEY or AMESSENGER_KEY in the "
-                "profile .env, then type `/amsg setup` again."
+                "AMessenger setup did not finish.\n"
+                f"Relay: {safe_url}\n"
+                "Reason: the relay rejected the Owner key.\n"
+                "Put a valid Redmine API key in REDMINE_API_KEY or AMESSENGER_KEY.\n\n"
+                "Then run:\n"
+                "/amsg setup"
             )
-        return (
-            f"AMessenger setup failed: the relay at {safe_url} rejected the request "
-            f"({_redact_setup_secret(error.detail, secret)}); fix that cause and type "
-            "/amsg setup again."
+        safe_detail = security.safe_field(
+            _redact_setup_secret(error.detail, secret)
         )
+        return (
+            "AMessenger setup did not finish.\n"
+            f"Relay: {safe_url}\n"
+            f"Reason: {safe_detail}\n"
+            "Fix this cause.\n\n"
+            "Then run:\n"
+            "/amsg setup"
+        )
+    safe_error = security.safe_field(_redact_setup_secret(error, secret))
     return (
-        f"AMessenger setup failed: the relay at {safe_url} is unreachable "
-        f"({_redact_setup_secret(error, secret)}).\n"
-        "If this Hermes runs in a container, an outbound proxy is the usual cause: "
-        "a bare IP is proxied unless it is listed in NO_PROXY, while a name such as "
-        "host.docker.internal is normally already there. Point it at a reachable "
-        "address with `/amsg relay <url>`, or check the relay's health, then type "
-        "`/amsg setup` again."
+        "AMessenger setup did not finish.\n"
+        f"Relay: {safe_url}\n"
+        f"Reason: the relay is unreachable: {safe_error}\n\n"
+        "For a container, check the outbound proxy and NO_PROXY.\n"
+        "A bare IP is normally proxied; host.docker.internal is normally exempt.\n"
+        "Check relay health or set a reachable relay:\n"
+        "/amsg relay <url>\n\n"
+        "Then run:\n"
+        "/amsg setup"
     )
 
 
@@ -368,31 +411,43 @@ async def _relay(adapter, tokens: list[str]) -> str:
         shipped = defaults.relay_url()
         source = "shipped with the plugin" if current == shipped else "set for this profile"
         return (
-            f"Relay: {current} ({source}).\n"
-            "To move this Agent to another relay, type "
-            "`/amsg relay <url>`."
+            "Relay address\n"
+            f"URL: {security.safe_field(current)}\n"
+            f"Source: {source}\n\n"
+            "To move this Agent:\n"
+            "/amsg relay <url>"
         )
     if len(tokens) != 2:
         return (
-            "Accepted forms: `/amsg relay` to show the current relay, or "
-            "`/amsg relay <url>` to move to another one."
+            "That relay command is not valid.\n\n"
+            "To show the current relay:\n"
+            "/amsg relay\n\n"
+            "To move this Agent:\n"
+            "/amsg relay <url>"
         )
     url = tokens[1].strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
         return (
-            f"'{security.safe_field(tokens[1])}' is not a relay address; it must "
-            "start with http:// or https://. Nothing was changed."
+            "Nothing was changed.\n"
+            f"Value: {security.safe_field(tokens[1])}\n"
+            "Reason: a relay address must start with http:// or https://."
         )
 
     previous = adapter_module.relay_url()
     if url == previous:
-        return f"Relay is already {url}; nothing to do."
+        return (
+            "Nothing changed.\n"
+            f"Relay: {security.safe_field(url)}\n"
+            "This Agent already uses that relay."
+        )
     try:
         adapter_module.update_profile_env({"AMESSENGER_URL": url})
     except Exception as error:
         return (
-            f"Could not save the new relay address ({error}); the profile .env is "
-            f"not writable. Still using {previous}."
+            "The relay address was not saved.\n"
+            "Reason: the profile .env is not writable: "
+            f"{security.safe_field(str(error))}\n"
+            f"Current relay: {security.safe_field(previous)}"
         )
     os.environ["AMESSENGER_URL"] = url
     try:
@@ -400,12 +455,20 @@ async def _relay(adapter, tokens: list[str]) -> str:
         card = await adapter.publish_card()
     except Exception as error:
         return (
-            f"Saved the new relay {url}, but publishing the Card there failed "
-            f"({error}). Check that the relay is reachable, then type "
-            "`/amsg relay` to see the current address."
+            "The relay address was saved, but the Card was not published.\n"
+            f"Relay: {security.safe_field(url)}\n"
+            f"Reason: {security.safe_field(str(error))}\n"
+            "Check that the relay is reachable.\n\n"
+            "To inspect the saved address:\n"
+            "/amsg relay"
         )
-    published = _setup_card_reply(card) if card else "Card not published yet."
-    return f"Relay moved from {previous} to {url}. {published}"
+    published = mirror.format_card(card) if card else "The Card is not published yet."
+    return (
+        "Relay moved.\n"
+        f"Previous relay: {security.safe_field(previous)}\n"
+        f"Current relay: {security.safe_field(url)}\n\n"
+        f"{published}"
+    )
 
 
 async def _setup(adapter, tokens: list[str], source) -> str:
@@ -430,9 +493,9 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             return _setup_argument_error()
         if not isinstance(pending, dict):
             return (
-                "AMessenger setup has no Owner Chat move waiting for confirmation; "
-                "type /amsg setup in the chat you want to use, or type /amsg setup "
-                "without `--confirm` to start setup."
+                "No Owner Chat move is waiting for confirmation.\n\n"
+                "To start setup in this chat:\n"
+                "/amsg setup"
             )
         values = dict(pending["values"])
         clear = tuple(pending.get("clear", ()))
@@ -456,18 +519,26 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             return _setup_agent_error(agent)
         if kind not in adapter_module.KINDS:
             return (
-                f"Agent kind {security.safe_field(kind)} is invalid; use "
-                f"{SETUP_KIND_FORMS} as the second argument and type /amsg setup again."
+                "AMessenger setup did not run.\n"
+                f"Kind: {security.safe_field(kind)}\n"
+                f"Reason: Kind must be {SETUP_KIND_FORMS}.\n\n"
+                "Try again:\n"
+                f"/amsg setup {security.safe_field(agent)} corporate"
             )
         platform, chat_id, user_id = _source_details(source)
         try:
             profile_values = adapter_module._profile_env_values()
         except OSError as error:
             return _setup_reply(
-                f"AMessenger setup failed: the profile .env could not be read ({error}); "
-                "fix its permissions, then type /amsg setup again.",
+                "AMessenger setup did not run.\n"
+                "Reason: the profile .env could not be read: "
+                f"{security.safe_field(_redact_setup_secret(error, parsed['key'] or ''))}\n"
+                "Fix access to the file.\n\n"
+                "Then run:\n"
+                "/amsg setup",
                 source,
                 key_supplied=parsed["key"] is not None,
+                secret=parsed["key"] or "",
             )
 
         key_supplied = parsed["key"] is not None
@@ -491,9 +562,12 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             )
         if not key:
             return _setup_reply(
-                "AMessenger setup failed: no key was found; put your Redmine API key "
-                "in REDMINE_API_KEY in the profile .env (or AMESSENGER_KEY), then "
-                "type /amsg setup again.",
+                "AMessenger setup did not run.\n"
+                "Reason: no Owner key was found.\n"
+                "Add the Redmine API key to REDMINE_API_KEY or AMESSENGER_KEY "
+                "in the profile .env.\n\n"
+                "Then run:\n"
+                "/amsg setup",
                 source,
                 key_supplied=key_supplied,
             )
@@ -513,8 +587,10 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             owner_user = str(user_id or "").strip()
             if not owner_user:
                 return _setup_reply(
-                    "AMessenger setup failed: this group event has no Owner user id; "
-                    "type /amsg setup from a group message that includes your user id.",
+                    "AMessenger setup did not run.\n"
+                    "Reason: this group event does not identify the Owner.\n"
+                    "Send a new group message containing:\n"
+                    "/amsg setup",
                     source,
                     key_supplied=key_supplied,
                     secret=key if key_supplied else "",
@@ -571,8 +647,12 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         adapter_module.update_profile_env(env_values, clear=clear)
     except Exception as error:
         return _setup_reply(
-            f"AMessenger setup failed: the profile .env is not writable ({error}); "
-            "fix its permissions or disk space, then type /amsg setup again.",
+            "AMessenger setup did not run.\n"
+            "Reason: the profile .env is not writable: "
+            f"{security.safe_field(_redact_setup_secret(error, key if key_supplied else ''))}\n"
+            "Fix file access or disk space.\n\n"
+            "Then run:\n"
+            "/amsg setup",
             source,
             key_supplied=key_supplied,
             secret=key if key_supplied else "",
@@ -591,9 +671,12 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         await adapter.reload_configuration()
     except Exception as error:
         return _setup_reply(
-            "AMessenger setup failed while applying the new configuration "
-            f"({_redact_setup_secret(error, key if key_supplied else '')}); "
-            "fix that cause and type /amsg setup again.",
+            "AMessenger setup was saved but could not be applied.\n"
+            "Reason: "
+            f"{security.safe_field(_redact_setup_secret(error, key if key_supplied else ''))}\n"
+            "Fix this cause.\n\n"
+            "Then run:\n"
+            "/amsg setup",
             source,
             key_supplied=key_supplied,
             secret=key if key_supplied else "",
@@ -603,7 +686,12 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         card = await adapter.publish_card()
     except Exception as error:
         return _setup_reply(
-            _setup_relay_error(url, error, key if key_supplied else ""),
+            _setup_relay_error(
+                env_values.get("AMESSENGER_AGENT", ""),
+                url,
+                error,
+                key if key_supplied else "",
+            ),
             source,
             key_supplied=key_supplied,
             secret=key if key_supplied else "",
@@ -734,12 +822,15 @@ async def resolve_channel(adapter, token) -> tuple[dict | None, str | None]:
 def _relay_failure(action: str, error: Exception) -> str:
     if isinstance(error, relay.RelayRejected):
         return (
-            f"Could not {action}: the relay rejected the request ({error.detail}); "
-            "fix the named Channel, Agent, or permission, then retry."
+            f"Could not {action}.\n"
+            "Reason: the relay rejected the request: "
+            f"{security.safe_field(error.detail)}\n"
+            "Check the named Channel, Agent, or Grant, then retry."
         )
     return (
-        f"Could not {action}: the relay did not answer ({error}); check "
-        "AMESSENGER_URL and relay health, then retry."
+        f"Could not {action}.\n"
+        f"Reason: the relay did not answer: {security.safe_field(str(error))}\n"
+        "Check AMESSENGER_URL and relay health, then retry."
     )
 
 
@@ -757,8 +848,10 @@ def _channel_token(tokens: list[str]) -> str | None:
 
 def _log_argument_error() -> str:
     return (
-        "Expected `/amsg log [n]`, where n is a positive number from 1 to "
-        f"{state.OWNER_LOG_MAX_LINES}."
+        "That log command is not valid.\n"
+        f"n must be a number from 1 to {state.OWNER_LOG_MAX_LINES}.\n\n"
+        "Use:\n"
+        "/amsg log [n]"
     )
 
 
@@ -785,11 +878,14 @@ async def _log(tokens: list[str]) -> str:
     except OSError as error:
         logger.warning("[amessenger] could not read Owner log: %s", error)
         return (
-            "The Owner log could not be read because owner_log.jsonl is unavailable; "
-            "fix its permissions or disk space, then run /amsg log again."
+            "Saved Owner Chat lines could not be read.\n"
+            "Reason: owner_log.jsonl is unavailable.\n"
+            "Fix file access or disk space.\n\n"
+            "Then run:\n"
+            "/amsg log"
         )
     if not entries:
-        return "The Owner log is empty; nothing to do."
+        return "No saved Owner Chat lines were found.\nNothing to do."
 
     try:
         document = adapter_module.read_state_file()
@@ -801,10 +897,15 @@ async def _log(tokens: list[str]) -> str:
     except (OSError, state.StateFileCorrupt, KeyError) as error:
         logger.warning("[amessenger] could not load Owner log mark: %s", error)
         return (
-            "The Owner log could not be shown because state.json's authenticity mark "
-            "is unavailable; fix state.json, then run /amsg log again."
+            "Saved Owner Chat lines could not be shown.\n"
+            "Reason: the authenticity mark in state.json is unavailable.\n"
+            "Fix state.json.\n\n"
+            "Then run:\n"
+            "/amsg log"
         )
-    return "\n".join(mirror.with_mark(entry["text"], secret) for entry in entries)
+    return "\n\n".join(
+        mirror.with_mark(entry["text"], secret) for entry in entries
+    )
 
 
 async def _join(adapter, tokens: list[str], help_text: str) -> str:
@@ -829,7 +930,11 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
                     document, channel["id"]
                 ),
             )
-        return f"{mirror.label(channel)} is already a member."
+        return (
+            "Nothing changed.\n"
+            f"Channel: {mirror.label(channel)}\n"
+            "This Agent is already a Member."
+        )
     try:
         async with relay_client(adapter) as client:
             await relay.join(client, channel["id"])
@@ -840,7 +945,10 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
                 lambda document: state.drop_channel(document, channel["id"]),
             )
             if pending_invite:
-                return "That Invite was withdrawn or the Channel was closed."
+                return (
+                    "Could not join the Channel.\n"
+                    "The Invite was withdrawn or the Channel was closed."
+                )
             return relay.CHANNEL_GONE
         return _relay_failure("join the Channel", caught)
     if pending_invite:
@@ -848,7 +956,11 @@ async def _join(adapter, tokens: list[str], help_text: str) -> str:
             adapter,
             lambda document: state.drop_pending_invite(document, channel["id"]),
         )
-    return f"Joined {mirror.label(channel)}. Messages in it will be mirrored here."
+    return (
+        "Joined the Channel.\n"
+        f"Channel: {mirror.label(channel)}\n"
+        "Messages will be mirrored in this Owner Chat."
+    )
 
 
 async def _interact(adapter, tokens: list[str], help_text: str) -> str:
@@ -894,16 +1006,27 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
     )
     if approval_mode is not None and approval_mode != "manual":
         return (
-            f"{mirror.label(channel)} is now interact, Tool Level base, {grant_period}.\n"
-            f"I refused the full Tool Level: this gateway has approvals.mode "
-            f"'{approval_mode}', so a dangerous command from a peer would be approved "
-            "by a model instead of by you. To use full, set approvals.mode: manual "
-            "in config.yaml and restart the gateway, then grant it again.\n"
-            f"End it any time with /amsg notify {mirror.channel_name(channel)}."
+            "The Grant started.\n"
+            f"Channel: {mirror.label(channel)}\n"
+            "Mail Policy: interact\n"
+            "Tool Level: base\n"
+            f"Grant: {grant_period}\n\n"
+            "Tool Level full was refused.\n"
+            f"Reason: approvals.mode is {security.safe_field(approval_mode)}.\n"
+            "A model, not the Owner, would otherwise approve a peer's dangerous command.\n"
+            "Set approvals.mode to manual in config.yaml and restart the gateway.\n"
+            "Then give the full Grant again.\n\n"
+            "To end the current Grant:\n"
+            f"/amsg notify {mirror.channel_name(channel)}"
         )
     return (
-        f"{mirror.label(channel)} is now interact, Tool Level {level}, {grant_period}. "
-        f"End it any time with `/amsg notify {mirror.channel_name(channel)}`."
+        "The Grant started.\n"
+        f"Channel: {mirror.label(channel)}\n"
+        "Mail Policy: interact\n"
+        f"Tool Level: {level}\n"
+        f"Grant: {grant_period}\n\n"
+        "To end the Grant:\n"
+        f"/amsg notify {mirror.channel_name(channel)}"
     )
 
 
@@ -916,11 +1039,17 @@ async def _notify(adapter, tokens: list[str], help_text: str) -> str:
         return error
     record = state.channel(_read_state(adapter), channel["id"], state.now())
     if record["policy"] == "notify":
-        return f"{mirror.label(channel)} is already notify."
+        return (
+            "Nothing changed.\n"
+            f"Channel: {mirror.label(channel)}\n"
+            "Mail Policy: notify"
+        )
     _update_state(adapter, lambda document: state.revoke(document, channel["id"]))
     return (
-        f"{mirror.label(channel)} is back to notify. I will show you its Messages "
-        "and do nothing else."
+        "The Grant ended.\n"
+        f"Channel: {mirror.label(channel)}\n"
+        "Mail Policy: notify\n"
+        "The Agent will show each Mirror and do nothing else."
     )
 
 
@@ -928,8 +1057,10 @@ async def _rename(adapter, tokens: list[str]) -> str:
     """Give a Channel a name the Owner chose. The relay allows only the Creator."""
     if len(tokens) != 3:
         return (
-            "Accepted form: `/amsg rename <channel> <new name>`. A name is "
-            "lower-case letters, digits and hyphens."
+            "That rename command is not valid.\n"
+            "A Channel name uses lower-case letters, digits, and hyphens.\n\n"
+            "Use:\n"
+            "/amsg rename <channel-name> <new-name>"
         )
     channel, error = await resolve_channel(adapter, tokens[1])
     if error is not None:
@@ -937,8 +1068,9 @@ async def _rename(adapter, tokens: list[str]) -> str:
     new_name = tokens[2].strip().lower()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,159}", new_name):
         return (
-            f"'{security.safe_field(tokens[2])}' is not a Channel name: use "
-            "lower-case letters, digits and hyphens. Nothing was changed."
+            "Nothing was changed.\n"
+            f"Channel name: {security.safe_field(tokens[2])}\n"
+            "Reason: a Channel name uses lower-case letters, digits, and hyphens."
         )
     old_label = mirror.label(channel)
     try:
@@ -951,13 +1083,18 @@ async def _rename(adapter, tokens: list[str]) -> str:
                 return relay.CHANNEL_GONE
             if caught.status == 403:
                 return (
-                    "Only the Channel's Creator may rename it; ask them to type "
-                    f"`/amsg rename {mirror.channel_name(channel)} {new_name}`."
+                    "The Channel was not renamed.\n"
+                    "Reason: only the Creator may rename a Channel.\n"
+                    "Ask the Creator to run:\n"
+                    f"/amsg rename {mirror.channel_name(channel)} "
+                    f"{security.safe_field(new_name)}"
                 )
             if caught.status == 409:
                 return (
-                    f"Another Channel is already called '{new_name}'; "
-                    "pick a different name."
+                    "The Channel was not renamed.\n"
+                    f"Channel name: {security.safe_field(new_name)}\n"
+                    "Reason: another Channel already uses that name.\n"
+                    "Choose a different name."
                 )
         return _relay_failure("rename the Channel", caught)
     # A TUI has no adapter; the state file is the shared record either way.
@@ -965,8 +1102,11 @@ async def _rename(adapter, tokens: list[str]) -> str:
     if adapter is not None:
         adapter.remember_channel(renamed)
     return (
-        f"Renamed {old_label} to {mirror.label(renamed)}. "
-        "Every Member was told; that is the name to type from now on."
+        "The Channel was renamed.\n"
+        f"Previous Channel: {old_label}\n"
+        f"Current Channel: {mirror.label(renamed)}\n"
+        "Every Member was told.\n"
+        "Use the current Channel name from now on."
     )
 
 
@@ -986,7 +1126,7 @@ async def _leave(adapter, tokens: list[str], help_text: str) -> str:
             return relay.CHANNEL_GONE
         return _relay_failure("leave the Channel", caught)
     _update_state(adapter, lambda document: state.revoke(document, channel["id"]))
-    return f"Left {mirror.label(channel)}."
+    return f"Left the Channel.\nChannel: {mirror.label(channel)}"
 
 
 def _is_invited(channel: dict, agent_name: str) -> bool:
@@ -999,16 +1139,24 @@ def _is_invited(channel: dict, agent_name: str) -> bool:
 
 def _argument_error(command: str) -> str:
     accepted = {
-        "join": "<ch>",
-        "interact": "1h, 5h, Nh, Nm, always, full",
-        "notify": "<ch>",
-        "leave": "<ch>",
-        "status": "no arguments",
-        "approve": "[name]",
-        "deny": "[name]",
-        "help": "no arguments",
+        "join": "<channel-name>",
+        "interact": "<channel-name> [Nh|Nm|always] [full]",
+        "notify": "<channel-name>",
+        "leave": "<channel-name>",
+        "status": "",
+        "approve": "[channel-name]",
+        "deny": "[channel-name]",
+        "help": "",
     }
-    return f"Accepted forms for {command}: {accepted[command]}."
+    syntax = f"/amsg {command} {accepted[command]}".rstrip()
+    result = f"That {command} command is not valid.\n\nUse:\n{syntax}"
+    if command == "interact":
+        result += (
+            "\n\nFor example:\n"
+            "/amsg interact deal-42 1h\n"
+            "/amsg interact deal-42 always full"
+        )
+    return result
 
 
 async def _status(adapter) -> str:
@@ -1017,20 +1165,29 @@ async def _status(adapter) -> str:
             channels = await relay.list_channels(client)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
         return _relay_failure("list Channels", error)
-    lines = []
+    blocks = []
     problem = adapter_module.receive_problem()
     if problem:
-        lines.append(f"AMessenger cannot receive mail: {problem}")
+        blocks.append(
+            "AMessenger status\n"
+            "Receive: unavailable\n"
+            f"Reason: {security.safe_field(problem)}"
+        )
+    else:
+        blocks.append("AMessenger status\nReceive: available")
     if not channels:
-        lines.append("No Channels yet; nothing to do.")
-        return "\n".join(lines)
+        blocks.append("No Channels yet.\nNothing to do.")
+        return "\n\n".join(blocks)
 
     agent_name = read_settings().get("agent", "")
     for channel in sorted(channels, key=mirror.label):
         label = mirror.label(channel)
         if _is_invited(channel, agent_name):
-            lines.append(
-                f"{label} — invited. Join with /amsg join {mirror.channel_name(channel)}"
+            blocks.append(
+                f"Channel: {label}\n"
+                "Invite: waiting\n"
+                "To join:\n"
+                f"/amsg join {mirror.channel_name(channel)}"
             )
             continue
         record = state.channel(_read_state(adapter), channel["id"])
@@ -1040,10 +1197,15 @@ async def _status(adapter) -> str:
                 if record.get("expires_at") is None
                 else f"until {mirror.human_time(record['expires_at'])}"
             )
-            lines.append(f"{label} — interact, {record['level']}, {period}")
+            blocks.append(
+                f"Channel: {label}\n"
+                "Mail Policy: interact\n"
+                f"Tool Level: {record['level']}\n"
+                f"Grant: {period}"
+            )
         else:
-            lines.append(f"{label} — notify")
-    return "\n".join(lines)
+            blocks.append(f"Channel: {label}\nMail Policy: notify")
+    return "\n\n".join(blocks)
 
 
 def _pending_label(adapter, channel_id, entry=None) -> str:
@@ -1087,20 +1249,23 @@ def _waiting_approvals_message(
     for _session_key, entry in entries:
         channel_id = entry["chat_id"]
         channel = _pending_channel(adapter, channel_id, entry)
-        descriptions.append(f"`{mirror.label(channel)}`")
+        descriptions.append(mirror.label(channel))
     example_name = mirror.channel_name(
         _pending_channel(adapter, entries[0][1]["chat_id"], entries[0][1])
     )
+    command = "approve" if choice == "once" else "deny"
     return (
-        f"There are {len(entries)} waiting: {', '.join(descriptions)}. "
-        f"Say which, for example `/amsg {choice} {example_name}`."
+        f"{len(entries)} approvals are waiting.\n"
+        f"Channels: {', '.join(descriptions)}\n\n"
+        "Choose one, for example:\n"
+        f"/amsg {command} {example_name}"
     )
 
 
 async def _approval(adapter, choice: str, approval_name: str | None = None) -> str:
     entries = _pending_entries(adapter)
     if not entries:
-        return "Nothing is waiting for your approval."
+        return "No approval is waiting.\nNothing to do."
 
     if approval_name is None:
         if len(entries) != 1:
@@ -1124,14 +1289,22 @@ async def _approval(adapter, choice: str, approval_name: str | None = None) -> s
             return resolution_error
         if not matches:
             return (
-                f"No pending approval matches `{approval_name}`; use a Channel name shown by "
-                "/amsg approve or /amsg deny."
+                "No pending approval matches this Channel.\n"
+                f"Channel: {security.safe_field(approval_name)}\n\n"
+                "Show the waiting approvals with one of:\n"
+                "/amsg approve\n"
+                "/amsg deny"
             )
         if len(matches) != 1:
             return _waiting_approvals_message(adapter, choice, matches)
         selected = matches[0]
 
     session_key, entry = selected
+    channel_name = mirror.channel_name(
+        _pending_channel(adapter, entry["chat_id"], entry)
+    )
+    if channel_name == mirror.UNKNOWN_CHANNEL_NAME:
+        channel_name = "<channel-name>"
     if adapter is None:
         try:
             adapter_module.append_pending_decision_file(entry["chat_id"], choice)
@@ -1139,18 +1312,27 @@ async def _approval(adapter, choice: str, approval_name: str | None = None) -> s
             logger.warning("[amessenger] could not record approval decision: %s", error)
             command = "approve" if choice == "once" else "deny"
             return (
-                "Could not record the approval decision because "
-                "pending_decisions.jsonl could not be written; fix its permissions "
-                f"or disk space, then run /amsg {command} again."
+                "The approval decision was not recorded.\n"
+                "Reason: pending_decisions.jsonl could not be written.\n"
+                "Fix file access or disk space.\n\n"
+                "Then run:\n"
+                f"/amsg {command} {channel_name}"
             )
-        return "recorded; the gateway applies it within half a minute"
+        return (
+            "The approval decision was recorded.\n"
+            "The gateway will apply it within 30 seconds."
+        )
 
     try:
         from tools.approval import resolve_gateway_approval
     except ImportError:
         return (
-            "Approvals are unavailable because this Hermes build lacks "
-            "tools.approval; upgrade Hermes, then run /amsg approve or /amsg deny again."
+            "Approvals are unavailable.\n"
+            "Reason: this Hermes build lacks tools.approval.\n"
+            "Upgrade Hermes.\n\n"
+            "Then use one of:\n"
+            f"/amsg approve {channel_name}\n"
+            f"/amsg deny {channel_name}"
         )
 
     popped = None
@@ -1164,10 +1346,16 @@ async def _approval(adapter, choice: str, approval_name: str | None = None) -> s
 
     adapter.update_state(pop_approval)
     if popped is None:
-        return "Nothing is waiting for your approval."
+        return "No approval is waiting.\nNothing to do."
     resolved = resolve_gateway_approval(popped["session_key"], choice)
     label = _pending_label(adapter, popped["chat_id"], popped)
-    return f"Resolved {resolved} approval(s) for Channel {label}."
+    decision = "allow once" if choice == "once" else "refuse"
+    return (
+        "The approval decision was applied.\n"
+        f"Channel: {label}\n"
+        f"Decision: {decision}\n"
+        f"Approvals resolved: {resolved}"
+    )
 
 
 def make_handler():

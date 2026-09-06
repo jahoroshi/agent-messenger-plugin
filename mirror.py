@@ -10,11 +10,16 @@ from . import security
 logger = logging.getLogger("amessenger")
 NOTICE_BODY_LIMIT = 300
 UNKNOWN_CHANNEL_NAME = "Channel name unavailable"
-INCOMING_HEADER_PREFIX = "📨 AMessenger · from "
-OUTGOING_HEADER_PREFIX = "📤 AMessenger · to "
-NOTICE_HEADER_PREFIX = "🔔 AMessenger · "
-GRANT_NOTICE_HEADER_PREFIX = "🔕 AMessenger · "
-APPROVAL_HEADER_PREFIX = "⚠️ AMessenger · "
+INCOMING_HEADER_PREFIX = "📨 AMessenger · Incoming"
+OUTGOING_HEADER_PREFIX = "📤 AMessenger · Outgoing"
+INVITE_HEADER_PREFIX = "🔔 AMessenger · Invite"
+NOTICE_HEADER_PREFIX = "🔔 AMessenger · Notice"
+UNKNOWN_NOTICE_HEADER_PREFIX = "🔔 AMessenger · Unknown notice"
+RECEIVE_PROBLEM_HEADER_PREFIX = "🔔 AMessenger · Receive problem"
+LATE_APPROVAL_HEADER_PREFIX = "🔔 AMessenger · Approval arrived too late"
+GRANT_NOTICE_HEADER_PREFIX = "🔕 AMessenger · Grant ended"
+REPLY_CAP_HEADER_PREFIX = "🔕 AMessenger · Reply cap reached"
+APPROVAL_HEADER_PREFIX = "⚠️ AMessenger · Approval needed"
 # A per-line prefix cannot be escaped: a body line containing a closing delimiter
 # could end a delimiter fence and expose a forged header, while stripping that
 # delimiter would violate the requirement that the Owner sees the Message exactly
@@ -27,8 +32,13 @@ UNTRUSTED_PEER_CLOSE = "[end untrusted peer Message]"
 MIRROR_HEADER_PREFIXES = (
     INCOMING_HEADER_PREFIX,
     OUTGOING_HEADER_PREFIX,
+    INVITE_HEADER_PREFIX,
     NOTICE_HEADER_PREFIX,
+    UNKNOWN_NOTICE_HEADER_PREFIX,
+    RECEIVE_PROBLEM_HEADER_PREFIX,
+    LATE_APPROVAL_HEADER_PREFIX,
     GRANT_NOTICE_HEADER_PREFIX,
+    REPLY_CAP_HEADER_PREFIX,
     APPROVAL_HEADER_PREFIX,
 )
 AGENT_WRITTEN_PREFIX = "⚠ (agent wrote, not a Mirror) "
@@ -43,9 +53,12 @@ GRANT_DEFAULT = "always"
 def grant_hint(name: str) -> str:
     """Offer the Owner the interact choices, with the full command spelled out."""
     return (
-        "— notify mode. Let my agent answer on its own:\n"
-        f"   /amsg interact {name} {GRANT_DEFAULT}        — how long: {GRANT_CHOICES}\n"
-        f"   /amsg interact {name} {GRANT_DEFAULT} full   — the same, plus all tools"
+        "Mail Policy: notify\n"
+        "To let the Agent answer:\n"
+        f"/amsg interact {name} {GRANT_DEFAULT}\n"
+        f"Duration choices: {GRANT_CHOICES}\n"
+        "For Tool Level full:\n"
+        f"/amsg interact {name} {GRANT_DEFAULT} full"
     )
 
 
@@ -111,7 +124,10 @@ def human_time(value: str | None, moment: datetime | None = None) -> str:
 
 def _line_imitates_mirror(line: str) -> bool:
     candidate = line.lstrip()
-    return candidate.startswith(MIRROR_HEADER_PREFIXES) or candidate.startswith(
+    fixed_header = any(
+        candidate.startswith(header) for header in MIRROR_HEADER_PREFIXES
+    )
+    return fixed_header or candidate.startswith(
         (UNTRUSTED_PEER_OPEN, UNTRUSTED_PEER_CLOSE)
     )
 
@@ -172,9 +188,14 @@ def _sender_details(sender_card: dict | None) -> tuple[str, str, str]:
 
 def _incoming_header(sender_card, channel) -> str:
     sender_name, owner_name, kind = _sender_details(sender_card)
-    return (
-        f"{INCOMING_HEADER_PREFIX}agent {sender_name} "
-        f"(Owner: {owner_name}, {kind}) · channel {label(channel)}"
+    return "\n".join(
+        (
+            INCOMING_HEADER_PREFIX,
+            f"Agent: {sender_name}",
+            f"Owner: {owner_name}",
+            f"Kind: {kind}",
+            f"Channel: {label(channel)}",
+        )
     )
 
 
@@ -183,7 +204,7 @@ def incoming(sender_card, channel, text, policy) -> str:
     header = _incoming_header(sender_card, channel)
     rendered = f"{header}\n{quote_body(text)}"
     if policy == "notify":
-        rendered += "\n" + grant_hint(channel_name(channel))
+        rendered += "\n\n" + grant_hint(channel_name(channel))
     return rendered
 
 
@@ -203,16 +224,26 @@ def approval_request(channel: dict, command: str, description: str) -> str:
     name = channel_name(channel)
     description = security.safe_field(description, fallback="")
     lines = [
-        f"{APPROVAL_HEADER_PREFIX}channel {label(channel)} asked me to run a command "
-        "under the full Tool Level."
+        APPROVAL_HEADER_PREFIX,
+        f"Channel: {label(channel)}",
+        "This Channel asked me to run a command at Tool Level full.",
     ]
     if description:
         lines.append(description)
     lines.extend(
         (
-            f"    {command}",
-            f"— Allow once: /amsg approve {name}     "
-            f"Refuse: /amsg deny {name}     Silence refuses it.",
+            "Requested command:",
+            # The command is shown exactly: safe_field would truncate it at 100
+            # characters and rewrite its text, so the Owner would approve a
+            # command that is not the one that runs.  quote_body prefixes every
+            # line instead, which contains a multi-line command without changing it.
+            quote_body(command if isinstance(command, str) else ""),
+            "",
+            "To allow once:",
+            f"/amsg approve {name}",
+            "To refuse:",
+            f"/amsg deny {name}",
+            "No answer also refuses it.",
         )
     )
     return "\n".join(lines)
@@ -220,24 +251,39 @@ def approval_request(channel: dict, command: str, description: str) -> str:
 
 def outgoing(channel, text) -> str:
     """Format an outgoing Message for the Owner Chat."""
-    return f"{OUTGOING_HEADER_PREFIX}channel {label(channel)}\n{quote_body(text)}"
+    return f"{OUTGOING_HEADER_PREFIX}\nChannel: {label(channel)}\n{quote_body(text)}"
 
 
 def receive_problem_notice(problem: str) -> str:
     """The Owner-facing line that says replies cannot arrive in this gateway."""
-    return f"{NOTICE_HEADER_PREFIX}Replies cannot arrive in this gateway: {problem}"
+    # A cause names a platform, a loop state, and often a relay error, so the
+    # 100-character default cut it in the middle of the very hint the operator
+    # needs.  NOTICE_BODY_LIMIT keeps the sanitizing and gives the cause room.
+    safe_problem = security.safe_field(problem, limit=NOTICE_BODY_LIMIT)
+    return (
+        f"{RECEIVE_PROBLEM_HEADER_PREFIX}\n"
+        "Replies cannot arrive in this gateway.\n"
+        f"Reason: {safe_problem}\n"
+        "Ask the operator to fix this cause."
+    )
 
 
 def grant_ended(channel: dict) -> str:
     """Format the notice for a single Grant ended by the Agent."""
-    return f"{GRANT_NOTICE_HEADER_PREFIX}Grant for {label(channel)} ended, back to notify."
+    return (
+        f"{GRANT_NOTICE_HEADER_PREFIX}\n"
+        f"Channel: {label(channel)}\n"
+        "Mail Policy: notify"
+    )
 
 
 def grant_ended_channel_gone(channel: dict) -> str:
     """Format the notice for a Grant removed by relay reconciliation."""
     return (
-        f"{GRANT_NOTICE_HEADER_PREFIX}Grant for {label(channel)} ended because the "
-        "Channel no longer exists on the relay, back to notify."
+        f"{GRANT_NOTICE_HEADER_PREFIX}\n"
+        f"Channel: {label(channel)}\n"
+        "Mail Policy: notify\n"
+        "Reason: the Channel no longer exists on the relay."
     )
 
 
@@ -245,14 +291,20 @@ def approval_decision_too_late(channel: dict, choice: str) -> str:
     """Tell the Owner that a gateway-less answer arrived after the prompt ended."""
     answer = "approval" if choice == "once" else "denial"
     return (
-        f"{NOTICE_HEADER_PREFIX}Your {answer} for Channel {label(channel)} "
-        "arrived too late; no pending approval was waiting, so nothing to do."
+        f"{LATE_APPROVAL_HEADER_PREFIX}\n"
+        f"Channel: {label(channel)}\n"
+        f"Your {answer} arrived too late.\n"
+        "There was no pending approval, so nothing to do."
     )
 
 
 def cap_reached(channel: dict) -> str:
     """Format the notice for a Channel that reached its reply cap."""
-    return f"{GRANT_NOTICE_HEADER_PREFIX}Cap reached, channel {label(channel)} back to notify."
+    return (
+        f"{REPLY_CAP_HEADER_PREFIX}\n"
+        f"Channel: {label(channel)}\n"
+        "Mail Policy: notify"
+    )
 
 
 def _notice_body(text) -> str:
@@ -263,29 +315,44 @@ def _notice_body(text) -> str:
 def invite(channel, text) -> str:
     """Format an Invite, including its first Message, for the Owner Chat."""
     creator = security.safe_field(channel.get("creator"))
-    header = f"{NOTICE_HEADER_PREFIX}{creator} invites you to channel {label(channel)}."
+    lines = [
+        INVITE_HEADER_PREFIX,
+        f"Creator: {creator}",
+        f"Channel: {label(channel)}",
+    ]
     body = text if isinstance(text, str) else ""
     if body:
-        header += f" First message:\n{quote_body(body)}"
-    return f"{header}\n— Join: /amsg join {channel_name(channel)}     Ignore: do nothing"
+        lines.extend(("First Message:", quote_body(body)))
+    lines.extend(
+        (
+            "",
+            "To join:",
+            f"/amsg join {channel_name(channel)}",
+            "Do nothing to ignore this Invite.",
+        )
+    )
+    return "\n".join(lines)
 
 
 def notice(channel, text) -> str:
     """Format a relay-written Channel notice for the Owner Chat."""
-    return f"{NOTICE_HEADER_PREFIX}channel {label(channel)}: {_notice_body(text)}"
+    return f"{NOTICE_HEADER_PREFIX}\nChannel: {label(channel)}\n{_notice_body(text)}"
 
 
 def unknown_notice(channel: dict, kind, text) -> str:
     """Format an Owner notice for a Delivery kind this plugin cannot handle."""
     safe_kind = security.safe_field(kind)
     safe_text = _notice_body(text)
-    notice_text = (
-        f"a notice this Agent does not understand yet ({safe_kind}); upgrade "
-        "AMessenger to handle this Delivery."
-    )
+    lines = [
+        UNKNOWN_NOTICE_HEADER_PREFIX,
+        f"Channel: {label(channel)}",
+        f"Kind: {safe_kind}",
+        "This Agent does not understand this notice yet.",
+        "Upgrade AMessenger to handle this Delivery.",
+    ]
     if safe_text:
-        notice_text += f"\n{safe_text}"
-    return f"{NOTICE_HEADER_PREFIX}channel {label(channel)}: {notice_text}"
+        lines.append(safe_text)
+    return "\n".join(lines)
 
 
 def format_card(card: dict | None) -> str:
@@ -294,20 +361,22 @@ def format_card(card: dict | None) -> str:
 
     owner = card.get("owner") if isinstance(card.get("owner"), dict) else {}
     owner_name = security.safe_field(owner.get("name") or owner.get("login"))
-    owner_line = f"  Owner: {owner_name}"
-    if owner.get("email"):
-        owner_line += f" <{security.safe_field(owner.get('email'))}>"
     agent_name = security.safe_field(card.get("name"))
     kind = security.safe_field(card.get("kind"))
     lines = [
-        "Your Card is published:",
-        f"  Agent: {agent_name} ({kind})",
-        owner_line,
+        "Your Card is published.",
+        f"Agent: {agent_name}",
+        f"Kind: {kind}",
+        f"Owner: {owner_name}",
     ]
+    if owner.get("email"):
+        email = security.safe_field(owner.get("email"), fallback="")
+        if email:
+            lines.append(f"Email: {email}")
     if card.get("description"):
         description = security.safe_field(card.get("description"), fallback="")
         if description:
-            lines.append(f"  About: {description}")
+            lines.append(f"About: {description}")
     return "\n".join(lines)
 
 

@@ -90,15 +90,15 @@ INTERIM_SEND_KEY = "_interim_send"
 # the relay, because its receive loop had never started and nothing said so.
 RECEIVE_NOT_CONNECTED = (
     "the AMessenger platform is not connected in this gateway; the gateway log "
-    "line beginning `[amessenger] not connecting:` names the cause"
+    "line that begins with [amessenger] not connecting: names the cause"
 )
 RECEIVE_LOOP_STOPPED = "the AMessenger receive loop stopped"
 RECEIVE_LOOP_NOT_RUNNING = "the AMessenger receive loop is not running"
-RECEIVE_WAITING_FOR_SETUP = "AMessenger is waiting for /amsg setup in the Owner Chat"
+RECEIVE_WAITING_FOR_SETUP = "the Owner Chat has not completed AMessenger setup"
 # A platform-only AMESSENGER_OWNER_CHAT (what the installer writes) is not a
 # fault: the chat id arrives with the Owner's first /amsg setup, or with
 # Hermes's own /sethome, which the poll loop notices without a restart.
-OWNER_CHAT_WAITING = "waiting for /amsg setup or /sethome in the Owner Chat"
+OWNER_CHAT_WAITING = "the Owner Chat has not been selected"
 _LIVE_ADAPTER = None
 _LAST_CONNECT_PROBLEM: str | None = None
 
@@ -534,9 +534,8 @@ def env_enablement() -> dict | None:
 
 
 class AMessengerAdapter(BasePlatformAdapter):
-    def __init__(self, config: PlatformConfig, help_text: str = "") -> None:
+    def __init__(self, config: PlatformConfig) -> None:
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
-        self._help_text = help_text
         self._settings = None
         self._owner_platform = ""
         self._owner_chat_id = ""
@@ -1341,7 +1340,9 @@ class AMessengerAdapter(BasePlatformAdapter):
                 raise
             except CardConflict as error:
                 logger.error("[amessenger] stopping: %s", error)
-                self._stop_reason = f"{RECEIVE_LOOP_STOPPED}: {error}"
+                self._stop_reason = (
+                    f"{RECEIVE_LOOP_STOPPED}: {security.safe_field(str(error))}"
+                )
                 self._running = False
                 self._mark_disconnected()
                 return
@@ -1358,8 +1359,9 @@ class AMessengerAdapter(BasePlatformAdapter):
                         settings["agent"],
                     )
                     self._relay_fault = (
-                        f"another gateway is publishing Agent {settings['agent']}; "
-                        "this one is waiting and receives nothing"
+                        "another gateway is publishing Agent "
+                        f"{security.safe_field(settings['agent'])}; "
+                        "this gateway receives nothing"
                     )
                 else:
                     logger.warning(
@@ -1368,7 +1370,8 @@ class AMessengerAdapter(BasePlatformAdapter):
                         wait,
                     )
                     self._relay_fault = (
-                        f"the AMessenger receive loop is retrying after: {error}"
+                        "the AMessenger receive loop is retrying\n"
+                        f"Cause: {security.safe_field(str(error))}"
                     )
                 self._card = None
                 index += 1
@@ -1380,8 +1383,9 @@ class AMessengerAdapter(BasePlatformAdapter):
                     wait,
                 )
                 self._relay_fault = (
-                    f"the AMessenger receive loop is retrying after: "
-                    f"{type(error).__name__}: {error}"
+                    "the AMessenger receive loop is retrying\n"
+                    f"Cause: {security.safe_field(type(error).__name__)}: "
+                    f"{security.safe_field(str(error))}"
                 )
                 self._card = None
                 index += 1
@@ -1454,11 +1458,19 @@ class AMessengerAdapter(BasePlatformAdapter):
         # explanatory sentence here makes that seam turn it into the one
         # concrete mark the Owner should remember, without putting the mark in
         # the log or any model-visible transcript.
-        text = self._help_text + "\n\n" + format_card(self._card)
-        # The sentence only makes sense when the seam will actually append a
-        # mark; with the mark hidden it would trail off mid-phrase.
+        text = (
+            "AMessenger is ready.\n"
+            "This is the Owner Chat.\n\n"
+            f"{format_card(self._card)}"
+        )
+        # The example only makes sense when the seam will append the mark that
+        # distinguishes the genuine fixed marker from an Agent imitation.
         if mirror.mark_is_visible():
-            text += "\n\nReal AMessenger lines end with"
+            text += (
+                "\n\nA real Mirror starts with a fixed marker line such as "
+                "📨 AMessenger · Incoming.\n"
+                "Real AMessenger lines end with"
+            )
         # A welcome is retried by the startup loop, not persisted as a second
         # pending copy; otherwise the failed attempt and the retry can both
         # appear when the Owner adapter comes back.
@@ -1467,6 +1479,16 @@ class AMessengerAdapter(BasePlatformAdapter):
         ):
             logger.warning(
                 "[amessenger] welcome not delivered to Owner Chat %s",
+                self._owner_chat_id,
+            )
+            return
+        if not await self.mirror_or_queue(
+            "To see AMessenger commands:\n/amsg help",
+            queue_on_failure=False,
+            note_transcript=False,
+        ):
+            logger.warning(
+                "[amessenger] welcome help prompt not delivered to Owner Chat %s",
                 self._owner_chat_id,
             )
             return
