@@ -52,6 +52,9 @@ FAULT_NOTICE_SECONDS = 60
 # produces for a moment; a real duplicate installation outlasts the grace period
 # and is announced then. Announcing every momentary one would teach an Owner
 # that these notices mean nothing.
+# `agent_name_taken` arrives from any authenticated route, not only the Card:
+# the relay refuses every request from an Agent name that belongs to another
+# Owner, so an inbox poll raises it too.
 PERMANENT_FAULT_CODES = frozenset(
     {"invalid_key", "missing_credentials", "agent_name_taken", "card_conflict"}
 )
@@ -314,6 +317,21 @@ def receive_problem() -> str | None:
         or getattr(adapter, "_relay_fault", None)
         or getattr(adapter, "_post_fault", None)
     )
+
+
+_REVISION = None
+
+
+def _installed_revision() -> str:
+    """The plugin revision, read once. It cannot change while this process runs.
+
+    Read on every poll cycle it would be two small file reads inside the receive
+    loop for a value that is fixed at import.
+    """
+    global _REVISION
+    if _REVISION is None:
+        _REVISION = health.installed_revision()
+    return _REVISION
 
 
 def _health_text(value) -> str:
@@ -1534,7 +1552,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             health.Report(
                 agent=str(settings.get("agent") or ""),
                 profile=profile_name(),
-                revision=health.installed_revision(),
+                revision=_installed_revision(),
                 owner_chat=health.RESOLVED if self._owner_chat_id else health.WAITING,
                 receiver=receiver,
                 last_poll_at=self._last_poll_at,
@@ -1629,13 +1647,12 @@ class AMessengerAdapter(BasePlatformAdapter):
             # teach the Owner that these notices are noise.
             return
         self._notified_fault_code = code
-        await self.mirror_or_queue(
+        await self._announce(
             "AMessenger cannot receive Messages.\n"
             f"Reason: {text}\n\n"
             "Nothing sent to you is lost: the relay holds a Message for two "
             "days.\n"
-            "You will be told when Messages arrive again.",
-            note_transcript=False,
+            "You will be told when Messages arrive again."
         )
 
     async def announce_recovery(self) -> None:
@@ -1646,11 +1663,35 @@ class AMessengerAdapter(BasePlatformAdapter):
         if self._notified_fault_code is None:
             return
         self._notified_fault_code = None
-        await self.mirror_or_queue(
+        await self._announce(
             "AMessenger receives Messages again.\n"
-            "Anything sent while it was down is arriving now.",
-            note_transcript=False,
+            "Anything sent while it was down is arriving now."
         )
+
+    async def _announce(self, text: str) -> None:
+        """Post a notice, without ever waiting out the Owner-adapter wait.
+
+        A notice is raised on the way out of a receive loop that is stopping,
+        and wait_for_owner_adapter() may sit there for five minutes. A shutdown
+        that takes five minutes looks hung to Hermes, and the wait buys nothing:
+        the queue delivers the notice when the Owner Chat comes back.
+        """
+        try:
+            await asyncio.wait_for(
+                self.mirror_or_queue(text, note_transcript=False),
+                timeout=OWNER_POST_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            self.update_state(
+                lambda document: state.queue_mirror(
+                    document, text, note_transcript=False
+                )
+            )
+            logger.warning(
+                "[amessenger] Owner notice queued: the Owner Chat did not "
+                "answer within %ss",
+                OWNER_POST_TIMEOUT_SECONDS,
+            )
 
     async def poll_pending_decisions(self) -> None:
         """Apply gateway-less approval decisions and consume their snapshot."""
