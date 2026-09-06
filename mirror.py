@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from . import security
@@ -40,6 +41,19 @@ MIRROR_HEADER_PREFIXES = (
     GRANT_NOTICE_HEADER_PREFIX,
     REPLY_CAP_HEADER_PREFIX,
     APPROVAL_HEADER_PREFIX,
+)
+# Detection is wider than rendering on purpose.  A reader recognizes the marker
+# family, not the exact suffix, so an Agent writing "🔔 AMessenger · anything"
+# would be read as a real notice.  Matching the family catches every such line,
+# including a header this plugin used in an earlier version.  The warning emoji
+# is listed with and without its variation selector because both render alike.
+MIRROR_HEADER_FAMILIES = (
+    "📨 AMessenger ·",
+    "📤 AMessenger ·",
+    "🔔 AMessenger ·",
+    "🔕 AMessenger ·",
+    "⚠️ AMessenger ·",
+    "⚠ AMessenger ·",
 )
 AGENT_WRITTEN_PREFIX = "⚠ (agent wrote, not a Mirror) "
 SHOW_MARK_VARIABLE = "AMESSENGER_SHOW_MARK"
@@ -124,10 +138,7 @@ def human_time(value: str | None, moment: datetime | None = None) -> str:
 
 def _line_imitates_mirror(line: str) -> bool:
     candidate = line.lstrip()
-    fixed_header = any(
-        candidate.startswith(header) for header in MIRROR_HEADER_PREFIXES
-    )
-    return fixed_header or candidate.startswith(
+    return candidate.startswith(MIRROR_HEADER_FAMILIES) or candidate.startswith(
         (UNTRUSTED_PEER_OPEN, UNTRUSTED_PEER_CLOSE)
     )
 
@@ -158,10 +169,23 @@ def rewrite_forged_lines(text) -> str | None:
     return "".join(rewritten)
 
 
+# Every separator a chat window can render as a new visual line.  Splitting on
+# "\n" alone let a body carry a bare carriage return, U+2028 or U+2029 in front
+# of a forged header: the line looked new to the reader but carried no "> ".
+_LINE_SEPARATORS = re.compile(
+    "(\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029])"
+)
+
+
 def quote_body(text) -> str:
     """Prefix every line of a Message body without changing its text."""
     body = text if isinstance(text, str) else ""
-    return "\n".join(f"{BODY_QUOTE}{line}" for line in body.split("\n"))
+    pieces = _LINE_SEPARATORS.split(body)
+    quoted = []
+    for index in range(0, len(pieces), 2):
+        separator = pieces[index + 1] if index + 1 < len(pieces) else ""
+        quoted.append(f"{BODY_QUOTE}{pieces[index]}{separator}")
+    return "".join(quoted)
 
 
 def channel_name(channel: dict | None) -> str:

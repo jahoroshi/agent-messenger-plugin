@@ -31,6 +31,13 @@ def filter_inbound(text: str) -> str:
     return cleaned
 
 
+# A cause, a relay URL, or an Owner Chat id is read to act on: cut at the 100
+# characters that suit a name, a URL differs from another only after the cut and
+# a cause loses the log line it names.  These values are sanitized to one line
+# like every other, but with room to stay exact.
+DIAGNOSTIC_LIMIT = 300
+
+
 def safe_field(value, fallback: str = "unknown", limit: int = 100) -> str:
     """Make a relay-supplied string safe to interpolate into a frame or Mirror line."""
     if not isinstance(value, str):

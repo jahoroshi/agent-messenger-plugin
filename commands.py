@@ -39,7 +39,7 @@ SETUP_NO_RELAY = (
     "Reason: no relay address is configured.\n"
     "Ask your administrator for the relay URL.\n\n"
     "Then run:\n"
-    "/amsg setup … --relay <url>"
+    "/amsg setup --relay <url>"
 )
 SETUP_GATEWAY_SOURCE = (
     "AMessenger setup did not run.\n"
@@ -158,7 +158,7 @@ def _setup_gateway_adapter_message() -> str:
         # Owner into a loop a restart can never end.
         return (
             "AMessenger cannot start with this Hermes profile.\n"
-            f"Reason: {security.safe_field(problem)}\n"
+            f"Reason: {security.safe_field(problem, limit=security.DIAGNOSTIC_LIMIT)}\n"
             "Fix that value, then restart the gateway.\n"
             "Restarting without the fix will not help.\n\n"
             "Then run:\n"
@@ -170,7 +170,7 @@ def _setup_gateway_adapter_message() -> str:
         # name now belongs to another Owner); the stop reason is the cause.
         return (
             "AMessenger cannot receive Messages in this gateway.\n"
-            f"Reason: {security.safe_field(problem)}\n"
+            f"Reason: {security.safe_field(problem, limit=security.DIAGNOSTIC_LIMIT)}\n"
             "Fix that cause, then restart the gateway."
         )
     return (
@@ -296,8 +296,8 @@ def _setup_reply(
 def _setup_move_message(old_owner_chat: str, owner_chat: str) -> str:
     return (
         "The Owner Chat has not moved.\n"
-        f"Current Owner Chat: {security.safe_field(old_owner_chat)}\n"
-        f"Requested Owner Chat: {security.safe_field(owner_chat)}\n\n"
+        f"Current Owner Chat: {security.safe_field(old_owner_chat, limit=security.DIAGNOSTIC_LIMIT)}\n"
+        f"Requested Owner Chat: {security.safe_field(owner_chat, limit=security.DIAGNOSTIC_LIMIT)}\n\n"
         "To confirm the move:\n"
         "/amsg setup --confirm\n"
         "Do not confirm to leave the Owner Chat unchanged."
@@ -352,7 +352,7 @@ def _setup_relay_error(
     agent: str, url: str, error: Exception, secret: str = ""
 ) -> str:
     safe_agent = security.safe_field(agent, fallback="")
-    safe_url = security.safe_field(_redact_setup_secret(url, secret))
+    safe_url = security.safe_field(_redact_setup_secret(url, secret), limit=security.DIAGNOSTIC_LIMIT)
     if isinstance(error, relay.CardConflict) or (
         isinstance(error, relay.RelayRejected) and error.status == 409
     ):
@@ -385,7 +385,7 @@ def _setup_relay_error(
             "Then run:\n"
             "/amsg setup"
         )
-    safe_error = security.safe_field(_redact_setup_secret(error, secret))
+    safe_error = security.safe_field(_redact_setup_secret(error, secret), limit=security.DIAGNOSTIC_LIMIT)
     return (
         "AMessenger setup did not finish.\n"
         f"Relay: {safe_url}\n"
@@ -412,7 +412,7 @@ async def _relay(adapter, tokens: list[str]) -> str:
         source = "shipped with the plugin" if current == shipped else "set for this profile"
         return (
             "Relay address\n"
-            f"URL: {security.safe_field(current)}\n"
+            f"URL: {security.safe_field(current, limit=security.DIAGNOSTIC_LIMIT)}\n"
             f"Source: {source}\n\n"
             "To move this Agent:\n"
             "/amsg relay <url>"
@@ -437,7 +437,7 @@ async def _relay(adapter, tokens: list[str]) -> str:
     if url == previous:
         return (
             "Nothing changed.\n"
-            f"Relay: {security.safe_field(url)}\n"
+            f"Relay: {security.safe_field(url, limit=security.DIAGNOSTIC_LIMIT)}\n"
             "This Agent already uses that relay."
         )
     try:
@@ -446,8 +446,8 @@ async def _relay(adapter, tokens: list[str]) -> str:
         return (
             "The relay address was not saved.\n"
             "Reason: the profile .env is not writable: "
-            f"{security.safe_field(str(error))}\n"
-            f"Current relay: {security.safe_field(previous)}"
+            f"{security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}\n"
+            f"Current relay: {security.safe_field(previous, limit=security.DIAGNOSTIC_LIMIT)}"
         )
     os.environ["AMESSENGER_URL"] = url
     try:
@@ -456,8 +456,8 @@ async def _relay(adapter, tokens: list[str]) -> str:
     except Exception as error:
         return (
             "The relay address was saved, but the Card was not published.\n"
-            f"Relay: {security.safe_field(url)}\n"
-            f"Reason: {security.safe_field(str(error))}\n"
+            f"Relay: {security.safe_field(url, limit=security.DIAGNOSTIC_LIMIT)}\n"
+            f"Reason: {security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}\n"
             "Check that the relay is reachable.\n\n"
             "To inspect the saved address:\n"
             "/amsg relay"
@@ -465,8 +465,8 @@ async def _relay(adapter, tokens: list[str]) -> str:
     published = mirror.format_card(card) if card else "The Card is not published yet."
     return (
         "Relay moved.\n"
-        f"Previous relay: {security.safe_field(previous)}\n"
-        f"Current relay: {security.safe_field(url)}\n\n"
+        f"Previous relay: {security.safe_field(previous, limit=security.DIAGNOSTIC_LIMIT)}\n"
+        f"Current relay: {security.safe_field(url, limit=security.DIAGNOSTIC_LIMIT)}\n\n"
         f"{published}"
     )
 
@@ -532,7 +532,7 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             return _setup_reply(
                 "AMessenger setup did not run.\n"
                 "Reason: the profile .env could not be read: "
-                f"{security.safe_field(_redact_setup_secret(error, parsed['key'] or ''))}\n"
+                f"{security.safe_field(_redact_setup_secret(error, parsed['key'] or ''), limit=security.DIAGNOSTIC_LIMIT)}\n"
                 "Fix access to the file.\n\n"
                 "Then run:\n"
                 "/amsg setup",
@@ -649,7 +649,7 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         return _setup_reply(
             "AMessenger setup did not run.\n"
             "Reason: the profile .env is not writable: "
-            f"{security.safe_field(_redact_setup_secret(error, key if key_supplied else ''))}\n"
+            f"{security.safe_field(_redact_setup_secret(error, key if key_supplied else ''), limit=security.DIAGNOSTIC_LIMIT)}\n"
             "Fix file access or disk space.\n\n"
             "Then run:\n"
             "/amsg setup",
@@ -673,7 +673,7 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         return _setup_reply(
             "AMessenger setup was saved but could not be applied.\n"
             "Reason: "
-            f"{security.safe_field(_redact_setup_secret(error, key if key_supplied else ''))}\n"
+            f"{security.safe_field(_redact_setup_secret(error, key if key_supplied else ''), limit=security.DIAGNOSTIC_LIMIT)}\n"
             "Fix this cause.\n\n"
             "Then run:\n"
             "/amsg setup",
@@ -824,12 +824,12 @@ def _relay_failure(action: str, error: Exception) -> str:
         return (
             f"Could not {action}.\n"
             "Reason: the relay rejected the request: "
-            f"{security.safe_field(error.detail)}\n"
+            f"{security.safe_field(error.detail, limit=security.DIAGNOSTIC_LIMIT)}\n"
             "Check the named Channel, Agent, or Grant, then retry."
         )
     return (
         f"Could not {action}.\n"
-        f"Reason: the relay did not answer: {security.safe_field(str(error))}\n"
+        f"Reason: the relay did not answer: {security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}\n"
         "Check AMESSENGER_URL and relay health, then retry."
     )
 
@@ -1086,8 +1086,7 @@ async def _rename(adapter, tokens: list[str]) -> str:
                     "The Channel was not renamed.\n"
                     "Reason: only the Creator may rename a Channel.\n"
                     "Ask the Creator to run:\n"
-                    f"/amsg rename {mirror.channel_name(channel)} "
-                    f"{security.safe_field(new_name)}"
+                    f"/amsg rename {mirror.channel_name(channel)} {new_name}"
                 )
             if caught.status == 409:
                 return (
@@ -1171,7 +1170,7 @@ async def _status(adapter) -> str:
         blocks.append(
             "AMessenger status\n"
             "Receive: unavailable\n"
-            f"Reason: {security.safe_field(problem)}"
+            f"Reason: {security.safe_field(problem, limit=security.DIAGNOSTIC_LIMIT)}"
         )
     else:
         blocks.append("AMessenger status\nReceive: available")
@@ -1350,6 +1349,15 @@ async def _approval(adapter, choice: str, approval_name: str | None = None) -> s
     resolved = resolve_gateway_approval(popped["session_key"], choice)
     label = _pending_label(adapter, popped["chat_id"], popped)
     decision = "allow once" if choice == "once" else "refuse"
+    if not resolved:
+        # The prompt had already ended.  Saying the decision was applied would
+        # tell the Owner a command was allowed or refused when none was.
+        return (
+            "The approval decision arrived too late.\n"
+            f"Channel: {label}\n"
+            f"Decision: {decision}\n"
+            "No approval was waiting, so nothing was applied."
+        )
     return (
         "The approval decision was applied.\n"
         f"Channel: {label}\n"
