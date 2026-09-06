@@ -471,6 +471,54 @@ async def _relay(adapter, tokens: list[str]) -> str:
     )
 
 
+async def _agent_named_after_the_owner(adapter, url: str, key: str) -> tuple[str, str]:
+    """Derive the Agent name from the key's Owner, or say why it cannot.
+
+    The installer already does this. Chat setup used the Hermes profile label
+    instead, whose ordinary default is `hermes-agent`, so two fresh
+    installations following the documented two-step route asked the relay for
+    the same globally unique name. There is no safe local guess: a name that is
+    not derived from the authenticated Owner is refused rather than invented.
+    """
+    client = relay.build_client(
+        url,
+        key,
+        "",
+        transport=getattr(adapter, "_transport", None),
+        ca_file=read_settings()["ca_file"],
+    )
+    try:
+        login = await relay.owner_login(client)
+    except (relay.RelayRejected, relay.RelayUnavailable) as error:
+        return "", (
+            "AMessenger setup did not run.\n"
+            "Reason: the Owner identity could not be read from the relay: "
+            f"{security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}\n\n"
+            "Check the relay and the key, or name the Agent yourself:\n"
+            "/amsg setup <agent-name>"
+        )
+    except relay.UntrustedRelayCertificate as error:
+        return "", (
+            "AMessenger setup did not run.\n"
+            f"Reason: {security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}"
+        )
+    finally:
+        await client.aclose()
+
+    agent = adapter_module.agent_name_from_login(login)
+    if re.fullmatch(adapter_module.AGENT_NAME_PATTERN, agent) is None:
+        # A login of one character, or one made only of punctuation, normalizes
+        # to something no Agent name may be. Saying so beats publishing a Card
+        # under a name the Owner never chose and cannot recognize.
+        return "", (
+            "AMessenger setup did not run.\n"
+            "Reason: an Agent name could not be derived from the Owner login.\n\n"
+            "Name the Agent yourself:\n"
+            "/amsg setup <agent-name>"
+        )
+    return agent, ""
+
+
 async def _setup(adapter, tokens: list[str], source) -> str:
     if not in_gateway_process():
         return SETUP_TUI
@@ -502,20 +550,21 @@ async def _setup(adapter, tokens: list[str], source) -> str:
         key_supplied = bool(pending.get("key_supplied"))
         key = str(values.get("AMESSENGER_KEY") or "")
     else:
-        profile = adapter_module.profile_name()
         positionals = parsed["positionals"]
         stored = read_settings()
         configured = adapter_module.configuration_state() == "configured"
         # A configured profile keeps its Agent name and Kind: the installer
-        # named the Agent after the Owner, and setup only adds the chat.
+        # named the Agent after the Owner, and setup only adds the chat. An
+        # empty name here means "derive it", which needs the key and cannot
+        # happen until both are resolved below.
         agent = positionals[0] if positionals else (
-            stored["agent"] if configured and stored.get("agent") else profile
+            stored["agent"] if configured and stored.get("agent") else ""
         )
         kind = positionals[1] if len(positionals) == 2 else (
             stored["kind"] if configured and not positionals and stored.get("kind")
             else "corporate"
         )
-        if re.fullmatch(adapter_module.AGENT_NAME_PATTERN, agent) is None:
+        if agent and re.fullmatch(adapter_module.AGENT_NAME_PATTERN, agent) is None:
             return _setup_agent_error(agent)
         if kind not in adapter_module.KINDS:
             return (
@@ -572,6 +621,15 @@ async def _setup(adapter, tokens: list[str], source) -> str:
                 key_supplied=key_supplied,
             )
         url = relay_url.rstrip("/")
+        if not agent:
+            agent, refusal = await _agent_named_after_the_owner(adapter, url, key)
+            if refusal:
+                return _setup_reply(
+                    refusal,
+                    source,
+                    key_supplied=key_supplied,
+                    secret=key if key_supplied else "",
+                )
         owner_chat = f"{platform}:{chat_id}"
         values = {
             "AMESSENGER_URL": url,

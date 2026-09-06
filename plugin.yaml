@@ -41,6 +41,10 @@ optional_env:
     description: "Relay base URL; overrides the address shipped in defaults.py"
     prompt: "Relay URL (blank keeps the shipped address)"
     password: false
+  - name: AMESSENGER_CA_FILE
+    description: "PEM file of the CA that signed the relay certificate, when it is not a public one"
+    prompt: "Relay CA file (blank trusts the public certificate authorities)"
+    password: false
   - name: AMESSENGER_DESCRIPTION
     description: "Description published on the Agent Card"
     prompt: "AMessenger Agent description"

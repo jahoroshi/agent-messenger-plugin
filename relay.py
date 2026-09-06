@@ -1,5 +1,7 @@
 """Small HTTP client for the AMessenger relay."""
 
+import ssl
+
 from . import mirror, security
 
 import httpx
@@ -32,12 +34,42 @@ class CardConflict(RelayRejected):
     """This Agent name belongs to another Owner (409 on the Card route)."""
 
 
-def build_client(url, key, agent, transport=None) -> httpx.AsyncClient:
+class UntrustedRelayCertificate(Exception):
+    """The named CA file cannot be used, so no request may be attempted.
+
+    Raised rather than quietly falling back to the public trust store: falling
+    back would send the Owner key to a relay whose certificate nobody checked,
+    which is the one thing naming a CA file was meant to prevent.
+    """
+
+
+def verification(ca_file: str = ""):
+    """Decide what this client verifies the relay's certificate against.
+
+    A relay behind a certificate this host does not already trust -- a private
+    CA on an internal network -- needs the CA named. The client is built with
+    `trust_env=False`, on purpose: it must not inherit a proxy or a CA bundle
+    from whatever environment a gateway happens to run in. So the file is read
+    here, and on httpx 0.28 it has to become a context rather than a path.
+    """
+    if not str(ca_file).strip():
+        return True
+    try:
+        return ssl.create_default_context(cafile=str(ca_file).strip())
+    except (OSError, ssl.SSLError) as error:
+        raise UntrustedRelayCertificate(
+            "the relay CA file named by AMESSENGER_CA_FILE could not be used: "
+            f"{security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}"
+        ) from error
+
+
+def build_client(url, key, agent, transport=None, ca_file="") -> httpx.AsyncClient:
     """Build the shared authenticated relay client."""
     return httpx.AsyncClient(
         base_url=url,
         transport=transport,
         trust_env=False,
+        verify=verification(ca_file),
         timeout=HTTP_TIMEOUT_SECONDS,
         headers={
             "Authorization": f"Bearer {key}",
@@ -122,6 +154,18 @@ def _array(response: httpx.Response) -> list:
     if not isinstance(payload, list):
         raise RelayUnavailable("response body is not a JSON array")
     return payload
+
+
+async def owner_login(client) -> str:
+    """The login the Owner key belongs to, before any Agent exists.
+
+    The one route that needs no Agent name, which is exactly why it can supply
+    one. Every other route wants an X-Agent header that does not exist yet the
+    first time an Owner sets AMessenger up.
+    """
+    payload = _object(await request(client, "GET", "/v1/whoami"))
+    login = payload.get("login")
+    return login.strip() if isinstance(login, str) else ""
 
 
 async def publish_card(client, kind, description) -> dict:

@@ -152,6 +152,23 @@ def _profile_env_values(path: Path | None = None) -> dict[str, str]:
     return values
 
 
+def agent_name_from_login(login: str) -> str:
+    """Turn an Owner login into an Agent name that is unique by construction.
+
+    A profile label is not an identity. `profile_name()` defaults to
+    `hermes-agent`, so thirty Owners running the same documented command would
+    all ask the relay for the same Agent name: the first wins and the rest are
+    refused, or worse, two installations of one Owner share one name and take
+    turns stealing each other's mail. A login is already globally unique and the
+    key already proves who it belongs to.
+
+    provision.py holds its own copy of this rule, because it must run where the
+    plugin cannot be imported. tests/test_defaults.py keeps the two in step.
+    """
+    name = re.sub(r"[^a-z0-9-]+", "-", (login or "").strip().lower()).strip("-")
+    return name[:32].rstrip("-")
+
+
 def profile_name() -> str:
     """Resolve a useful default Agent name for the active Hermes profile."""
     for variable in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
@@ -437,6 +454,7 @@ def build_relay_client(transport=None):
         settings["key"],
         settings["agent"],
         transport=transport,
+        ca_file=settings["ca_file"],
     )
 
 
@@ -471,6 +489,7 @@ def read_settings() -> dict:
         "description": os.getenv("AMESSENGER_DESCRIPTION", ""),
         "owner_chat": os.getenv("AMESSENGER_OWNER_CHAT", ""),
         "owner_user": os.getenv("AMESSENGER_OWNER_USER", ""),
+        "ca_file": os.getenv("AMESSENGER_CA_FILE", ""),
         "base_toolsets": _toolsets(
             "AMESSENGER_BASE_TOOLSETS", "amessenger,web,no_mcp"
         ),
@@ -653,6 +672,13 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
         if settings["kind"] not in KINDS:
             return "AMESSENGER_KIND must be one of: corporate, personal"
+        try:
+            # Checked here so a CA file that cannot be read is named once, at
+            # startup, instead of failing every relay call from inside a retry
+            # loop the Owner cannot see.
+            relay.verification(settings["ca_file"])
+        except relay.UntrustedRelayCertificate as error:
+            return str(error)
 
         owner_platform, owner_chat_id = parse_owner_chat(settings["owner_chat"])
         if not owner_platform:
@@ -826,6 +852,7 @@ class AMessengerAdapter(BasePlatformAdapter):
                 settings["key"],
                 settings["agent"],
                 transport=self._transport,
+                ca_file=settings.get("ca_file", ""),
             )
         return self._client
 
