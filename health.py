@@ -136,13 +136,15 @@ def summarize(report: Report) -> Report:
 
 def lines(report: Report) -> list[str]:
     """The report as an Owner or an operator reads it, one fact per line."""
+    # Summary then reason, before anything else. A reader who stops after two
+    # lines must already have what happened and why.
     out = [f"Summary: {report.summary}"]
+    if report.fault:
+        out.append(f"Reason: {report.fault}")
     if report.agent:
         out.append(f"Agent: {report.agent}")
     if report.profile:
         out.append(f"Profile: {report.profile}")
-    if report.fault:
-        out.append(f"Reason: {report.fault}")
     out.append(f"Owner Chat: {report.owner_chat}")
     receiver = report.receiver
     if report.last_poll_at:

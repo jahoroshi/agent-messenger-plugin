@@ -7,7 +7,7 @@ import os
 import re
 
 from . import adapter as adapter_module
-from . import defaults, mirror, relay, security, state
+from . import defaults, health, mirror, relay, security, state
 from .adapter import active_adapter, read_settings
 
 
@@ -1158,22 +1158,40 @@ def _argument_error(command: str) -> str:
     return result
 
 
+def local_health_block() -> str:
+    """What this installation knows about itself, before anything is asked.
+
+    Local first, and on purpose. `/amsg status` used to open with a relay call
+    and return its error, so the one moment an Owner most needs to know whether
+    their own gateway is receiving was the one moment the command refused to
+    say. Every fact here is already in this process or in the profile.
+    """
+    adapter = active_adapter()
+    if adapter is not None:
+        return "AMessenger status\n" + health.render(adapter.health_report())
+    report = health.read_snapshot(adapter_module.health_path_for_process())
+    if in_gateway_process():
+        # A gateway with no live adapter: the record is this profile's own, and
+        # its absence is the answer.
+        return "AMessenger status\n" + health.render(report)
+    # A console cannot receive. Saying "available" here would answer for a
+    # gateway this process has never met.
+    return (
+        "AMessenger status\n"
+        "This console does not receive Messages; a gateway does.\n"
+        "The gateway last reported:\n"
+        + health.render(report)
+    )
+
+
 async def _status(adapter) -> str:
+    blocks = [local_health_block()]
     try:
         async with relay_client(adapter) as client:
             channels = await relay.list_channels(client)
     except (relay.RelayRejected, relay.RelayUnavailable) as error:
-        return _relay_failure("list Channels", error)
-    blocks = []
-    problem = adapter_module.receive_problem()
-    if problem:
-        blocks.append(
-            "AMessenger status\n"
-            "Receive: unavailable\n"
-            f"Reason: {security.safe_field(problem, limit=security.DIAGNOSTIC_LIMIT)}"
-        )
-    else:
-        blocks.append("AMessenger status\nReceive: available")
+        blocks.append(_relay_failure("list Channels", error))
+        return "\n\n".join(blocks)
     if not channels:
         blocks.append("No Channels yet.\nNothing to do.")
         return "\n\n".join(blocks)
