@@ -15,7 +15,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
     fcntl = None
 
-DEFAULT_SINGLE_GRANT_HOURS = 5.0  # A Grant with no duration (§6.6).
+BOUNDED_GRANT_HOURS = 5.0  # The longest Grant nobody human is approving (§6.6).
 SINGLE_GRANT_IDLE_HOURS = 1.0  # A single Grant's idle limit (§6.6).
 REPLY_CAP = 20  # Autonomous replies allowed per Channel (§6.4).
 REPLY_WINDOW_SECONDS = 600  # Rolling reply-cap window (§6.4).

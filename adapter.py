@@ -375,6 +375,51 @@ def approval_mode() -> str:
         return "unknown"
 
 
+# A full Grant with no end means a peer Agent can run dangerous commands for
+# ever. That is only defensible while a human answers every approval: Hermes in
+# manual mode, with no bypass running. In every other state the Owner still gets
+# the full Tool Level they asked for -- it is not refused -- but it is bounded,
+# so the exposure ends by itself instead of outliving the Owner's attention.
+STANDING_FULL_MAX_SECONDS = int(state.BOUNDED_GRANT_HOURS * 3600)
+
+
+def unbounded_full_block(adapter, channel_id, source=None) -> str:
+    """Say why a full Grant may not be unbounded, or return "" when it may.
+
+    Both gates call this one function: the ``/amsg interact`` command, which
+    bounds the Grant as it writes it, and ``effective_level``, which re-asks at
+    every mail session in case the mode changed afterwards. They used to hold
+    the rule separately and could disagree, so an Owner could be told
+    ``Tool Level: full`` and be handed ``base`` with nothing said.
+
+    Returns ``"mode"``, ``"bypass"``, or ``""``. Anything unreadable fails
+    closed to a bounded Grant, never to an unbounded one.
+    """
+    try:
+        if approval_mode() != "manual":
+            return "mode"
+    except Exception:
+        logger.exception("[amessenger] approval mode unreadable; bounding the Grant")
+        return "mode"
+    try:
+        from gateway.session import build_session_key
+
+        if source is None:
+            if adapter is None:
+                return "bypass"
+            source = adapter.build_source(chat_id=channel_id)
+        if approval_bypass_active(build_session_key(source)) is not False:
+            return "bypass"
+    except Exception:
+        logger.exception(
+            "[amessenger] approval bypass state unreadable for Channel %s; "
+            "bounding the Grant",
+            channel_id,
+        )
+        return "bypass"
+    return ""
+
+
 def approval_bypass_active(session_key: str) -> bool:
     """Return whether Hermes will bypass approvals for this session."""
     try:
@@ -1272,7 +1317,12 @@ class AMessengerAdapter(BasePlatformAdapter):
         policy = state.channel(
             self.state(), channel["id"], state.now()
         )["policy"]
-        text = mirror.incoming(sender_card, channel, message_text, policy)
+        # The hint promises what the command will really do, so ask the same
+        # question the command will ask when the Owner acts on it.
+        bounded = bool(unbounded_full_block(self, channel["id"]))
+        text = mirror.incoming(
+            sender_card, channel, message_text, policy, bounded=bounded
+        )
         if not await self._mirror_delivery(delivery, text):
             return False
         self.remember_channel(channel)
@@ -1344,34 +1394,22 @@ class AMessengerAdapter(BasePlatformAdapter):
         if record["policy"] != "interact" or record["level"] != "full":
             return "base"
 
-        try:
-            if source is None:
-                source = self.build_source(chat_id=channel_id)
-            from gateway.session import build_session_key
-
-            session_key = build_session_key(source)
-            mode = approval_mode()
-            bypass_active = approval_bypass_active(session_key)
-        except Exception:
-            logger.exception(
-                "[amessenger] Tool Level gate failed for Channel %s while reading "
-                "configuration or approval bypass state; using base Tool Level",
-                channel_id,
-            )
-            return "base"
-
-        if mode == "manual" and bypass_active is False:
+        # A Grant with an end was already bounded when it was written, and the
+        # state layer stops honouring it once it expires. Nothing more to ask.
+        if record["grant"] != "standing":
             return "full"
 
-        failed_conditions = []
-        if mode != "manual":
-            failed_conditions.append(f"approvals.mode={mode!r}")
-        if bypass_active is not False:
-            failed_conditions.append("approval bypass is active")
+        # Only an unbounded Grant has to be re-checked: the Owner may have made
+        # it while approvals were manual and changed the mode afterwards.
+        block = unbounded_full_block(self, channel_id, source)
+        if not block:
+            return "full"
         logger.warning(
-            "[amessenger] refusing full Tool Level for Channel %s: %s",
+            "[amessenger] Channel %s holds a standing full Grant, but %s; "
+            "using base Tool Level until the Grant is made again",
             channel_id,
-            ", ".join(failed_conditions),
+            "approvals.mode is no longer manual" if block == "mode"
+            else "an approval bypass is active",
         )
         return "base"
 

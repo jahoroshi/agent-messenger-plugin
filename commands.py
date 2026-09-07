@@ -803,14 +803,16 @@ def parse_interact(tokens) -> tuple[str, float | None, str] | None:
         return None
 
     duration = None
-    level = "base"
+    # Asking for interact is asking for work to happen, so the Tool Level that
+    # can do work is the default. `base` is the deliberate step down.
+    level = None
     for token in values:
         if not isinstance(token, str):
             return None
-        if token == "full":
-            if level == "full":
+        if token in ("full", "base"):
+            if level is not None:
                 return None
-            level = "full"
+            level = token
             continue
         match = _DURATION.fullmatch(token)
         if match is not None:
@@ -829,10 +831,10 @@ def parse_interact(tokens) -> tuple[str, float | None, str] | None:
             continue
         return None
 
-    if duration == "standing":
+    if level is None:
+        level = "full"
+    if duration is None or duration == "standing":
         return "standing", None, level
-    if duration is None:
-        duration = state.DEFAULT_SINGLE_GRANT_HOURS * 3600
     return "single", duration, level
 
 
@@ -1040,17 +1042,26 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
         adapter.remember_channel(channel)
     parsed = parse_interact(tokens[2:])
     kind, duration_seconds, level = parsed
-    approval_mode = None
+    # A full Grant is never refused now. When nobody human answers the peer's
+    # approvals, it is bounded instead, so the Owner gets the tools they asked
+    # for and the exposure still ends on its own.
+    bounded = ""
     if level == "full":
-        approval_mode = adapter_module.approval_mode()
-        if approval_mode != "manual":
-            logger.warning(
-                "[amessenger] refused full Tool Level for Channel %s: "
-                "approvals.mode=%r is not manual",
-                channel["id"],
-                approval_mode,
-            )
-            level = "base"
+        block = adapter_module.unbounded_full_block(adapter, channel["id"])
+        if block:
+            cap = adapter_module.STANDING_FULL_MAX_SECONDS
+            if kind == "standing":
+                kind, duration_seconds, bounded = "single", cap, block
+            elif duration_seconds > cap:
+                duration_seconds, bounded = cap, block
+            if bounded:
+                logger.warning(
+                    "[amessenger] bounded the full Grant for Channel %s to %ds: %s",
+                    channel["id"],
+                    cap,
+                    "approvals.mode is not manual" if bounded == "mode"
+                    else "an approval bypass is active",
+                )
     moment = state.now()
     updated = _update_state(
         adapter,
@@ -1069,30 +1080,39 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
         if record["expires_at"] is None
         else f"until {mirror.human_time(record['expires_at'])}"
     )
-    if approval_mode is not None and approval_mode != "manual":
-        return (
-            "The Grant started.\n"
-            f"Channel: {mirror.label(channel)}\n"
-            "Mail Policy: interact\n"
-            "Tool Level: base\n"
-            f"Grant: {grant_period}\n\n"
-            "Tool Level full was refused.\n"
-            f"Reason: approvals.mode is {security.safe_field(approval_mode)}.\n"
-            "A model, not the Owner, would otherwise approve a peer's dangerous command.\n"
-            "Set approvals.mode to manual in config.yaml and restart the gateway.\n"
-            "Then give the full Grant again.\n\n"
-            "To end the current Grant:\n"
-            f"/amsg notify {mirror.channel_name(channel)}"
-        )
-    return (
+    name = mirror.channel_name(channel)
+    head = (
         "The Grant started.\n"
         f"Channel: {mirror.label(channel)}\n"
         "Mail Policy: interact\n"
         f"Tool Level: {level}\n"
-        f"Grant: {grant_period}\n\n"
-        "To end the Grant:\n"
-        f"/amsg notify {mirror.channel_name(channel)}"
+        f"Grant: {grant_period}\n"
     )
+    body = ""
+    if bounded == "mode":
+        body = (
+            "\nYou asked for a Grant with no end.\n"
+            "approvals.mode is not manual, so a model\n"
+            "approves dangerous commands, not you.\n"
+            "A Grant like that runs five hours.\n\n"
+            "For a Grant with no end: set approvals.mode\n"
+            "to manual, restart the gateway, grant again.\n"
+        )
+    elif bounded == "bypass":
+        body = (
+            "\nAn approval bypass is on. Commands from the\n"
+            "peer Agent run with no check, and nobody is\n"
+            "asked, not even a model. You chose this.\n"
+            "A Grant like that runs five hours.\n"
+        )
+    elif level == "base":
+        body = (
+            "\nThe Agent answers and reads the web.\n"
+            "No terminal, no files, no MCP.\n\n"
+            "For full Tool Level:\n"
+            f"/amsg interact {name}\n"
+        )
+    return f"{head}{body}\nTo end the Grant:\n/amsg notify {name}"
 
 
 async def _notify(adapter, tokens: list[str], help_text: str) -> str:

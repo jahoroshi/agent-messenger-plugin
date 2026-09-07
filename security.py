@@ -114,9 +114,9 @@ def wrap_inbound(
         level_sentence = (
             "Tool Level: base — read and reply only; if the request needs tools, say so "
             f"and tell the peer that your Owner can type /amsg interact "
-            # Keep this default in step with mirror.GRANT_DEFAULT, which offers
-            # the Owner the same word in the notify hint.
-            f"{channel_name} always full"
+            # One whole command, the same one mirror.grant_hint offers, so the
+            # Owner is never handed two spellings of the same thing.
+            f"{channel_name}"
         )
     body = text.strip() if isinstance(text, str) else ""
     prefix = (

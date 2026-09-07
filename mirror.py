@@ -58,22 +58,47 @@ MIRROR_HEADER_FAMILIES = (
 AGENT_WRITTEN_PREFIX = "⚠ (agent wrote, not a Mirror) "
 SHOW_MARK_VARIABLE = "AMESSENGER_SHOW_MARK"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
-# Durations offered in the hint.  The grammar accepts any <N>h/<N>m too; these
-# are the choices worth putting in front of an Owner who is deciding now.
-GRANT_CHOICES = "always | 1h | 5h"
-GRANT_DEFAULT = "always"
+# The longest Grant offered in the hint. The grammar accepts any <N>h/<N>m, and
+# an Owner who sees 5h can shorten it; nobody has to be told that separately.
+GRANT_LONGEST = "5h"
 
 
-def grant_hint(name: str) -> str:
-    """Offer the Owner the interact choices, with the full command spelled out."""
-    return (
-        "Mail Policy: notify\n"
-        "To let the Agent answer:\n"
-        f"/amsg interact {name} {GRANT_DEFAULT}\n"
-        f"Duration choices: {GRANT_CHOICES}\n"
-        "For Tool Level full:\n"
-        f"/amsg interact {name} {GRANT_DEFAULT} full"
+def grant_hint(name: str, *, bounded: bool = False) -> str:
+    """Offer the Owner the interact choices, one whole command per line.
+
+    Every line is copied and sent as it stands. The Owner is never asked to
+    join a command out of parts, and never told about a word to add: the point
+    of this hint is that it appears with each incoming Message and has to be
+    acted on in one gesture.
+
+    ``bounded`` says an unbounded full Grant is not available right now, so the
+    hint promises what the command will actually do rather than what it asks
+    for.
+    """
+    lead = (
+        "Let the Agent work on this, five hours:"
+        if bounded
+        else "Let the Agent work on this, no time limit:"
     )
+    lines = [
+        "Mail Policy: notify",
+        "No Grant is active.",
+        "",
+        lead,
+        f"/amsg interact {name}",
+    ]
+    if not bounded:
+        lines += [
+            "",
+            "Let it work for five hours:",
+            f"/amsg interact {name} {GRANT_LONGEST}",
+        ]
+    lines += [
+        "",
+        "Messaging only, no tools:",
+        f"/amsg interact {name} always base",
+    ]
+    return "\n".join(lines)
 
 
 def authenticity_mark(secret: str) -> str:
@@ -223,12 +248,16 @@ def _incoming_header(sender_card, channel) -> str:
     )
 
 
-def incoming(sender_card, channel, text, policy) -> str:
-    """Format an incoming Message for the Owner Chat."""
+def incoming(sender_card, channel, text, policy, *, bounded: bool = False) -> str:
+    """Format an incoming Message for the Owner Chat.
+
+    ``bounded`` is decided by the caller, because only the adapter can read
+    Hermes's approval state and this module must not import it.
+    """
     header = _incoming_header(sender_card, channel)
     rendered = f"{header}\n{quote_body(text)}"
     if policy == "notify":
-        rendered += "\n\n" + grant_hint(channel_name(channel))
+        rendered += "\n\n" + grant_hint(channel_name(channel), bounded=bounded)
     return rendered
 
 
