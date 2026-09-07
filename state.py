@@ -186,11 +186,28 @@ def channel(state: dict, channel_id, moment=None) -> dict:
     return _copy_record(record)
 
 
-def grant(state: dict, channel_id, *, kind, level, duration_seconds, moment) -> dict:
+def grant(
+    state: dict, channel_id, *, kind, level, duration_seconds, moment,
+    bound_seconds=None,
+) -> dict:
+    """Write a Grant.
+
+    ``kind`` is the Owner's intent and decides how the Grant ends early: a
+    single Grant ends on ``[TASK_DONE]`` or an idle hour, a standing one does
+    not. ``bound_seconds`` is a safety bound on a standing Grant, used when
+    nobody human is answering the peer's approvals. The two are separate on
+    purpose: writing the bound as a single Grant would silently attach both
+    early-end rules to a Grant the Owner asked to keep running.
+    """
     if kind not in {"single", "standing"} or level not in {"base", "full"}:
         raise ValueError("invalid Grant kind or Tool Level")
     granted_at = ts(moment)
-    expires_at = None if kind == "standing" else ts(moment + timedelta(seconds=duration_seconds))
+    if kind == "single":
+        expires_at = ts(moment + timedelta(seconds=duration_seconds))
+    elif bound_seconds is not None:
+        expires_at = ts(moment + timedelta(seconds=bound_seconds))
+    else:
+        expires_at = None
     existing = state["channels"].get(channel_id, _default_channel())
     record = {
         "name": existing.get("name"),
@@ -485,7 +502,12 @@ def _grant_ended(record: dict, moment: datetime) -> bool:
     if not _timestamps_are_valid(record):
         return True
     if record["grant"] == "standing":
-        return False
+        # A standing Grant has no idle limit and no [TASK_DONE] end. It ends
+        # only at a safety bound, when it carries one.
+        if record.get("expires_at") is None:
+            return False
+        expires_at = parse_ts(record["expires_at"])
+        return expires_at is None or expires_at <= moment
     expires_at = parse_ts(record["expires_at"])
     if expires_at is None or expires_at <= moment:
         return True

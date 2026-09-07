@@ -1396,7 +1396,9 @@ class AMessengerAdapter(BasePlatformAdapter):
 
         # A Grant with an end was already bounded when it was written, and the
         # state layer stops honouring it once it expires. Nothing more to ask.
-        if record["grant"] != "standing":
+        # The question is the bound, not the kind: a standing Grant made while
+        # nobody human approves carries one too.
+        if record["expires_at"] is not None:
             return "full"
 
         # Only an unbounded Grant has to be re-checked: the Owner may have made

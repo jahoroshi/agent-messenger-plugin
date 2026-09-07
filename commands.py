@@ -1046,12 +1046,16 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
     # approvals, it is bounded instead, so the Owner gets the tools they asked
     # for and the exposure still ends on its own.
     bounded = ""
+    bound_seconds = None
     if level == "full":
         block = adapter_module.unbounded_full_block(adapter, channel["id"])
         if block:
             cap = adapter_module.STANDING_FULL_MAX_SECONDS
             if kind == "standing":
-                kind, duration_seconds, bounded = "single", cap, block
+                # Bound it, but leave it standing. Rewriting it as a single
+                # Grant would also end it at the peer's first [TASK_DONE] and
+                # after an idle hour, neither of which the Owner asked for.
+                bound_seconds, bounded = cap, block
             elif duration_seconds > cap:
                 duration_seconds, bounded = cap, block
             if bounded:
@@ -1072,6 +1076,7 @@ async def _interact(adapter, tokens: list[str], help_text: str) -> str:
             level=level,
             duration_seconds=duration_seconds,
             moment=moment,
+            bound_seconds=bound_seconds,
         )
     )
     record = state.channel(updated, channel["id"])
