@@ -12,7 +12,7 @@ import time
 
 import httpx
 
-from . import defaults, health, security, state
+from . import defaults, health, security, state, telegram
 from . import mirror, relay
 from .mirror import format_card
 from .relay import (
@@ -809,6 +809,22 @@ class AMessengerAdapter(BasePlatformAdapter):
                     f"{OWNER_CHAT_WAITING} on {owner_platform}: AMESSENGER_OWNER_CHAT "
                     "names only the platform and no home channel is set"
                 )
+
+        if telegram.is_owner_chat(owner_platform) and not telegram.chat_id_is_reachable(
+            owner_chat_id
+        ):
+            # A Telegram post addressed by name arrives; the Owner command
+            # typed back does not, because Hermes reports the numeric id and
+            # the two never match. Named here, once, instead of refusing every
+            # command later for a reason only the operator could find.
+            self._settings = settings
+            self._owner_platform = owner_platform
+            self._owner_chat_id = ""
+            return (
+                "the Telegram Owner Chat must be named by its chat id, not "
+                f"'{security.safe_field(owner_chat_id)}'; open that chat with this "
+                "Agent and use /amsg setup"
+            )
 
         self._settings = settings
         self._owner_platform = owner_platform
@@ -2148,6 +2164,16 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
         # Nothing in this method may post into the Channel: the peer must never
         # learn that an approval was asked for, let alone answer it.
+        if telegram.is_owner_chat(self._owner_platform):
+            # Telegram renders Hermes's own approval buttons, and anyone Hermes
+            # allows in that chat can press them: they are not checked against
+            # the Owner. Hermes also shortens the command it shows and leaves
+            # no pending approval behind, so /amsg approve is not an answer
+            # either. AMessenger asks with its own card instead, which is
+            # answered only by the Owner and shows the command whole.
+            return await self._post_exec_approval_card(
+                owner, chat_id, command, session_key, description
+            )
         forwarded = await self._forward_exec_approval(
             owner,
             chat_id,

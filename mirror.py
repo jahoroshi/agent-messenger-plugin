@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from . import security
+from . import security, telegram
 
 
 logger = logging.getLogger("amessenger")
@@ -21,6 +21,10 @@ LATE_APPROVAL_HEADER_PREFIX = "🔔 AMessenger · Approval arrived too late"
 GRANT_NOTICE_HEADER_PREFIX = "🔕 AMessenger · Grant ended"
 REPLY_CAP_HEADER_PREFIX = "🔕 AMessenger · Reply cap reached"
 APPROVAL_HEADER_PREFIX = "⚠️ AMessenger · Approval needed"
+# A Telegram post is capped, so one Mirror can need several. Every post
+# after the first opens with this line, so the Owner reads them as one
+# Mirror and a peer cannot pass a cut off as the start of a new one.
+CONTINUATION_HEADER_PREFIX = "📎 AMessenger · Continued"
 # A per-line prefix cannot be escaped: a body line containing a closing delimiter
 # could end a delimiter fence and expose a forged header, while stripping that
 # delimiter would violate the requirement that the Owner sees the Message exactly
@@ -41,6 +45,7 @@ MIRROR_HEADER_PREFIXES = (
     GRANT_NOTICE_HEADER_PREFIX,
     REPLY_CAP_HEADER_PREFIX,
     APPROVAL_HEADER_PREFIX,
+    CONTINUATION_HEADER_PREFIX,
 )
 # Detection is wider than rendering on purpose.  A reader recognizes the marker
 # family, not the exact suffix, so an Agent writing "🔔 AMessenger · anything"
@@ -54,6 +59,7 @@ MIRROR_HEADER_FAMILIES = (
     "🔕 AMessenger ·",
     "⚠️ AMessenger ·",
     "⚠ AMessenger ·",
+    "📎 AMessenger ·",
 )
 AGENT_WRITTEN_PREFIX = "⚠ (agent wrote, not a Mirror) "
 SHOW_MARK_VARIABLE = "AMESSENGER_SHOW_MARK"
@@ -197,7 +203,7 @@ def rewrite_forged_lines(text) -> str | None:
 # Every separator a chat window can render as a new visual line.  Splitting on
 # "\n" alone let a body carry a bare carriage return, U+2028 or U+2029 in front
 # of a forged header: the line looked new to the reader but carried no "> ".
-_LINE_SEPARATORS = re.compile(
+LINE_SEPARATORS = re.compile(
     "(\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029])"
 )
 
@@ -205,7 +211,7 @@ _LINE_SEPARATORS = re.compile(
 def quote_body(text) -> str:
     """Prefix every line of a Message body without changing its text."""
     body = text if isinstance(text, str) else ""
-    pieces = _LINE_SEPARATORS.split(body)
+    pieces = LINE_SEPARATORS.split(body)
     quoted = []
     for index in range(0, len(pieces), 2):
         separator = pieces[index + 1] if index + 1 < len(pieces) else ""
@@ -433,8 +439,28 @@ def format_card(card: dict | None) -> str:
     return "\n".join(lines)
 
 
-async def post(owner_adapter, chat_id: str, text: str) -> bool:
-    """Post text in the Owner Chat and report whether Hermes accepted it."""
+async def deliver(
+    owner_adapter, chat_id: str, text: str, *, platform: str = "", thread_id=None
+) -> tuple[int, int]:
+    """Post text in the Owner Chat and say how much of it arrived.
+
+    One text can need several posts on Telegram, and a caller that would repeat
+    the whole text after a failure has to know that some of it is already
+    there.
+    """
+    if telegram.is_owner_chat(platform):
+        # Hermes reads Markdown on the way to Telegram, so this text would
+        # reach the Owner with the peer's own characters changed. AMessenger
+        # posts there itself instead (ADR-0007).
+        return await telegram.deliver(
+            owner_adapter,
+            chat_id,
+            text,
+            continuation_header=CONTINUATION_HEADER_PREFIX,
+            quote=BODY_QUOTE,
+            separators=LINE_SEPARATORS,
+            thread_id=thread_id,
+        )
     try:
         result = await owner_adapter.send(chat_id, text)
     except Exception as error:
@@ -445,9 +471,18 @@ async def post(owner_adapter, chat_id: str, text: str) -> bool:
             error,
             exc_info=True,
         )
-        return False
-    succeeded = bool(result and getattr(result, "success", False))
-    return succeeded
+        return 0, 1
+    return (1, 1) if result and getattr(result, "success", False) else (0, 1)
+
+
+async def post(
+    owner_adapter, chat_id: str, text: str, *, platform: str = "", thread_id=None
+) -> bool:
+    """Post text in the Owner Chat and report whether Hermes accepted all of it."""
+    delivered, total = await deliver(
+        owner_adapter, chat_id, text, platform=platform, thread_id=thread_id
+    )
+    return delivered == total
 
 
 def note(platform: str, chat_id: str, text: str, *, framed_text: str | None = None) -> bool:
@@ -475,6 +510,11 @@ def note(platform: str, chat_id: str, text: str, *, framed_text: str | None = No
     return bool(result)
 
 
+def _platform_name(platform) -> str:
+    """Read a platform however Hermes hands it over: an enum or a plain name."""
+    return str(getattr(platform, "value", platform) or "")
+
+
 async def mirror(
     owner_adapter,
     platform,
@@ -486,7 +526,7 @@ async def mirror(
     note_transcript: bool = True,
 ) -> bool:
     """Post the human Mirror, then append its model-safe transcript copy."""
-    if not await post(owner_adapter, chat_id, text):
+    if not await post(owner_adapter, chat_id, text, platform=_platform_name(platform)):
         return False
     if not note_transcript:
         return True

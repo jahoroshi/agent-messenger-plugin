@@ -8,7 +8,7 @@ import os
 import re
 
 from . import adapter as adapter_module
-from . import defaults, health, mirror, relay, security, state
+from . import defaults, health, mirror, relay, security, state, telegram
 from .adapter import active_adapter, read_settings
 
 
@@ -1494,11 +1494,59 @@ async def _approval(adapter, choice: str, approval_name: str | None = None) -> s
     )
 
 
+async def answer_in_owner_chat(adapter, source, answer):
+    """Post a command's answer where Hermes would change it on the way.
+
+    Hermes reads an answer as Markdown before it reaches Telegram, and
+    ``/amsg log`` answers with Messages a peer wrote. Posting it here keeps
+    every character the Owner is meant to read. Returning the answer instead
+    hands it back to Hermes, which is what every other Owner Chat wants and
+    what a failed post falls back to, so the Owner always sees something.
+    """
+    if not answer or adapter is None or source is None:
+        return answer
+    owner_platform = getattr(adapter, "_owner_platform", "")
+    if not telegram.is_owner_chat(owner_platform):
+        return answer
+    owner_chat_id = str(getattr(adapter, "_owner_chat_id", "") or "")
+    if not owner_chat_id:
+        return answer
+    try:
+        asked_here = (
+            source.platform.value == owner_platform
+            and str(source.chat_id) == owner_chat_id
+        )
+    except AttributeError:
+        return answer
+    if not asked_here:
+        # A refusal answers the chat that asked, which is not the Owner Chat.
+        # A chat id alone does not say which platform it belongs to.
+        return answer
+    owner = adapter.owner_adapter
+    if owner is None:
+        return answer
+    delivered, _total = await mirror.deliver(
+        owner,
+        owner_chat_id,
+        answer,
+        platform=owner_platform,
+        thread_id=getattr(source, "thread_id", None),
+    )
+    # Handing back an answer already half posted would repeat it, and repeat it
+    # through the Markdown path this exists to avoid.
+    return None if delivered else answer
+
+
 def make_handler():
     """Return the async callable registered by Hermes as ``/amsg``."""
-    async def handle(raw_args: str) -> str:
+    async def handle(raw_args: str) -> str | None:
         source = _SOURCE.get()
         adapter = active_adapter()
+        return await answer_in_owner_chat(
+            adapter, source, await answer(raw_args, adapter, source)
+        )
+
+    async def answer(raw_args: str, adapter, source) -> str:
         tokens = (raw_args or "").split()
         command = tokens[0] if tokens else ""
         if command == "setup":
