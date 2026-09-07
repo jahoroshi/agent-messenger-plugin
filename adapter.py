@@ -2214,7 +2214,6 @@ class AMessengerAdapter(BasePlatformAdapter):
         if count_reply and state.cap_reached(self.state(), channel_id, moment):
             return await self._cap_result(channel_id)
 
-        redacted = security.redact_outbound(text)
         if self.on_gateway_loop():
             client = self.client()
             close_client = False
@@ -2230,7 +2229,7 @@ class AMessengerAdapter(BasePlatformAdapter):
         try:
             try:
                 # This is the only path by which a Message reaches a peer.
-                send_arguments = {"text": redacted}
+                send_arguments = {"text": text}
                 if to is None:
                     send_arguments["channel_id"] = channel_id
                 else:
@@ -2275,7 +2274,7 @@ class AMessengerAdapter(BasePlatformAdapter):
             )
 
         self.remember_channel(result["channel"])
-        outgoing_line = mirror.outgoing(result["channel"], redacted)
+        outgoing_line = mirror.outgoing(result["channel"], text)
         if self._loop is None or self.on_gateway_loop():
             posted = await self.mirror_or_queue(outgoing_line)
         else:

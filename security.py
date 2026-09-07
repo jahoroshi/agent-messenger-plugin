@@ -60,29 +60,6 @@ def safe_field(value, fallback: str = "unknown", limit: int = 100) -> str:
     return cleaned.strip()
 
 
-# Copied from a2a's security.py; copy instead of importing because a plugin must not depend on another plugin.
-_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "sk-[redacted]"),
-    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "sk-ant-[redacted]"),
-    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_[redacted]"),
-    (re.compile(r"xox[bap]-[A-Za-z0-9\-]{10,}"), "xox-[redacted]"),
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[redacted]"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[redacted-jwt]"),
-    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"), "Bearer [redacted]"),
-    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[redacted-email]"),
-)
-
-
-def redact_outbound(text: str) -> str:
-    """Scrub credential-shaped substrings before sending text to a peer."""
-    if not text:
-        return text
-    out = text
-    for pat, repl in _REDACTION_PATTERNS:
-        out = pat.sub(repl, out)
-    return out
-
-
 NO_REPLY = "[NO_REPLY]"
 TASK_DONE = "[TASK_DONE]"
 _NO_REPLY_RE = re.compile(re.escape(NO_REPLY), re.IGNORECASE)

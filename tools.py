@@ -303,7 +303,6 @@ async def amessenger_send(args: dict, **_) -> str:
         return "Error: provide exactly one of 'to' and 'channel'."
     channel_id = None
     text = args.get("text", "")
-    redacted = security.redact_outbound(text)
     if channel_name is not None:
         channel, resolution_error = await _resolve_channel(adapter, channel_name)
         if resolution_error is not None:
@@ -357,7 +356,7 @@ async def amessenger_send(args: dict, **_) -> str:
         result = delivery.raw_response
         owner_copy_queued = False
     else:
-        send_arguments = {"text": redacted}
+        send_arguments = {"text": text}
         if to is None:
             send_arguments["channel_id"] = channel_id
         else:
@@ -376,7 +375,7 @@ async def amessenger_send(args: dict, **_) -> str:
             return relay_error(error)
         if not _usable_send_result(result):
             return _MALFORMED_SEND
-        owner_line = mirror.outgoing(result["channel"], redacted)
+        owner_line = mirror.outgoing(result["channel"], text)
         adapter_module.update_state_file(
             lambda document: state.queue_mirror(document, owner_line)
         )
