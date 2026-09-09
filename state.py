@@ -25,6 +25,17 @@ PENDING_INVITES_MAX = DEDUPE_MAX  # Pending Invite snapshots retained for restar
 DEDUPE_SECONDS = 3600  # Processed Delivery retention window.
 SEND_IDEMPOTENCY_SECONDS = 60  # Exact tool sends are coalesced for one minute.
 SEND_IDEMPOTENCY_MAX = DEDUPE_MAX
+# An Owner Chat session's send waits here until the Channel session sees it.
+# A Message lives on the relay for two days; a send older than that has no
+# reply to explain.
+OWNER_SEND_SECONDS = 2 * 24 * 3600
+OWNER_SENDS_MAX = 20  # Owner Chat sends kept per Channel until the next dispatch.
+OWNER_SEND_MAX_CHARS = 4000  # One remembered send is cut here, with a mark.
+OWNER_SENDS_MAX_CHARS = 8000  # All remembered sends of one Channel, oldest dropped.
+OWNER_SEND_CUT_MARK = " […cut by AMessenger]"
+# A Channel record with a send this fresh survives a stale relay listing: the
+# send may have created the Channel after the listing was taken.
+RECONCILE_GRACE_SECONDS = 300
 OWNER_LOG_MAX_LINES = 2000
 AUTHENTICITY_SECRET_KEY = "authenticity_secret"
 AUTHENTICITY_SECRET_LENGTH = 4
@@ -95,12 +106,25 @@ def ensure_authenticity_secret(document: dict) -> dict:
 
 
 def _copy_record(record: dict) -> dict:
-    return {
+    copied = {
         **record,
         "name": record.get("name"),
         "topic": record.get("topic"),
         "replies": [*record.get("replies", [])],
     }
+    if "owner_sends" in record:
+        copied["owner_sends"] = [{**entry} for entry in record["owner_sends"]]
+    return copied
+
+
+def _owner_sends_are_valid(record: dict) -> bool:
+    entries = record.get("owner_sends", [])
+    return isinstance(entries, list) and all(
+        isinstance(entry, dict)
+        and isinstance(entry.get("text"), str)
+        and isinstance(entry.get("sent_at"), str)
+        for entry in entries
+    )
 
 
 def _copy_channels(channels: dict) -> dict:
@@ -265,14 +289,24 @@ def drop_channel(state: dict, channel_id) -> dict:
     )
 
 
-def reconcile_channels(state: dict, listed_ids) -> tuple[dict, list[str]]:
+def reconcile_channels(state: dict, listed_ids, moment=None) -> tuple[dict, list[str]]:
     """Drop Channels absent from one successful relay listing.
 
     The caller decides whether a listing is trustworthy.  This function only
     applies the authoritative set it is given and returns the dropped Channel
     ids so an active Grant can be explained to the Owner.
+
+    A Channel that holds an Owner Chat send fresher than ``moment`` minus
+    ``RECONCILE_GRACE_SECONDS`` is kept: ``amessenger_send(to=...)`` creates a
+    Channel on the relay, and a listing taken just before that does not
+    show it yet. The next listing decides.
     """
     listed = {channel_id for channel_id in listed_ids if isinstance(channel_id, str)}
+    listed |= {
+        channel_id
+        for channel_id, record in state["channels"].items()
+        if _has_fresh_owner_send(record, moment)
+    }
     dropped = sorted(
         channel_id
         for channel_id in state["channels"]
@@ -371,6 +405,101 @@ def note_reply(state: dict, channel_id, moment) -> dict:
                       if key == channel_id else value)
                 for key, value in state["channels"].items()}
     return _copy_state(state, channels=channels)
+
+
+def _cut_owner_send(text: str) -> str:
+    if len(text) <= OWNER_SEND_MAX_CHARS:
+        return text
+    return text[:OWNER_SEND_MAX_CHARS].rstrip() + OWNER_SEND_CUT_MARK
+
+
+def _bound_owner_sends(entries: list[dict]) -> list[dict]:
+    """Keep the newest sends that fit the count and the character budget."""
+    kept = []
+    used = 0
+    for entry in reversed(entries[-OWNER_SENDS_MAX:]):
+        size = len(entry["text"])
+        if kept and used + size > OWNER_SENDS_MAX_CHARS:
+            break
+        kept.append(entry)
+        used += size
+    return list(reversed(kept))
+
+
+def _live_owner_sends(record: dict, moment: datetime) -> list[dict]:
+    cutoff = moment - timedelta(seconds=OWNER_SEND_SECONDS)
+    live = [
+        {"text": entry["text"], "sent_at": entry["sent_at"]}
+        for entry in record.get("owner_sends", [])
+        if (sent_at := parse_ts(entry.get("sent_at"))) is not None
+        and sent_at >= cutoff
+    ]
+    return _bound_owner_sends(live)
+
+
+def _owner_sends_up_to(entries: list[dict], before) -> list[dict]:
+    if before is None:
+        return entries
+    return [
+        entry for entry in entries
+        if (sent_at := parse_ts(entry["sent_at"])) is not None and sent_at <= before
+    ]
+
+
+def remember_owner_send(state: dict, channel_id, text: str, moment) -> dict:
+    """Keep an Owner Chat session's send until the Channel session has seen it.
+
+    The Channel session is a separate Hermes session (§6.4). It never sees
+    what the Owner Chat session sent with ``amessenger_send``, so without
+    this it answers a peer's reply as if the question had never been asked.
+    """
+    existing = state["channels"].get(channel_id, _default_channel())
+    entry = {"text": _cut_owner_send(text), "sent_at": ts(moment)}
+    entries = _bound_owner_sends([*_live_owner_sends(existing, moment), entry])
+    record = {**_copy_record(existing), "owner_sends": entries}
+    return _copy_state(state, channels={**state["channels"], channel_id: record})
+
+
+def pending_owner_sends(state: dict, channel_id, moment, *, before=None) -> list[str]:
+    """Return the Owner Chat sends the Channel session has not seen, oldest first.
+
+    ``before`` is the moment the peer's Message was created: only a send made
+    up to then can be what the peer is answering. Later sends wait.
+    """
+    record = state["channels"].get(channel_id)
+    if record is None:
+        return []
+    live = _owner_sends_up_to(_live_owner_sends(record, moment), before)
+    return [entry["text"] for entry in live]
+
+
+def forget_owner_sends(state: dict, channel_id, *, before=None) -> dict:
+    """Drop the Owner Chat sends the Channel session has now seen.
+
+    With ``before``, only sends made up to that moment are dropped; the rest
+    wait for the next dispatch. An empty list is removed, not kept.
+    """
+    record = state["channels"].get(channel_id)
+    if record is None or not record.get("owner_sends"):
+        return _copy_state(state)
+    seen = _owner_sends_up_to(record["owner_sends"], before)
+    remaining = [entry for entry in record["owner_sends"] if entry not in seen]
+    cleared = _copy_record(record)
+    cleared.pop("owner_sends", None)
+    if remaining:
+        cleared["owner_sends"] = [{**entry} for entry in remaining]
+    return _copy_state(state, channels={**state["channels"], channel_id: cleared})
+
+
+def _has_fresh_owner_send(record: dict, moment) -> bool:
+    if moment is None or not isinstance(record, dict):
+        return False
+    cutoff = moment - timedelta(seconds=RECONCILE_GRACE_SECONDS)
+    return any(
+        (sent_at := parse_ts(entry.get("sent_at"))) is not None and sent_at >= cutoff
+        for entry in record.get("owner_sends", [])
+        if isinstance(entry, dict)
+    )
 
 
 def cap_reached(state: dict, channel_id, moment) -> bool:
@@ -649,7 +778,10 @@ def load(path) -> dict:
         isinstance(document, dict)
         and isinstance(document.get("welcomed"), bool)
         and isinstance(document.get("channels"), dict)
-        and all(isinstance(record, dict) for record in document["channels"].values())
+        and all(
+            isinstance(record, dict) and _owner_sends_are_valid(record)
+            for record in document["channels"].values()
+        )
         and isinstance(pending_approvals, dict)
         and isinstance(pending_invites, dict)
         and all(

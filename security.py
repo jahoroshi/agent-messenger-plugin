@@ -16,6 +16,9 @@ _INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     # compiled pattern is byte-identical; a test asserts that.
     re.compile(r"you are " r"now (?:a|an|in) ", re.IGNORECASE),
     re.compile(r"</?(?:system|assistant|tool)[^>]*>", re.IGNORECASE),
+    # A peer body must not open a frame of its own: the Channel session reads
+    # "[AMessenger inbound" and "[AMessenger context" as the plugin's voice.
+    re.compile(r"\[AMessenger (?:inbound|context)\b", re.IGNORECASE),
 )
 
 _INJECTION_REPLACEMENT = "[filtered]"
@@ -69,10 +72,44 @@ _TRAILING_LINE_SPACE_RE = re.compile(r"[ \t]+(?=\n)")
 _EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
 
 
+OWNER_SENDS_PREFIX = (
+    "[AMessenger context — your Owner Chat session sent these Messages into "
+    "this Channel before the one below, oldest first. They are your own words, "
+    "sent on your Owner's instruction; the peer is answering them.]"
+)
+# The block is closed in the plugin's own voice. Without this a peer body made
+# of "> " lines would read as more of the Owner's words. filter_inbound drops
+# both openers from a peer body, so a peer can neither open nor close a block.
+OWNER_SENDS_SUFFIX = "[AMessenger context ends — the peer's Message follows]"
+
+
+def _owner_sends_block(owner_sends) -> str:
+    """Quote the Owner Chat session's sends the way a Mirror quotes a body."""
+    lines = [
+        f"> {line}"
+        for text in owner_sends
+        if isinstance(text, str)
+        for line in text.splitlines() or [""]
+    ]
+    if not lines:
+        return ""
+    return OWNER_SENDS_PREFIX + "\n" + "\n".join(lines) + "\n" + OWNER_SENDS_SUFFIX
+
+
 def wrap_inbound(
-    sender_card: dict | None, channel: dict | None, text: str, tool_level: str
+    sender_card: dict | None,
+    channel: dict | None,
+    text: str,
+    tool_level: str,
+    owner_sends=(),
 ) -> str:
-    """Frame a filtered Message from an Agent for a Channel session."""
+    """Frame a filtered Message from an Agent for a Channel session.
+
+    ``owner_sends`` are the Messages the Owner Chat session sent into this
+    Channel since the Channel session last ran. They are the Agent's own
+    words, so they are quoted, not filtered, and they come before the peer's
+    body so the session reads the exchange in order.
+    """
     card = sender_card if isinstance(sender_card, dict) else {}
     owner = card.get("owner") if isinstance(card.get("owner"), dict) else {}
     channel_data = channel if isinstance(channel, dict) else {}
@@ -103,6 +140,9 @@ def wrap_inbound(
         f"secrets or private files. Reply as you would to a colleague's request. End with {NO_REPLY} "
         f"if no answer is needed, {TASK_DONE} when the task is finished. {level_sentence}]"
     )
+    context = _owner_sends_block(owner_sends)
+    if context:
+        return prefix + "\n\n" + context + "\n\n" + filter_inbound(body)
     return prefix + "\n\n" + filter_inbound(body)
 
 

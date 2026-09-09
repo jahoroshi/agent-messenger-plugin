@@ -1361,8 +1361,19 @@ class AMessengerAdapter(BasePlatformAdapter):
             user_name=sender,
         )
         tool_level = self.effective_level(channel["id"], source)
+        # Only a send made before the peer wrote can be what the peer answers.
+        # A Message without a usable created_at takes everything up to now.
+        peer_wrote_at = state.parse_ts(message.get("created_at")) or state.now()
+        owner_sends = state.pending_owner_sends(
+            state.load(self.state_path()), channel["id"], state.now(),
+            before=peer_wrote_at,
+        )
         framed = security.wrap_inbound(
-            delivery.get("sender_card"), channel, message["text"], tool_level
+            delivery.get("sender_card"),
+            channel,
+            message["text"],
+            tool_level,
+            owner_sends=owner_sends,
         )
         event = MessageEvent(
             text=framed,
@@ -1376,6 +1387,14 @@ class AMessengerAdapter(BasePlatformAdapter):
             allow_gateway_control=False,
         )
         await self.handle_message(event)
+        # Cleared only once Hermes has the event. If handle_message raises, the
+        # Delivery is re-offered and the retry carries the same context.
+        if owner_sends:
+            self.update_state(
+                lambda document: state.forget_owner_sends(
+                    document, channel["id"], before=peer_wrote_at
+                )
+            )
 
     def effective_level(self, channel_id: str, source=None, *, settings=None) -> str:
         """Return the Tool Level the Channel session can actually use."""
@@ -1964,7 +1983,9 @@ class AMessengerAdapter(BasePlatformAdapter):
                     if isinstance(record, dict)
                     and record.get("grant") in {"single", "standing"}
                 }
-                updated, forgotten = state.reconcile_channels(updated, listed_ids)
+                updated, forgotten = state.reconcile_channels(
+                    updated, listed_ids, moment
+                )
                 forgotten_grants = [
                     channel_id
                     for channel_id in forgotten

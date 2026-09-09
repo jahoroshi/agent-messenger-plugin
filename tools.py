@@ -409,10 +409,17 @@ async def amessenger_send(args: dict, **_) -> str:
     if isinstance(result_channel, dict) and isinstance(result_message, dict):
         sent_channel_id = result_channel["id"]
         key = state.send_idempotency_key(sent_channel_id, text)
+        moment = state.now()
+        # This tool runs only in an Owner Chat session or the TUI, never in a
+        # Channel session (§6.4), so every send here is one the Channel
+        # session has not seen. It is handed over at the next dispatch.
         _update_shared_state(
             adapter,
-            lambda document: state.remember_send(
-                document, key, result_message["id"], state.now()
+            lambda document: state.remember_owner_send(
+                state.remember_send(document, key, result_message["id"], moment),
+                sent_channel_id,
+                text,
+                moment,
             ),
         )
     return _send_result(
