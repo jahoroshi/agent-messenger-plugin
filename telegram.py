@@ -8,11 +8,18 @@ Telegram itself, as plain text, through the client Hermes already holds.
 
 Only this module knows anything about Telegram.  Every other Owner Chat keeps
 Hermes's own send path.
+
+Telegram's own way to tell one bot from another in a group, ``/amsg@name``,
+cannot be used: Hermes strips the name and the whitespace after it before the
+command is dispatched, so ``/amsg@name status`` arrives as ``/amsgstatus`` and
+is refused (``plugins/platforms/telegram/adapter.py``,
+``_clean_bot_trigger_text``).  A live run read that refusal in a real group on
+2026-09-09.  Every command AMessenger prints is therefore the bare form, which
+works in a group with one bot.
 """
 
 import asyncio
 import logging
-import re
 
 
 logger = logging.getLogger("amessenger")
@@ -20,9 +27,6 @@ logger = logging.getLogger("amessenger")
 PLATFORM = "telegram"
 # Telegram measures a message in UTF-16 code units and refuses a longer one.
 MAX_CHARS = 4096
-# A whole line that is one AMessenger command, and nothing a peer wrote: a
-# quoted body line starts with the quote, so this never matches one.
-_COMMAND_LINE = re.compile(r"(?m)^(/[a-z][a-z0-9_-]*)(?=$|[ \t])")
 # Room kept on a continued post for its header, counted with a two-digit
 # numbering and widened by split_for_posts() when there are more posts.
 _COUNT_DIGITS = 2
@@ -105,39 +109,6 @@ def _link_preview(owner_adapter) -> dict:
     return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
 
 
-def _bot_username(owner_adapter) -> str:
-    """Return the name Telegram knows this Agent's bot by, if it says."""
-    reader = getattr(owner_adapter, "_current_bot_username", None)
-    if not callable(reader):
-        return ""
-    try:
-        return str(reader() or "").strip().lstrip("@")
-    except Exception as error:
-        logger.debug("[amessenger] Telegram bot name unavailable: %s", error)
-        return ""
-
-
-def address_commands(text: str, username: str) -> str:
-    """Address every AMessenger command in *text* to this Agent's bot.
-
-    Telegram gives a group's members several bots, and a bare ``/amsg`` there
-    reaches whichever one the group is configured to answer. ``/amsg@name`` is
-    the form Telegram routes to one bot, and Hermes drops the name again before
-    the command runs.
-
-    Only a line that begins with the command is rewritten. Everything a peer
-    wrote is quoted first, so a command inside a Message is never touched.
-    """
-    if not username:
-        return text
-    return _COMMAND_LINE.sub(rf"\1@{username}", text)
-
-
-def is_group(chat_id) -> bool:
-    """Return whether this chat is a group, which Telegram numbers below zero."""
-    return str(chat_id or "").strip().startswith("-")
-
-
 def _units(text: str, separators) -> list[str]:
     """Cut text into lines, each carrying the line break that starts it.
 
@@ -177,6 +148,19 @@ def _header_room(continuation_header: str, digits: int) -> int:
     return utf16_length(continuation_header) + len(" (/)") + 2 * digits + 1
 
 
+def _carry(tail: str, unit: str, quote: str, separators, room: int) -> str:
+    """Give the rest of a cut line the quote its line already carries.
+
+    Without it a peer could place a forged AMessenger header at the cut and
+    have the next post open with a line that looks like one AMessenger wrote.
+    A post with no more room than the quote costs would take back as much as it
+    gave and never finish, so there the rest goes on unquoted.
+    """
+    line = _line_of(unit, separators)
+    repeats = line.startswith(quote) and room > utf16_length(quote)
+    return (quote if repeats else "") + tail
+
+
 def _fragments(text: str, limit: int, reserve: int, quote: str, separators) -> list[str]:
     """Pack the text into post-sized fragments, adding only the body quote."""
     fragments: list[str] = []
@@ -191,25 +175,29 @@ def _fragments(text: str, limit: int, reserve: int, quote: str, separators) -> l
         if not unit:
             index += 1
             continue
-        if utf16_length(unit) <= whole - utf16_length(current):
+        room = whole - utf16_length(current)
+        if utf16_length(unit) <= room:
             current += unit
             index += 1
             continue
         if current:
+            # A line that must be cut whatever we do starts in the room left
+            # here, rather than leaving this post half empty: found live on
+            # 2026-09-09, where a 5000-character line left the Owner reading a
+            # Mirror header with no Message under it and spread two posts'
+            # worth over three. A line that would fit in a post of its own
+            # moves there whole instead of being split for no gain.
+            if utf16_length(unit) > max(limit - reserve, 1) and room > utf16_length(quote):
+                head, tail = _cut(unit, room)
+                current += head
+                pending[index] = _carry(tail, unit, quote, separators, room)
             fragments.append(current)
             current = ""
             continue
-        # A single line too long for a post of its own: cut the line, and give
-        # the rest the quote its line already carries.  Without it a peer could
-        # place a forged AMessenger header at the cut and have the next post
-        # open with a line that looks like one AMessenger wrote.  A post with
-        # no room for more than the quote would take it back and never finish,
-        # so there the cut goes on unquoted.
-        line = _line_of(unit, separators)
+        # An empty post that still cannot hold this line: cut the line itself.
         head, tail = _cut(unit, whole)
         fragments.append(head)
-        repeats = line.startswith(quote) and whole > utf16_length(quote)
-        pending[index] = (quote if repeats else "") + tail
+        pending[index] = _carry(tail, unit, quote, separators, whole)
     if current:
         fragments.append(current)
     return fragments
@@ -290,8 +278,6 @@ async def deliver(
 
     target = normalized_chat_id(chat_id)
     options = {**_link_preview(owner_adapter), **thread_kwargs(thread_id)}
-    if is_group(chat_id):
-        text = address_commands(text, _bot_username(owner_adapter))
     pieces = split_for_posts(text, continuation_header, quote, separators)
     delivered = 0
     async with _POSTING:
