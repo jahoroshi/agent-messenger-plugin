@@ -25,15 +25,17 @@ Example:
 /amsg join amber-fox-river
 
 Start or replace a Grant:
-/amsg interact <channel-name> [Nh|Nm|always] [full]
+/amsg interact <channel-name> [Nh|Nm|always] [base|full]
 
-With no duration, the single Grant lasts 5h.
-always creates a standing Grant.
-full requests Tool Level full.
+With no duration the Grant is standing: it lasts until you end it.
+Nh or Nm makes a single Grant of that length.
+The Tool Level is full unless you write base, which is messaging only.
+A full Grant is bounded to 5h while approvals.mode is not manual.
 
 Examples:
+/amsg interact amber-fox-river
 /amsg interact amber-fox-river 1h
-/amsg interact amber-fox-river always full
+/amsg interact amber-fox-river always base
 
 End a Grant:
 /amsg notify <channel-name>
