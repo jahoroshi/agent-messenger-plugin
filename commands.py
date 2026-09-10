@@ -8,7 +8,7 @@ import os
 import re
 
 from . import adapter as adapter_module
-from . import defaults, health, mirror, relay, security, state, telegram
+from . import bootstrap, defaults, health, mirror, relay, security, state, telegram
 from .adapter import active_adapter, read_settings
 
 
@@ -146,6 +146,20 @@ def _setup_source_is_usable(source) -> bool:
 def _setup_gateway_adapter_message() -> str:
     missing = adapter_module.missing_requirements()
     if missing:
+        if adapter_module.bootstrap_pending():
+            # Everything still missing is derived on the first start after the
+            # install. Naming a shell command for this state is what sent an
+            # Owner to an operator for a profile that already had what it needed.
+            return (
+                "AMessenger is not running in this gateway yet.\n"
+                "Reason: the plugin was installed after this gateway started.\n"
+                "It configures itself on the next start: the Agent is named "
+                "after the Owner of the key this profile already holds, and "
+                "Messages arrive in the home channel.\n\n"
+                "Restart the gateway."
+            )
+        if not adapter_module.owner_key():
+            return bootstrap.NO_OWNER_KEY
         safe_missing = security.safe_field(", ".join(missing))
         # Not "/amsg setup". Hermes refuses to register the platform for a
         # profile in this state, so there is no adapter for setup to write
@@ -478,54 +492,6 @@ async def _relay(adapter, tokens: list[str]) -> str:
     )
 
 
-async def _agent_named_after_the_owner(adapter, url: str, key: str) -> tuple[str, str]:
-    """Derive the Agent name from the key's Owner, or say why it cannot.
-
-    The installer already does this. Chat setup used the Hermes profile label
-    instead, whose ordinary default is `hermes-agent`, so two fresh
-    installations following the documented two-step route asked the relay for
-    the same globally unique name. There is no safe local guess: a name that is
-    not derived from the authenticated Owner is refused rather than invented.
-    """
-    client = relay.build_client(
-        url,
-        key,
-        "",
-        transport=getattr(adapter, "_transport", None),
-        ca_file=read_settings()["ca_file"],
-    )
-    try:
-        login = await relay.owner_login(client)
-    except (relay.RelayRejected, relay.RelayUnavailable) as error:
-        return "", (
-            "AMessenger setup did not run.\n"
-            "Reason: the Owner identity could not be read from the relay: "
-            f"{security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}\n\n"
-            "Check the relay and the key, or name the Agent yourself:\n"
-            "/amsg setup <agent-name>"
-        )
-    except relay.UntrustedRelayCertificate as error:
-        return "", (
-            "AMessenger setup did not run.\n"
-            f"Reason: {security.safe_field(str(error), limit=security.DIAGNOSTIC_LIMIT)}"
-        )
-    finally:
-        await client.aclose()
-
-    agent = adapter_module.agent_name_from_login(login)
-    if re.fullmatch(adapter_module.AGENT_NAME_PATTERN, agent) is None:
-        # A login of one character, or one made only of punctuation, normalizes
-        # to something no Agent name may be. Saying so beats publishing a Card
-        # under a name the Owner never chose and cannot recognize.
-        return "", (
-            "AMessenger setup did not run.\n"
-            "Reason: an Agent name could not be derived from the Owner login.\n\n"
-            "Name the Agent yourself:\n"
-            "/amsg setup <agent-name>"
-        )
-    return agent, ""
-
-
 async def _setup(adapter, tokens: list[str], source) -> str:
     if not in_gateway_process():
         return SETUP_TUI
@@ -629,7 +595,7 @@ async def _setup(adapter, tokens: list[str], source) -> str:
             )
         url = relay_url.rstrip("/")
         if not agent:
-            agent, refusal = await _agent_named_after_the_owner(adapter, url, key)
+            agent, refusal = await bootstrap.agent_named_after_the_owner(adapter, url, key)
             if refusal:
                 return _setup_reply(
                     refusal,

@@ -56,6 +56,49 @@ REQUIRED_SETTINGS = (
 # Values that identify rather than authenticate. Everything else is reported as
 # present or missing and never shown.
 SHOWABLE = {"AMESSENGER_URL", "AMESSENGER_AGENT", "AMESSENGER_KIND", "AMESSENGER_CA_FILE"}
+# Copies of what the plugin ships. This file imports nothing from the package
+# (see the module docstring), so it keeps its own; tests/test_doctor.py keeps
+# every copy in step with the original.
+DEFAULT_KIND = "corporate"
+OWNER_KEY_VARIABLES = ("AMESSENGER_KEY", "REDMINE_API_KEY")
+# Values the first gateway start after an install derives for itself. Missing
+# one of these is a wait, never a fault, and never an operator's errand.
+DERIVABLE_SETTINGS = ("AMESSENGER_AGENT", "AMESSENGER_OWNER_CHAT")
+
+
+def shipped_defaults(module_dir: Path) -> dict:
+    """Read the values defaults.py ships, without importing it."""
+    try:
+        source = (module_dir / "defaults.py").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out = {}
+    for literal, variable in (("RELAY_URL", "AMESSENGER_URL"), ("KIND", "AMESSENGER_KIND")):
+        match = re.search(rf'^{literal}\s*=\s*"([^"]*)"', source, re.MULTILINE)
+        value = (match.group(1).strip() if match else "")
+        if value:
+            out[variable] = value
+    return out
+
+
+def effective_values(values: dict, shipped: dict) -> dict:
+    """What this profile actually runs with: what is written, else the default.
+
+    A value that has a default is never reported as missing. Reporting it sends
+    an Owner to write a line the plugin already knows the answer to, which is
+    the whole fault this diagnostic exists to catch.
+    """
+    out = {name: str(value).strip() for name, value in values.items()}
+    key = next(
+        (out[name] for name in OWNER_KEY_VARIABLES if out.get(name, "")),
+        "",
+    )
+    if key:
+        out["AMESSENGER_KEY"] = key
+    for name, value in shipped.items():
+        if not out.get(name, ""):
+            out[name] = value
+    return out
 
 
 def load_health(module_dir: Path):
@@ -98,14 +141,18 @@ def read_env(path: Path) -> dict:
     return values
 
 
-def settings_lines(values: dict) -> list[str]:
+def settings_lines(values: dict, written: dict | None = None) -> list[str]:
+    """Report each value, saying which are the plugin's own rather than typed."""
+    written = values if written is None else written
     out = []
     for name in SETTINGS:
         value = str(values.get(name, "")).strip()
+        defaulted = bool(value) and not str(written.get(name, "")).strip()
+        note = " (the plugin's own)" if defaulted else ""
         if not value:
             out.append(f"{name}: not set")
         elif name in SHOWABLE:
-            out.append(f"{name}: {value}")
+            out.append(f"{name}: {value}{note}")
         elif name == "AMESSENGER_OWNER_CHAT":
             # The platform decides half the faults in this file, so it is shown.
             # The chat id is not: this output gets pasted into a chat to ask for
@@ -120,7 +167,7 @@ def settings_lines(values: dict) -> list[str]:
                 )
             )
         else:
-            out.append(f"{name}: set")
+            out.append(f"{name}: set{note}")
     return out
 
 
@@ -175,8 +222,9 @@ def report(module_dir: Path, home: Path | None) -> tuple[list[str], int]:
         return lines, CANNOT_RUN
 
     lines.append(f"Profile: {home}")
-    values = read_env(home / ".env")
-    lines.extend(settings_lines(values))
+    written = read_env(home / ".env")
+    values = effective_values(written, shipped_defaults(module_dir))
+    lines.extend(settings_lines(values, written))
 
     status, detail = import_check(module_dir)
     if status == "failed":
@@ -210,7 +258,16 @@ def report(module_dir: Path, home: Path | None) -> tuple[list[str], int]:
             for name in REQUIRED_SETTINGS
             if not str(values.get(name, "")).strip()
         ]
-        if missing and len(missing) < len(REQUIRED_SETTINGS):
+        if missing and set(missing) <= set(DERIVABLE_SETTINGS):
+            # Nothing here needs a hand: the first start names the Agent after
+            # the key's Owner and takes the Owner Chat from the home channel.
+            lines.append(
+                "Configuration: complete on the next gateway start\n"
+                "Reason: "
+                + ", ".join(missing)
+                + " are derived then, from the key this profile already holds."
+            )
+        elif missing and len(missing) < len(REQUIRED_SETTINGS):
             record = replace(
                 record,
                 fault_code="half_configured",

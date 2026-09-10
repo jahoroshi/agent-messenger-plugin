@@ -79,6 +79,12 @@ OWNER_CONFIGURATION_ENV = (
     "AMESSENGER_KIND",
     "AMESSENGER_OWNER_CHAT",
 )
+# First-run question: which required values does the first gateway start work
+# out for itself?  The Agent is named after the key's Owner and the Owner Chat
+# is the Hermes home channel, so neither has to be typed or written by install.
+# Missing one of these is a state, not a fault: Hermes must keep the platform,
+# or the first run never happens.  See docs/adr/0008.
+DERIVABLE_ENV = ("AMESSENGER_AGENT", "AMESSENGER_OWNER_CHAT")
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{1,31}$"   # §6.1
 KINDS = ("corporate", "personal")
 DEDUPE_MAX = state.DEDUPE_MAX
@@ -547,13 +553,32 @@ def relay_url() -> str:
     return (os.getenv("AMESSENGER_URL", "").strip() or defaults.relay_url()).rstrip("/")
 
 
+def owner_key() -> str:
+    """The Owner key: AMESSENGER_KEY, else the profile's Redmine key.
+
+    The same Redmine account authenticates Hermes and the relay, so a profile
+    that already holds REDMINE_API_KEY needs nothing typed to name its Owner.
+    A key is never logged and never returned to a chat.
+    """
+    for name in defaults.OWNER_KEY_VARIABLES:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def agent_kind() -> str:
+    """The Kind: AMESSENGER_KIND, else the shipped default."""
+    return os.getenv("AMESSENGER_KIND", "").strip() or defaults.KIND
+
+
 def read_settings() -> dict:
     """Read AMessenger settings from the environment at call time."""
     return {
         "url": relay_url(),
-        "key": os.getenv("AMESSENGER_KEY", ""),
+        "key": owner_key(),
         "agent": os.getenv("AMESSENGER_AGENT", ""),
-        "kind": os.getenv("AMESSENGER_KIND", ""),
+        "kind": agent_kind(),
         "description": os.getenv("AMESSENGER_DESCRIPTION", ""),
         "owner_chat": os.getenv("AMESSENGER_OWNER_CHAT", ""),
         "owner_user": os.getenv("AMESSENGER_OWNER_USER", ""),
@@ -565,6 +590,40 @@ def read_settings() -> dict:
             "AMESSENGER_FULL_TOOLSETS", "amessenger,terminal,file,web,browser"
         ),
     }
+
+
+def owner_chat_platform_is_disabled(runner, platform, platform_name) -> bool:
+    """Return whether config explicitly disables an Owner Chat platform.
+
+    bootstrap.py asks this before any adapter exists, so it lives here rather
+    than on the class; AMessengerAdapter keeps its own name for it.
+    """
+    try:
+        runner_config = getattr(runner, "config", None)
+        platforms = getattr(runner_config, "platforms", None)
+        if platforms is None:
+            return False
+        getter = getattr(platforms, "get", None)
+        if not callable(getter):
+            return False
+        platform_config = getter(platform)
+        if platform_config is None:
+            platform_config = getter(platform_name)
+        if platform_config is None:
+            return False
+        if isinstance(platform_config, dict):
+            return (
+                "enabled" in platform_config
+                and platform_config.get("enabled") is False
+            )
+        return getattr(platform_config, "enabled", None) is False
+    except Exception as error:
+        logger.warning(
+            "[amessenger] could not inspect Owner Chat platform config; "
+            "continuing: %s",
+            error,
+        )
+        return False
 
 
 def parse_owner_chat(value: str) -> tuple[str, str | None]:
@@ -581,24 +640,56 @@ def parse_owner_chat(value: str) -> tuple[str, str | None]:
 
 
 def has_any_configuration() -> bool:
+    # An Owner key counts wherever it is read from: a profile that already holds
+    # REDMINE_API_KEY has asked for AMessenger by installing the plugin, and
+    # waiting for an AMESSENGER_ line it should never have to write is what left
+    # an installed Agent silent.  An address is still not intent.
+    if owner_key():
+        return True
     return any(os.getenv(name, "").strip() for name in OWNER_CONFIGURATION_ENV)
+
+
+def bootstrap_pending() -> bool:
+    """Is this profile one the first gateway start can finish by itself?
+
+    True means: an Owner key is readable, and every value still missing is one
+    first_run() derives.  Anything else missing is an operator mistake nothing
+    can guess.
+    """
+    missing = missing_requirements()
+    if not missing or not owner_key():
+        return False
+    return set(missing) <= set(DERIVABLE_ENV)
 
 
 def configuration_state() -> str:
     """Classify the five storage variables for startup and validation."""
-    # These three states are intentionally distinct: none is a fresh install,
-    # some is an operator mistake, and all five is a usable stored profile.
+    # These four states are intentionally distinct: none is a fresh install,
+    # a key with only derivable values missing is one first_run() finishes,
+    # anything else missing is an operator mistake, and all five is a usable
+    # stored profile.
     if not has_any_configuration():
         return "unconfigured"
-    if not check_requirements():
-        return "half-configured"
-    return "configured"
+    if check_requirements():
+        return "configured"
+    if bootstrap_pending():
+        return "bootstrapping"
+    return "half-configured"
 
 
 def configured_value(name: str) -> str:
-    """Read one required variable, honouring the shipped relay default."""
+    """Read one required variable, honouring every shipped default.
+
+    missing_requirements() reads through here, so a value that has a default is
+    never named as missing. Naming it would send an Owner to set a variable the
+    plugin already knows the answer to.
+    """
     if name == "AMESSENGER_URL":
         return relay_url()
+    if name == "AMESSENGER_KEY":
+        return owner_key()
+    if name == "AMESSENGER_KIND":
+        return agent_kind()
     return os.getenv(name, "").strip()
 
 
@@ -622,11 +713,17 @@ def check_dependencies() -> bool:
 
 def validate_config(config) -> bool:
     """Validate environment configuration; config.extra is intentionally ignored."""
-    if not has_any_configuration():
+    profile_state = configuration_state()
+    if profile_state == "unconfigured":
         # This is the fresh-install state.  It must reach connect() so the
         # /amsg setup command can configure this profile from a chat.
         return True
-    if check_requirements():
+    if profile_state == "configured":
+        return True
+    if profile_state == "bootstrapping":
+        # The installed state.  It must reach connect() too: the poll loop is
+        # where first_run() derives the rest.  Dropping the platform here is
+        # what made an install with a Redmine key in the profile do nothing.
         return True
     missing = missing_requirements()
     if missing:
@@ -697,6 +794,10 @@ class AMessengerAdapter(BasePlatformAdapter):
         self._owner_user_warning_logged = False
         self._waiting_log_written = False
         self._disabled_owner_log_written = False
+        # The first run happens once per process. Set when bootstrap.first_run
+        # has configured this profile; why it is still waiting, when it has not.
+        self._bootstrap_done = False
+        self._bootstrap_reason: str | None = None
         self._pending_setup = None
         self._connected_via_connect = False
         # Recorded where they are found, read by receive_problem().
@@ -834,32 +935,7 @@ class AMessengerAdapter(BasePlatformAdapter):
     @staticmethod
     def _owner_chat_platform_is_disabled(runner, platform, platform_name) -> bool:
         """Return whether config explicitly disables the Owner Chat platform."""
-        try:
-            runner_config = getattr(runner, "config", None)
-            platforms = getattr(runner_config, "platforms", None)
-            if platforms is None:
-                return False
-            getter = getattr(platforms, "get", None)
-            if not callable(getter):
-                return False
-            platform_config = getter(platform)
-            if platform_config is None:
-                platform_config = getter(platform_name)
-            if platform_config is None:
-                return False
-            if isinstance(platform_config, dict):
-                return (
-                    "enabled" in platform_config
-                    and platform_config.get("enabled") is False
-                )
-            return getattr(platform_config, "enabled", None) is False
-        except Exception as error:
-            logger.warning(
-                "[amessenger] could not inspect Owner Chat platform config; "
-                "continuing: %s",
-                error,
-            )
-            return False
+        return owner_chat_platform_is_disabled(runner, platform, platform_name)
 
     @property
     def owner_adapter(self):
@@ -1125,10 +1201,15 @@ class AMessengerAdapter(BasePlatformAdapter):
     def _log_waiting_for_setup(self) -> None:
         if self._waiting_log_written:
             return
+        self._waiting_log_written = True
+        if getattr(self, "_bootstrap_reason", None):
+            # first_run() already said what this profile is waiting for, in the
+            # words its Owner needs. Naming /amsg setup after it would name a
+            # command that is not the remedy.
+            return
         logger.warning(
             "[amessenger] AMessenger installed; waiting for /amsg setup in the Owner Chat"
         )
-        self._waiting_log_written = True
 
     def _configuration_ready(self) -> bool:
         """Refresh settings and report whether mail tasks may run.
@@ -1509,11 +1590,24 @@ class AMessengerAdapter(BasePlatformAdapter):
         ]
 
     async def run_poll_loop(self) -> None:
+        # Imported here rather than at module scope: bootstrap.py reads this
+        # module, and a top-level import either way would close the circle.
+        from . import bootstrap
+
         index = 0
         flush_at_start = True
         while self._running:
             try:
                 if not self._configuration_ready():
+                    # The install-time seam. Hermes runs no plugin code when it
+                    # installs a plugin, so this is the earliest moment the
+                    # shipped defaults can become this profile's own lines.
+                    # Tried again on every turn while it fails, and never once
+                    # it has succeeded. See docs/adr/0008.
+                    if not self._bootstrap_done and configuration_state() == "bootstrapping":
+                        self._bootstrap_done = await bootstrap.first_run(self)
+                        if self._bootstrap_done:
+                            continue
                     self._log_waiting_for_setup()
                     await sleep(CONFIG_WAIT_SECONDS)
                     continue

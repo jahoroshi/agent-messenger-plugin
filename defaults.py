@@ -35,3 +35,19 @@ REPOSITORY_URL = "https://github.com/jahoroshi/agent-messenger-plugin.git"
 def relay_url() -> str:
     """Return the shipped relay address in the form settings store it."""
     return RELAY_URL.strip().rstrip("/")
+
+
+# The Kind every Agent gets until its Owner asks for the other one. A Kind is
+# not a secret and not a choice a new Owner has to make, so it is a default
+# rather than a value install has to write. `/amsg setup <agent> personal` and
+# AMESSENGER_KIND in the profile .env both override it.
+KIND = "corporate"
+
+# Where the Owner key is read from, best first. AMESSENGER_KEY is the Owner
+# saying "use this key for AMessenger". REDMINE_API_KEY is the key the Hermes
+# profile already holds: the same Redmine account authenticates both, so an
+# installed plugin needs nothing typed to know who its Owner is.
+#
+# A key is a secret. Neither name is ever shipped with a value, and no surface
+# prints either one.
+OWNER_KEY_VARIABLES = ("AMESSENGER_KEY", "REDMINE_API_KEY")
