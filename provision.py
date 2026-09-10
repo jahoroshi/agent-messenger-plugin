@@ -18,7 +18,6 @@ import os
 import re
 import ssl
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -68,13 +67,12 @@ def write_env(path: Path, updates: dict) -> None:
     for name, value in updates.items():
         if name not in seen:
             out.append(f"{name}={value}\n")
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=str(path.parent), delete=False
-    )
-    with handle:
-        handle.writelines(out)
-    os.chmod(handle.name, 0o600)
-    os.replace(handle.name, path)
+    # Written in place, never renamed into place. On the Owner's host this file
+    # is a bind mount of one file: a rename replaces the mount point and the
+    # container keeps reading the old values, so the write appears to succeed
+    # and changes nothing.
+    path.write_text("".join(out), encoding="utf-8")
+    os.chmod(path, 0o600)
 
 
 def certificate_context(ca_file: str):
