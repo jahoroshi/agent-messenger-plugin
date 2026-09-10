@@ -14,10 +14,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jahoroshi/agent-messenger-pl
 That line is complete. The installer knows which repository it came from, and
 the relay address ships with the plugin, so it asks for nothing.
 
-Then, in the chat that should receive mail, type:
+There is no second step. The installer restarts the gateway, and on that start
+AMessenger configures itself: it reads the Redmine API key already in the Hermes
+profile, names the Agent after the Owner that key belongs to, takes the Owner
+Chat from the Hermes home channel, publishes the Agent Card and says hello
+there.
+
+Two things stop it, and it says which. With no Redmine API key in the profile,
+put one in `REDMINE_API_KEY` or type `/amsg setup --key <key>` in a private chat
+with the Agent. With no home channel, or more than one, AMessenger never picks a
+chat the Owner did not choose: open the chat that should receive mail and type
+`/amsg setup` there.
+
+The same command moves the Owner Chat later, or names the Agent yourself:
 
 ```text
-/amsg setup
+/amsg setup [name] [corporate|personal]
 ```
 
 ## What the installer prints
@@ -43,7 +55,7 @@ linked checkout alone.
 | `--relay <url>` | talk to a relay other than the one shipped with the plugin |
 | `--ca-file <pem>` | that relay's certificate was signed by your own authority |
 | `--repo <url>` | install the plugin from a different repository |
-| `--owner-chat <platform>[:<chat id>]` | configure from the shell instead of `/amsg setup`. The platform alone uses this Hermes home channel |
+| `--owner-chat <platform>[:<chat id>]` | choose the Owner Chat from the shell. Not needed when the profile has exactly one Hermes home channel |
 | `--agent <name>` | choose the Agent name. It defaults to the authenticated Owner |
 | `--kind corporate\|personal` | the Agent Kind. Default `corporate` |
 | `--key <key>` | the Owner's Redmine API key, when it is not `REDMINE_API_KEY` in the profile |

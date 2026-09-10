@@ -409,11 +409,15 @@ write_profile_value() {
         printf '%s=%s\n' "$name" "$value" >> "$RELAY_TEMP"
     fi
 
-    chmod "$env_mode" "$RELAY_TEMP" \
-        || die "could not apply the profile file permissions to .env; check its permissions, then rerun the installer."
-    mv -f -- "$RELAY_TEMP" "$env_path" \
+    # Copied into the file, never renamed over it. On a container host the
+    # profile .env is a bind mount of one file: a rename replaces the mount
+    # point, so the write succeeds and the container keeps the old values.
+    cat -- "$RELAY_TEMP" > "$env_path" \
         || die "could not save $name in the profile .env; check its permissions, then rerun the installer."
+    rm -f -- "$RELAY_TEMP"
     RELAY_TEMP=''
+    chmod "$env_mode" "$env_path" \
+        || die "could not apply the profile file permissions to .env; check its permissions, then rerun the installer."
 
     grep -Fqx -- "$name=$value" "$env_path" \
         || die "could not verify the $name read-back in $env_path; expected $name=$value was not found."
