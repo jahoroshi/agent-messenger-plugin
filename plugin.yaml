@@ -20,6 +20,13 @@ provides_hooks:
   - pre_gateway_dispatch
   - transform_llm_output
   - on_stream_end
+# Documentation, not configuration. Hermes reads optional_env only for the
+# platforms bundled in its own tree, so for an installed plugin these entries
+# prompt for nothing and seed nothing. Do not convert them to requires_env
+# either: that is an interactive prompt for a secret, and Hermes disables a
+# plugin whose requires_env value is left unanswered. Every value below has a
+# default or is derived on the first gateway start (see bootstrap.py and
+# docs/adr/0008); the Owner supplies only their Redmine API key.
 optional_env:
   - name: AMESSENGER_KEY
     description: "Owner's Redmine API key for AMessenger"
